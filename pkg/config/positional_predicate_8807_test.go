@@ -557,6 +557,7 @@ var converseAdjudicated8807 = map[string]converseVerdict8807{
 	"proposal / description": {"known-defect", "#8785. Declared under `security ike proposal` (and `security " +
 		"ipsec proposal`), no compiler clause reads it there, and IKEProposal has no Description field. The " +
 		"three-part remedy is declare / add the field / read it, and only the first is visible to a schema test."},
+	"scheduler / description": {"benign", "Junos permits a display-only description on scheduler <name>; declared to keep this closed-world subtree LEAF-COMPLETE. The compiler has no SchedulerConfig.Description field and ignores it."},
 
 	"policy / description":    {"unmeasured", "declared under a policy container; no localised read clause. NOT MEASURED."},
 	"policy / scheduler-name": {"unmeasured", "NOT MEASURED."},

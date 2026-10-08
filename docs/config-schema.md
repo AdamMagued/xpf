@@ -15792,8 +15792,16 @@ packed the whole line onto one leaf node and the compiler dropped it.
   produces. The `start-time`/`stop-time` slots are `ValueTimeOfDay` +
   `ValidateTimeOfDay`, and `start-date`/`stop-date` are `ValueDate` +
   `ValidateDate`, so a malformed window is rejected at commit (the
-  fail-closed-at-commit half). Unknown keywords stay lenient
-  (`schema_walk.go`), so no valid scheduler config is newly rejected.
+  fail-closed-at-commit half). The `scheduler <name>` node is
+  closed-world (#12239): strict validation rejects unknown weekday names and
+  unknown children in day windows, including a misspelled packed `all-day` /
+  `exclude` tail (`daily all-dya;`) and any token after that tail on the same
+  packed line, which the compiler never read (`monday all-day exclude;`
+  compiled as all-day alone; brace the statements instead). Valid flat-set
+  day runs (`set ... monday all-day exclude`) are expanded before
+  validation, matching the compiler reader. `description text` is modeled
+  because Junos permits it on a scheduler; it is display-only and the
+  current compiler does not store it.
 - **fail-closed runtime** — `isWithinWindow` no longer returns
   always-true on an empty window. A scheduler that resolves to NO window
   for a given instant (no daily window, no applicable per-day override,
@@ -15808,6 +15816,43 @@ packed the whole line onto one leaf node and the compiler dropped it.
   per-day evaluation: `pkg/scheduler/scheduler_3849_test.go` and the
   updated `pkg/scheduler/scheduler_test.go`
   (`TestIsWithinWindow_NoWindowFailsClosed`).
+
+The #12239 regressions in
+`pkg/config/schema_closedworld_time_range_scheduler_12239_test.go` and
+`pkg/configstore/scheduler_closedworld_12239_test.go` pin a misspelled
+`modnay` on a scheduled deny, unknown and packed day-window leaves through
+`CheckText` and `CommitCheck` (the error names the scheduler), the accepted
+description, flat-run, and day-window shapes, a lenient load of a persisted
+packed typo, and an unrelated commit over a persisted description or flat
+run. The empty-scheduler control remains valid, and
+`TestIsWithinWindow_NoWindowFailsClosed` continues to pin its inactive runtime
+behavior. The instance-name schema ratchet records `/schedulers/scheduler` as
+closed-world.
+
+The closed-world arm deliberately rejects unsupported children rather than
+silently dropping them. `apply-groups-except` and `apply-macro` inside this
+subtree are currently rejected by the shared walker; this known Junos
+compatibility gap is tracked as #12635. A weekday packed onto the scheduler
+line (`scheduler S monday { ... }`) is not validated as a day window and
+remains a known input-shape gap (#12636). Scheduler-level
+`start-time X stop-time Y` and `start-date X stop-date Y` one-line runs remain
+strict-rejected (#12637).
+
+Expanding day runs also makes the `daily` / weekday
+`start-time X stop-time Y` one-liner commit-acceptable in both the flat-set
+and the hierarchical spelling; strict commit rejected it before. The
+flat-set weekday spelling additionally leaves a stray scheduler-level
+`StopTime` through the existing #9235 residue hoist (the hierarchical
+`monday start-time X stop-time Y;` does not). With no daily or
+scheduler-level window, that half-window is what the other weekdays resolve
+to: it fails closed, so they stay inactive exactly as with no window, and
+each evaluation logs `scheduler: incomplete time window, failing closed`. A
+`daily all-day` window keeps precedence over it. With a daily or
+scheduler-level `start-time` / `stop-time` window, strict commit refuses the
+pair as `daily has conflicting repeated time boundaries` (#11358), so the
+stray cannot replace that window; write the weekday window as separate
+`start-time` / `stop-time` statements instead. The hoist itself is unchanged
+here.
 
 ### #11305 — Junos-native scheduler time and date-time forms
 
