@@ -744,3 +744,73 @@ func TestEachValidationPhaseRowRunsItsOwnCompiler_4960(t *testing.T) {
 		}
 	}
 }
+
+// #12224 F1: the all-value disabled-AppID catalog makes tolerant NAT list
+// references visible to the production pre-pass. Pin the newly widened apply
+// abort for both a dangling second DNAT app and a broken second SNAT set.
+func TestTolerantNATApplicationListErrorsArePinned12224(t *testing.T) {
+	cases := []struct {
+		name string
+		cmds []string
+		want []string
+	}{
+		{
+			name: "dangling second DNAT app",
+			cmds: []string{
+				"set security zones security-zone untrust",
+				"set security nat destination pool web1 address 10.0.30.100",
+				"set security nat destination rule-set rs1 from zone untrust",
+				"set security nat destination rule-set rs1 rule r1 match destination-address 50.0.0.1/32",
+				"set security nat destination rule-set rs1 rule r1 match application [ junos-http no-such-app ]",
+				"set security nat destination rule-set rs1 rule r1 then destination-nat pool web1",
+			},
+			want: []string{`application "no-such-app" not found`},
+		},
+		{
+			name: "broken second SNAT set",
+			cmds: []string{
+				"set security zones security-zone trust",
+				"set security zones security-zone untrust",
+				"set applications application-set broken application ghost",
+				"set security nat source rule-set rs1 from zone trust",
+				"set security nat source rule-set rs1 to zone untrust",
+				"set security nat source rule-set rs1 rule r1 match source-address 10.0.0.0/24",
+				"set security nat source rule-set rs1 rule r1 match application [ junos-http broken ]",
+				"set security nat source rule-set rs1 rule r1 then source-nat interface",
+			},
+			want: []string{`expand application-set "broken"`, `member "ghost" not found`},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tree := &config.ConfigTree{}
+			for _, cmd := range tc.cmds {
+				path, err := config.ParseSetCommand(cmd)
+				if err != nil {
+					t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+				}
+				if err := tree.SetPath(path); err != nil {
+					t.Fatalf("SetPath(%q): %v", cmd, err)
+				}
+			}
+			cfg, err := config.CompileConfigLenient(tree)
+			if err != nil {
+				t.Fatalf("tolerant config load rejected the fixture: %v", err)
+			}
+
+			err = validateBeforeMutate(cfg)
+			if err == nil {
+				t.Fatal("validateBeforeMutate accepted a later invalid NAT application-list value")
+			}
+			if !strings.HasPrefix(err.Error(), "validate applications: ") {
+				t.Fatalf("pre-pass error = %q, want validate applications phase", err)
+			}
+			for _, fragment := range tc.want {
+				if !strings.Contains(err.Error(), fragment) {
+					t.Fatalf("pre-pass error = %q, want fragment %q", err, fragment)
+				}
+			}
+		})
+	}
+}

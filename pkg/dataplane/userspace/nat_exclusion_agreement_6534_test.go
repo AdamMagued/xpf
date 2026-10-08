@@ -202,6 +202,20 @@ func natExclusionCases() []natExclusionCase {
 			rule:         "d1",
 			wantExcluded: true,
 		},
+		{
+			name: "dnat_protocol_less_only_uses_never_match_row",
+			site: "buildDestinationNATSnapshots",
+			cmds: []string{
+				"set applications application NOPROTO destination-port 80",
+				"set security nat destination pool dp1 address 10.0.0.9/32",
+				"set security nat destination rule-set drs from zone untrust",
+				"set security nat destination rule-set drs rule d1 match destination-address 203.0.113.9/32",
+				"set security nat destination rule-set drs rule d1 match application NOPROTO",
+				"set security nat destination rule-set drs rule d1 then destination-nat pool dp1",
+			},
+			rule:         "d1",
+			wantExcluded: false,
+		},
 		// --- NPTv6: #5818 scope widening ---
 		{
 			name: "nptv6_healthy_rule_installs",
