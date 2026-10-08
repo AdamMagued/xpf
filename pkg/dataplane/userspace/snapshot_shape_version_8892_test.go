@@ -236,7 +236,7 @@ func shapeDigest8892(t *testing.T) (string, int) {
 // refuse every snapshot in exchange for nothing. The golden below moved to the
 // #9984-merge digest; ProtocolVersion was 24 until #10018's lease-wire bump.
 const (
-	snapshotShapeGolden8892 = "059a0f796cc1d27f3506e079150a3f07ed725cdc54ad15dce027dbb530996035"
+	snapshotShapeGolden8892 = "210fa7c739585810f12c31042e5f59b35922419aa376c2369905a3efe5d2c8d2"
 	// v13 BUMPED (issue 9412) against the SAME digest. The TCP close class
 	// crosses the HA session-sync path, and the old behaviour is the defect it
 	// fixes, so the v9 rule requires the bump. The session-sync messages are not
@@ -471,6 +471,13 @@ const (
 	// Measured delta vs the af02ee89 base is exactly these three
 	// `json:"-"` lines. No helper-visible wire change; ProtocolVersion
 	// stays at 45.
+	// v45 STANDS (#12247): Config.ZoneQuarantineNames is compile-time
+	// metadata (`json:"-"`): the main/node0/node1 zone-name set that Go-side
+	// runtime quarantine decides over. ConfigSnapshot embeds Config, so this
+	// walk sees it although it is absent from snapshot JSON, and the zones the
+	// helper receives are already quarantined in Go. Measured delta vs the
+	// 51ace11d0 base is exactly that one `json:"-"` line; Rust has no consumer.
+	// No helper-visible wire change; ProtocolVersion stays at 45.
 	// v44 -> v45 BUMPED (#11812): single-rate PolicerSnapshot adds optional
 	// marking-action and logical-interface-policer JSON fields. The keys are
 	// omitted by default and the current Rust runtime ignores them; warnings
