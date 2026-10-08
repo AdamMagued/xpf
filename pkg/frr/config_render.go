@@ -122,11 +122,23 @@ func (m *Manager) generateInterfaceSettings(fc *FullConfig) string {
 		return ""
 	}
 
-	// Build set of interfaces that have explicit OSPF NetworkType so we don't override.
+	// Build the explicit-network-type set from OSPF fragments that survive the
+	// same first-area rule as protocol rendering. Equivalent-area fragments
+	// union their settings; later fragments assigned to another area are
+	// dropped and must not suppress the generated point-to-point line.
 	ospfNetworkType := make(map[string]bool)
 	if fc.OSPF != nil {
+		firstAreaByInterface := make(map[string]string)
 		for _, area := range fc.OSPF.Areas {
+			areaKey := ospfAreaIdentity11400(area.ID)
 			for _, iface := range area.Interfaces {
+				firstArea, seen := firstAreaByInterface[iface.Name]
+				if seen && firstArea != areaKey {
+					continue
+				}
+				if !seen {
+					firstAreaByInterface[iface.Name] = areaKey
+				}
 				if iface.NetworkType != "" {
 					ospfNetworkType[iface.Name] = true
 				}

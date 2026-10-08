@@ -23,6 +23,12 @@ func validateOSPFMD5KeyIDs11794(cfg *Config) error {
 				if iface == nil || iface.AuthType != "md5" {
 					continue
 				}
+				for _, key := range iface.AuthMD5Keys {
+					if key.ID < 1 || key.ID > 255 {
+						return fmt.Errorf("%sprotocols ospf area %s interface %s authentication md5 key-id %d is outside 1..255",
+							scope, area.ID, iface.Name, key.ID)
+					}
+				}
 				if iface.AuthKeyID < 1 || iface.AuthKeyID > 255 {
 					return fmt.Errorf("%sprotocols ospf area %s interface %s authentication md5 key-id %d is outside 1..255",
 						scope, area.ID, iface.Name, iface.AuthKeyID)

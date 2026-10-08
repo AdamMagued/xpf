@@ -167,6 +167,9 @@ var astLeafForSecretField = map[string]secretLeafClaim{
 	"OSPFInterface.AuthKey": {
 		set: `set protocols ospf area 0.0.0.0 interface ge-0/0/0.0 authentication md5 1 key "%s"`,
 	},
+	"OSPFMD5Key12186.Key": {
+		set: `set protocols ospf area 0.0.0.0 interface ge-0/0/0.0 authentication md5 2 key "%s"`,
+	},
 	"RIPConfig.AuthKey": {
 		set: `set protocols rip authentication-key "%s"`,
 	},
@@ -213,14 +216,15 @@ func TestEverySecretFieldIsMapped(t *testing.T) {
 	// was measured rather than what was first assumed.
 	//
 	// A PARTIAL walk break is NOT caught here. Removing the slice/array arm of
-	// the descent loses exactly the two slice-reachable fields
-	// (BGPNeighbor.AuthPassword, ISISInterface.AuthKey) and leaves 20, well
-	// above any floor worth setting. What catches that is the stale-mapping
-	// check at the bottom of this function, which names those two fields
-	// precisely — a better detector than a count, because it says WHICH.
+	// the descent loses exactly the three slice-reachable fields
+	// (BGPNeighbor.AuthPassword, ISISInterface.AuthKey,
+	// OSPFMD5Key12186.Key) and leaves 20, well above any floor worth setting.
+	// What catches that is the stale-mapping check at the bottom of this
+	// function, which names those three fields precisely — a better detector
+	// than a count, because it says WHICH.
 	//
 	// The floor earns its place on TOTAL collapse only. With the walk disabled
-	// entirely the population is empty, and without this the reader gets 22
+	// entirely the population is empty, and without this the reader gets 23
 	// "the field was renamed" errors pointing at the mapping table when the
 	// mapping table is fine and the WALK is broken. The Fatalf short-circuits
 	// them and names the real fault. That is a diagnostic guarantee, not a

@@ -999,6 +999,24 @@ step. Both are required — neither sees the other's case:
   `collectBGPRouteMapPolicies`/`bgpEffectiveChains` still iterate all
   neighbors — they emit no `neighbor <addr>` line, only route-map objects, so
   an unreferenced definition for a skipped neighbor is harmless valid config.)
+- **Equivalent-area OSPF interface fragments are unioned (#12186).**
+  Distinct area-ID spellings for one 32-bit area, and authored interface
+  aliases resolving to one Linux device, can create multiple model fragments
+  for one FRR interface. The renderer emits one context and unions disjoint
+  settings, including OSPFv2/OSPFv3 adjacency timers, priority/passive state,
+  network type, BFD and all configured OSPFv2 MD5 key IDs for rollover. First-wins
+  output silently discarded later-only settings; lost OSPF authentication could
+  leave an adjacency unauthenticated on a green commit. Strict compilation
+  rejects conflicting values (#12186); tolerant loads retain the first present
+  value per field and warn. Area activation retains the first fragment's
+  original area-ID spelling; that spelling and tolerant conflict precedence
+  follow authoring order, not order-independent semantics. Same-area
+  kernel-name aliases use the same union. Different-area membership remains
+  rejected strictly and uses the existing first-area warning fallback on
+  tolerant loads. Network-type suppression uses only surviving fragments,
+  so a dropped different-area setting cannot hide the generated `network
+  point-to-point` line.
+
 - **OSPFv3 stub/NSSA area types (#11401).** The `area-type { stub | nssa }`
   and `no-summaries` leaves are preserved in `OSPFv3Area` through schema and
   compilation, including elided, packed, braced, and routing-instance forms.

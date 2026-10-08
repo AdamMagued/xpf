@@ -185,6 +185,7 @@ func compileProtocols(node *Node, proto *ProtocolsConfig, opts compileOpts, warn
 							switch authChild.Name() {
 							case "md5":
 								iface.AuthType = "md5"
+								keyID := iface.AuthKeyID
 								if v := nodeVal(authChild); v != "" {
 									n, err := strconv.Atoi(v)
 									if err != nil {
@@ -192,15 +193,24 @@ func compileProtocols(node *Node, proto *ProtocolsConfig, opts compileOpts, warn
 										// validateOSPFMD5KeyIDs11794. Zero used to be
 										// ambiguous with the renderer's fabricated
 										// default key-id, hiding Atoi failures.
-										iface.AuthKeyID = -1
+										keyID = -1
 									} else {
-										iface.AuthKeyID = n
+										keyID = n
 									}
+									iface.AuthKeyID = keyID
 								}
+								key := Secret("")
+								keyPresent := false
 								for _, kc := range authChild.Children {
 									if kc.Name() == "key" {
-										iface.AuthKey = Secret(nodeVal(kc))
+										key = Secret(nodeVal(kc))
+										keyPresent = true
 									}
+								}
+								iface.AuthMD5Keys = append(iface.AuthMD5Keys,
+									OSPFMD5Key12186{ID: keyID, Key: key})
+								if keyPresent {
+									iface.AuthKey = key
 								}
 							case "simple-password":
 								iface.AuthType = "simple"

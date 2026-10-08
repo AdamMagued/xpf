@@ -50,6 +50,16 @@ type ospfRenderArea11400 struct {
 	id  string
 }
 
+func warnOSPFInterfaceConflict12186(protocol, name string, fields []string) {
+	if len(fields) == 0 {
+		return
+	}
+	slog.Warn("frr: conflicting OSPF interface settings; retaining first present values (#12186)",
+		"protocol", protocol,
+		"interface", sanitizeFRRValue(name),
+		"fields", strings.Join(fields, ", "))
+}
+
 // validFRROSPFArea reports whether id is renderable as an FRR area operand
 // (#9820): exactly what the commit gate accepts (ValidateOSPFArea,
 // incl. its mapped + padding arms) AND a single FRR token. The token
@@ -115,16 +125,20 @@ func (m *Manager) generateProtocolsWithQNH11447(ospf *config.OSPFConfig, ospfv3 
 		if ospf.PassiveDefault {
 			b.WriteString(" passive-interface default\n")
 		}
-		passiveAreaByInterface := make(map[string]string)
+		type passiveAreaState11400 struct {
+			key              string
+			directiveEmitted bool
+		}
+		passiveAreaByInterface := make(map[string]passiveAreaState11400)
 		for _, area := range ospf.Areas {
 			areaKey := ospfAreaIdentity11400(area.ID)
 			for _, iface := range area.Interfaces {
-				firstAreaKey, seen := passiveAreaByInterface[iface.Name]
-				if seen && firstAreaKey != areaKey {
+				firstArea, seen := passiveAreaByInterface[iface.Name]
+				if seen && firstArea.key != areaKey {
 					continue
 				}
 				if !seen {
-					passiveAreaByInterface[iface.Name] = areaKey
+					firstArea.key = areaKey
 				}
 				// OSPFv2 area membership is activated per-interface in the
 				// "interface <name>" block below via "ip ospf area <id>", NOT
@@ -136,12 +150,15 @@ func (m *Manager) generateProtocolsWithQNH11447(ospf *config.OSPFConfig, ospfv3 
 				// instance (#1712). passive-interface directives are
 				// independent of activation and remain under "router ospf".
 				if ospf.PassiveDefault {
-					if iface.NoPassive {
+					if iface.NoPassive && !firstArea.directiveEmitted {
 						fmt.Fprintf(&b, " no passive-interface %s\n", iface.Name)
+						firstArea.directiveEmitted = true
 					}
-				} else if iface.Passive {
+				} else if iface.Passive && !firstArea.directiveEmitted {
 					fmt.Fprintf(&b, " passive-interface %s\n", iface.Name)
+					firstArea.directiveEmitted = true
 				}
+				passiveAreaByInterface[iface.Name] = firstArea
 			}
 			if area.AreaType != "" {
 				if !validFRROSPFArea(area.ID) {
@@ -173,90 +190,115 @@ func (m *Manager) generateProtocolsWithQNH11447(ospf *config.OSPFConfig, ospfv3 
 		}
 		b.WriteString("exit\n!\n")
 		// OSPF interface settings + per-interface area activation. The
-		// "interface <name>" block is emitted UNCONDITIONALLY for every
+		// "interface <name>" block is emitted UNCONDITIONALLY for each unique
 		// configured OSPF interface because "ip ospf area <id>" is now the
 		// sole activation mechanism (the global "network 0.0.0.0/0 area"
 		// line was removed above, #1712). Cost / network-type / auth / BFD
 		// lines remain optional within the block.
-		renderedAreaByInterface := make(map[string]ospfRenderArea11400)
+		// Equivalent area-ID spellings and authored interface aliases can
+		// remain distinct model objects while resolving to one Linux device.
+		// Union disjoint settings into one context. Strict compilation rejects
+		// conflicting values; tolerant input keeps the first present value and
+		// warns. Area activation retains the first fragment's spelling, so the
+		// output intentionally follows fragment order.
+		type ospfRenderV2State12186 struct {
+			area     ospfRenderArea11400
+			settings config.OSPFInterfaceUnion12186
+		}
+		renderedAreaByInterface := make(map[string]ospfRenderV2State12186)
+		interfaceOrder := make([]string, 0)
 		for _, area := range ospf.Areas {
 			areaKey := ospfAreaIdentity11400(area.ID)
 			for _, iface := range area.Interfaces {
-				firstArea, seen := renderedAreaByInterface[iface.Name]
-				if seen && firstArea.key != areaKey {
+				state, seen := renderedAreaByInterface[iface.Name]
+				if seen && state.area.key != areaKey {
 					slog.Warn("frr: dropping an OSPF interface assigned to multiple areas; keeping the first area (#11400)",
 						"interface", sanitizeFRRValue(iface.Name),
-						"first_area", sanitizeFRRValue(firstArea.id),
+						"first_area", sanitizeFRRValue(state.area.id),
 						"dropped_area", sanitizeFRRValue(area.ID))
 					continue
-				} else if !seen {
-					renderedAreaByInterface[iface.Name] = ospfRenderArea11400{key: areaKey, id: area.ID}
 				}
-				fmt.Fprintf(&b, "interface %s\n", iface.Name)
-				if iface.Cost > 0 {
-					fmt.Fprintf(&b, " ip ospf cost %d\n", frrClampInt("ospf cost", iface.Cost, 65535))
+				if !seen {
+					state.area = ospfRenderArea11400{key: areaKey, id: area.ID}
+					interfaceOrder = append(interfaceOrder, iface.Name)
 				}
-				// Adjacency timers + DR priority (#4285). hello/dead MUST
-				// match the neighbor or the adjacency never forms; FRR keeps
-				// its defaults (hello 10s, dead 40s, priority 1) when unset.
-				if iface.HelloInterval > 0 {
-					fmt.Fprintf(&b, " ip ospf hello-interval %d\n", iface.HelloInterval)
-				}
-				if iface.DeadInterval > 0 {
-					fmt.Fprintf(&b, " ip ospf dead-interval %d\n", iface.DeadInterval)
-				}
-				if iface.RetransmitInt > 0 {
-					fmt.Fprintf(&b, " ip ospf retransmit-interval %d\n", iface.RetransmitInt)
-				}
-				// HasPriority gates the line; 0 is a valid value ("never DR").
-				if iface.HasPriority {
-					fmt.Fprintf(&b, " ip ospf priority %d\n", iface.Priority)
-				}
-				if iface.NetworkType != "" {
-					fmt.Fprintf(&b, " ip ospf network %s\n", iface.NetworkType)
-				}
-				// #8443: an EMPTY key must render nothing. Without this guard
-				// `authentication { md5 1; }` — a clean commit — emitted
-				// `ip ospf message-digest-key 1 md5` with no argument, and
-				// `authentication { simple-password; }` emitted
-				// `ip ospf authentication-key`, both vtysh-rejected keywords
-				// that fail the whole managed-section reload (#1880/#2223).
-				if iface.AuthKey != "" && iface.AuthType == "md5" {
-					// #11794: no renderer default. A tolerant load or an
-					// externally-assembled Config may bypass SchemaValidate;
-					// emit neither half of the authentication pair unless the
-					// configured key-id is in FRR's 1..255 domain.
-					if iface.AuthKeyID < 1 || iface.AuthKeyID > 255 {
-						slog.Warn("frr: omitting OSPF MD5 authentication with an invalid key-id (#11794)",
-							"interface", sanitizeFRRValue(iface.Name), "key_id", iface.AuthKeyID)
-					} else if tok, ok := authTokenOrOmit("ospf-md5", iface.AuthKey.Reveal()); ok {
-						b.WriteString(" ip ospf authentication message-digest\n")
-						fmt.Fprintf(&b, " ip ospf message-digest-key %d md5 %s\n", iface.AuthKeyID, tok)
-					}
-				} else if iface.AuthKey != "" && iface.AuthType == "simple" {
-					// #11462: same token-first gate as the md5 arm above.
-					if tok, ok := authTokenOrOmit("ospf-simple", iface.AuthKey.Reveal()); ok {
-						b.WriteString(" ip ospf authentication\n")
-						fmt.Fprintf(&b, " ip ospf authentication-key %s\n", tok)
-					}
-				}
-				if iface.BFD {
-					if iface.BFDInterval > 0 || iface.BFDMultiplier > 0 {
-						profile := bfdProfileName(iface.BFDInterval, iface.BFDMultiplier)
-						bfd.addProfile(profile, bfdProfile{iface.BFDInterval, iface.BFDMultiplier})
-						fmt.Fprintf(&b, " ip ospf bfd profile %s\n", profile)
-					} else {
-						b.WriteString(" ip ospf bfd\n")
-					}
-				}
-				if validFRROSPFArea(area.ID) {
-					fmt.Fprintf(&b, " ip ospf area %s\n", area.ID)
-				} else {
-					slog.Warn("frr: omitting an OSPF interface area activation with an invalid area id (#9820)",
-						"area", sanitizeFRRValue(area.ID), "interface", sanitizeFRRValue(iface.Name))
-				}
-				b.WriteString("exit\n!\n")
+				warnOSPFInterfaceConflict12186("OSPF", iface.Name, state.settings.Merge(iface))
+				renderedAreaByInterface[iface.Name] = state
 			}
+		}
+		for _, name := range interfaceOrder {
+			state := renderedAreaByInterface[name]
+			iface := state.settings.OSPFInterface
+			fmt.Fprintf(&b, "interface %s\n", iface.Name)
+			if iface.Cost > 0 {
+				fmt.Fprintf(&b, " ip ospf cost %d\n", frrClampInt("ospf cost", iface.Cost, 65535))
+			}
+			// Adjacency timers + DR priority (#4285). hello/dead MUST
+			// match the neighbor or the adjacency never forms; FRR keeps
+			// its defaults (hello 10s, dead 40s, priority 1) when unset.
+			if iface.HelloInterval > 0 {
+				fmt.Fprintf(&b, " ip ospf hello-interval %d\n", iface.HelloInterval)
+			}
+			if iface.DeadInterval > 0 {
+				fmt.Fprintf(&b, " ip ospf dead-interval %d\n", iface.DeadInterval)
+			}
+			if iface.RetransmitInt > 0 {
+				fmt.Fprintf(&b, " ip ospf retransmit-interval %d\n", iface.RetransmitInt)
+			}
+			// HasPriority gates the line; 0 is a valid value ("never DR").
+			if iface.HasPriority {
+				fmt.Fprintf(&b, " ip ospf priority %d\n", iface.Priority)
+			}
+			if iface.NetworkType != "" {
+				fmt.Fprintf(&b, " ip ospf network %s\n", iface.NetworkType)
+			}
+			if iface.AuthType == "md5" {
+				// One interface can carry multiple key IDs during rollover.
+				// A key is rendered only when both its ID and secret are safe.
+				authEmitted := false
+				for _, key := range state.settings.MD5Keys {
+					if key.Key == "" {
+						continue
+					}
+					if key.ID < 1 || key.ID > 255 {
+						slog.Warn("frr: omitting OSPF MD5 authentication with an invalid key-id (#11794)",
+							"interface", sanitizeFRRValue(iface.Name), "key_id", key.ID)
+						continue
+					}
+					tok, ok := authTokenOrOmit("ospf-md5", key.Key.Reveal())
+					if !ok {
+						continue
+					}
+					if !authEmitted {
+						b.WriteString(" ip ospf authentication message-digest\n")
+						authEmitted = true
+					}
+					fmt.Fprintf(&b, " ip ospf message-digest-key %d md5 %s\n", key.ID, tok)
+				}
+			} else if iface.AuthKey != "" && iface.AuthType == "simple" {
+				// #11462: the empty-key guard and token-first gate keep
+				// malformed simple authentication from bricking frr-reload.
+				if tok, ok := authTokenOrOmit("ospf-simple", iface.AuthKey.Reveal()); ok {
+					b.WriteString(" ip ospf authentication\n")
+					fmt.Fprintf(&b, " ip ospf authentication-key %s\n", tok)
+				}
+			}
+			if iface.BFD {
+				if iface.BFDInterval > 0 || iface.BFDMultiplier > 0 {
+					profile := bfdProfileName(iface.BFDInterval, iface.BFDMultiplier)
+					bfd.addProfile(profile, bfdProfile{iface.BFDInterval, iface.BFDMultiplier})
+					fmt.Fprintf(&b, " ip ospf bfd profile %s\n", profile)
+				} else {
+					b.WriteString(" ip ospf bfd\n")
+				}
+			}
+			if validFRROSPFArea(state.area.id) {
+				fmt.Fprintf(&b, " ip ospf area %s\n", state.area.id)
+			} else {
+				slog.Warn("frr: omitting an OSPF interface area activation with an invalid area id (#9820)",
+					"area", sanitizeFRRValue(state.area.id), "interface", sanitizeFRRValue(iface.Name))
+			}
+			b.WriteString("exit\n!\n")
 		}
 	}
 
@@ -297,59 +339,78 @@ func (m *Manager) generateProtocolsWithQNH11447(ospf *config.OSPFConfig, ospfv3 
 		// `interface <name> area <id>` command to the INTERFACE_NODE form
 		// `ipv6 ospf6 area <id>`. Emit the interface block unconditionally so
 		// an interface with no optional settings still gets activated.
-		renderedAreaByInterface := make(map[string]ospfRenderArea11400)
+		// Equivalent area-ID spellings and authored aliases can remain
+		// distinct model objects while resolving to one Linux device. Union
+		// disjoint settings into one context. Strict compilation rejects
+		// conflicting values; tolerant input keeps the first present value and
+		// warns. Area activation retains the first fragment's spelling, so the
+		// output intentionally follows fragment order.
+		type ospfRenderV3State12186 struct {
+			area     ospfRenderArea11400
+			settings config.OSPFv3InterfaceUnion12186
+		}
+		renderedAreaByInterface := make(map[string]ospfRenderV3State12186)
+		interfaceOrder := make([]string, 0)
 		for _, area := range ospfv3.Areas {
 			areaKey := ospfAreaIdentity11400(area.ID)
 			for _, iface := range area.Interfaces {
-				firstArea, seen := renderedAreaByInterface[iface.Name]
-				if seen && firstArea.key != areaKey {
+				state, seen := renderedAreaByInterface[iface.Name]
+				if seen && state.area.key != areaKey {
 					slog.Warn("frr: dropping an OSPFv3 interface assigned to multiple areas; keeping the first area (#11400)",
 						"interface", sanitizeFRRValue(iface.Name),
-						"first_area", sanitizeFRRValue(firstArea.id),
+						"first_area", sanitizeFRRValue(state.area.id),
 						"dropped_area", sanitizeFRRValue(area.ID))
 					continue
-				} else if !seen {
-					renderedAreaByInterface[iface.Name] = ospfRenderArea11400{key: areaKey, id: area.ID}
 				}
-				fmt.Fprintf(&b, "interface %s\n", iface.Name)
-				if validFRROSPFArea(area.ID) {
-					fmt.Fprintf(&b, " ipv6 ospf6 area %s\n", area.ID)
-				} else {
-					slog.Warn("frr: omitting an OSPFv3 interface area activation with an invalid area id (#9820)",
-						"area", sanitizeFRRValue(area.ID), "interface", sanitizeFRRValue(iface.Name))
+				if !seen {
+					state.area = ospfRenderArea11400{key: areaKey, id: area.ID}
+					interfaceOrder = append(interfaceOrder, iface.Name)
 				}
-				if iface.Passive {
-					b.WriteString(" ipv6 ospf6 passive\n")
-				}
-				if iface.Cost > 0 {
-					fmt.Fprintf(&b, " ipv6 ospf6 cost %d\n", frrClampInt("ospf3 cost", iface.Cost, 65535))
-				}
-				// Adjacency timers + DR priority (#4285): hello/dead must
-				// match the neighbor. HasPriority gates the priority line;
-				// priority 0 ("never DR") emits, unset omits.
-				if iface.HelloInterval > 0 {
-					fmt.Fprintf(&b, " ipv6 ospf6 hello-interval %d\n", iface.HelloInterval)
-				}
-				if iface.DeadInterval > 0 {
-					fmt.Fprintf(&b, " ipv6 ospf6 dead-interval %d\n", iface.DeadInterval)
-				}
-				if iface.RetransmitInt > 0 {
-					fmt.Fprintf(&b, " ipv6 ospf6 retransmit-interval %d\n", iface.RetransmitInt)
-				}
-				if iface.HasPriority {
-					fmt.Fprintf(&b, " ipv6 ospf6 priority %d\n", iface.Priority)
-				}
-				if iface.BFD {
-					if iface.BFDInterval > 0 || iface.BFDMultiplier > 0 {
-						profile := bfdProfileName(iface.BFDInterval, iface.BFDMultiplier)
-						bfd.addProfile(profile, bfdProfile{iface.BFDInterval, iface.BFDMultiplier})
-						fmt.Fprintf(&b, " ipv6 ospf6 bfd profile %s\n", profile)
-					} else {
-						b.WriteString(" ipv6 ospf6 bfd\n")
-					}
-				}
-				b.WriteString("exit\n!\n")
+				warnOSPFInterfaceConflict12186("OSPFv3", iface.Name, state.settings.Merge(iface))
+				renderedAreaByInterface[iface.Name] = state
 			}
+		}
+		for _, name := range interfaceOrder {
+			state := renderedAreaByInterface[name]
+			iface := state.settings.OSPFv3Interface
+			fmt.Fprintf(&b, "interface %s\n", iface.Name)
+			if validFRROSPFArea(state.area.id) {
+				fmt.Fprintf(&b, " ipv6 ospf6 area %s\n", state.area.id)
+			} else {
+				slog.Warn("frr: omitting an OSPFv3 interface area activation with an invalid area id (#9820)",
+					"area", sanitizeFRRValue(state.area.id), "interface", sanitizeFRRValue(iface.Name))
+			}
+			if iface.Passive {
+				b.WriteString(" ipv6 ospf6 passive\n")
+			}
+			if iface.Cost > 0 {
+				fmt.Fprintf(&b, " ipv6 ospf6 cost %d\n", frrClampInt("ospf3 cost", iface.Cost, 65535))
+			}
+			// Adjacency timers + DR priority (#4285): hello/dead must
+			// match the neighbor. HasPriority gates the line; priority 0
+			// ("never DR") emits, unset omits.
+			if iface.HelloInterval > 0 {
+				fmt.Fprintf(&b, " ipv6 ospf6 hello-interval %d\n", iface.HelloInterval)
+			}
+			if iface.DeadInterval > 0 {
+				fmt.Fprintf(&b, " ipv6 ospf6 dead-interval %d\n", iface.DeadInterval)
+			}
+			if iface.RetransmitInt > 0 {
+				fmt.Fprintf(&b, " ipv6 ospf6 retransmit-interval %d\n", iface.RetransmitInt)
+			}
+			if iface.HasPriority {
+				fmt.Fprintf(&b, " ipv6 ospf6 priority %d\n", iface.Priority)
+			}
+			if iface.BFD {
+				if iface.BFDInterval > 0 || iface.BFDMultiplier > 0 {
+					profile := bfdProfileName(iface.BFDInterval, iface.BFDMultiplier)
+					bfd.addProfile(profile, bfdProfile{iface.BFDInterval, iface.BFDMultiplier})
+					fmt.Fprintf(&b, " ipv6 ospf6 bfd profile %s\n", profile)
+				} else {
+					b.WriteString(" ipv6 ospf6 bfd\n")
+				}
+			}
+			b.WriteString("exit\n!\n")
 		}
 	}
 
