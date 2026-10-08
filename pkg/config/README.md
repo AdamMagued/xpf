@@ -597,7 +597,7 @@ policy scope, policy, field, and the inner failure. Resolution mirrors the
 runtime resolver EXACTLY (`policyMatchAddressBookResolves` replicates
 `resolveUserspaceAddressBookEntry`'s fail-closed semantics and the outer
 `len(values) == 0` reject), so the commit gate and the runtime gate cannot
-diverge. `any` / `any-ipv4` / `any-ipv6` / the empty token and literal CIDR/IP
+diverge. Every match-all keyword (#9523), the empty token and literal CIDR/IP
 tokens are passed through; a wholly-undefined token stays the domain of
 `validatePolicyMatchAddressesStrict` (#2008), which runs first. **#3147
 excluded-inversion safety:** the resolver runs on the same address lists the
@@ -653,7 +653,7 @@ truth — `policyMatchNamedAddressRefs` (address-book entries + feed bindings) a
 `policyMatchAddressTokenRecognized` (the `any`/literal/named predicate) in
 `compiler_validate_strict.go` — that BOTH the strict gate and the warn pass call,
 so they cannot diverge again. The warn pass now warns only for a token that is
-NONE of {`any`/`any-ipv4`/`any-ipv6`, literal CIDR/IP, feed binding, address-book
+NONE of {a match-all keyword, literal CIDR/IP, feed binding, address-book
 entry} — a genuinely undefined reference, which still warns (and is hard-rejected
 by #2008 on the strict commit path). The address-set MEMBER validation keeps its
 own address-book-only set: a feed binding nested in an address-set stays
@@ -675,7 +675,8 @@ zone-local fold) now rejects such an object at commit, naming it; the tolerant
 load / peer-sync path keeps it with a warning (`lenientReservedAddressNames`,
 #1960 no-brick). Every resolver asks `IsPolicyAddressWildcardKeyword` before any
 name lookup: the snapshot builder (`classifyPolicyAddresses`), the
-`match-policies` simulator (`resolveToken`), and the CLI / gRPC detail renderers.
+`match-policies` simulator (`resolveToken`), the junos-host kernel projection
+(`junosHostResolveAddrSet`, #12242), and the CLI / gRPC detail renderers.
 So on the tolerant path the keyword keeps matching every address, and every
 surface shows what is enforced. `0.0.0.0/0` remains a legal object name.
 
@@ -697,6 +698,18 @@ for the keyword set and its families. Name-before-literal is unchanged: a litera
 `0.0.0.0/0` typed in a policy still resolves to an object of that name. `show
 security policies detail` renders `any-ipv4(global): 0.0.0.0/0`, and the REST and
 gRPC inventories show the keyword the operator wrote instead of the CIDR.
+
+**The short forms `any4` / `any6` commit, and every surface reads them as the
+long forms (#12242):** `policyMatchAddressTokenRecognized` (the #2008 strict gate
+and the #3958 warn pass) and the #3149 member gate ask
+`IsPolicyAddressWildcardKeyword`, so `any4` / `any6` commit. A surface with a
+private long-form keyword list then disagrees with the gate. The junos-host
+kernel projection was one: a committed `any4` failed its literal parse, made the
+term unrepresentable and withdrew the whole ingress-zone `xpf_hostinbound` DROP
+program, correctly spelled denies included, behind only the #4168 advisory.
+`junosHostResolveAddrSet` (token and address-value arms; keyword before any
+name lookup), `junosHostAddrScoped` and the #4146 warning's
+`junosHostPolicySourceScoped` now read the SSOT.
 
 **An address takes one value form; a mixed entry is rejected (#9524/#11508):**
 the compiler enforces only parsed IP/CIDR prefixes; a Junos `dns-name` /

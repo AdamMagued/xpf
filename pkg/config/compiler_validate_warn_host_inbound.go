@@ -288,19 +288,19 @@ func validatePolicyLogInertOnDenyWarnings(cfg *Config) []string {
 
 // junosHostPolicySourceScoped reports whether a policy match carries a genuine
 // source-address restriction — i.e. it is narrower than "any source". A match
-// with only the reserved wildcards (`any`/`any-ipv4`/`any-ipv6`/the empty
-// token) is NOT scoped; a match naming a concrete address-book entry, literal
-// prefix, or feed binding IS. `source-address-excluded` is inherently a
+// with only the reserved wildcards (`any`/`any-ipv4`/`any4`/`any-ipv6`/`any6`/
+// the empty token) is NOT scoped; a match naming a concrete address-book entry,
+// literal prefix, or feed binding IS. `source-address-excluded` is inherently a
 // restriction (permit/deny all EXCEPT the named sources) and so counts as
 // scoped regardless of the token. Mirrors the wildcard set recognized by
-// policyMatchAddressTokenRecognized (#3958) so the two agree on "any".
+// policyMatchAddressTokenRecognized (#3958) — both ask
+// IsPolicyAddressWildcardKeyword (#12242) — so the two agree on "any".
 func junosHostPolicySourceScoped(m PolicyMatch) bool {
 	if m.SourceAddressExcluded {
 		return true
 	}
 	for _, a := range m.SourceAddresses {
-		switch a {
-		case "", "any", "any-ipv4", "any-ipv6":
+		if a == "" || IsPolicyAddressWildcardKeyword(a) {
 			continue
 		}
 		return true

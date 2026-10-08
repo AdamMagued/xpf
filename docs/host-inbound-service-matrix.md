@@ -2684,10 +2684,11 @@ through ONE projection formula (`junosHostProjectAddrMatch`,
   `saddr != 10.0.0.0/8`), and — because the set has no prefix of the *other*
   family — drops **ALL** of that other family (IPv6 here): "everything except
   10/8" is all IPv6. This match-all-of-opposite-family behavior is intentional.
-- The **wildcard** case `any` (or the family-scoped `any-ipv4` / `any-ipv6`) +
-  excluded is the degenerate "every address EXCEPT every address" = the **empty
-  set**: it matches NOTHING and projects **no drop rule** for the affected
-  family. `any` suppresses both families; `any-ipv4` / `any-ipv6` suppress only
+- The **wildcard** case `any` (or the family-scoped `any-ipv4` / `any-ipv6`, and
+  their short forms `any4` / `any6`, #12242) + excluded is the degenerate "every
+  address EXCEPT every address" = the **empty set**: it matches NOTHING and
+  projects **no drop rule** for the affected family. `any` suppresses both
+  families; the family-scoped forms suppress only
   their own. Emitting an unconditional drop here (the #5828 bug — the old
   `len(src)==0 => SrcAny` classification) would invert the authored domain and
   could lock out **all** direct host-bound traffic on the ingress zone. A plain
