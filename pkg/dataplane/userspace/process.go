@@ -14,6 +14,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/psaab/xpf/pkg/config"
+	"golang.org/x/sys/unix"
 )
 
 // helperEventSocketPath resolves the event-socket path for a helper config: the
@@ -526,28 +527,73 @@ func tuneSocketBuffers() {
 
 func findBinary(explicit string) (string, error) {
 	if explicit != "" {
-		if _, err := os.Stat(explicit); err == nil {
-			return explicit, nil
+		info, err := os.Stat(explicit)
+		if err != nil {
+			return "", fmt.Errorf("userspace dataplane binary not found: %s", explicit)
 		}
-		return "", fmt.Errorf("userspace dataplane binary not found: %s", explicit)
+		if info.IsDir() {
+			return "", fmt.Errorf("userspace dataplane binary is a directory, not executable: %s", explicit)
+		}
+		if info.Mode().Perm()&0o111 == 0 {
+			return "", fmt.Errorf("userspace dataplane binary is not executable: %s (mode %s)", explicit, info.Mode())
+		}
+		return explicit, nil
 	}
 	candidates := []string{
 		"./xpf-userspace-dp",
 		filepath.Join("userspace-dp", "target", "release", "xpf-userspace-dp"),
 		filepath.Join(filepath.Dir(os.Args[0]), "xpf-userspace-dp"),
 	}
-	for _, c := range candidates {
-		if c == "" {
+	var skipped []string
+	for i, c := range candidates {
+		if c == "" || i > 0 && filepath.Clean(c) == filepath.Clean(candidates[0]) {
 			continue
 		}
-		if _, err := os.Stat(c); err == nil {
+		executable, reason := executableBinaryCandidate(c)
+		if executable {
 			return c, nil
+		}
+		if reason != "" {
+			skipped = append(skipped, fmt.Sprintf("%s: %s", c, reason))
 		}
 	}
 	if p, err := exec.LookPath("xpf-userspace-dp"); err == nil {
 		return p, nil
 	}
-	return "", errors.New("userspace dataplane helper binary not found; build make build-userspace-dp or configure system dataplane binary")
+	const notFound = "userspace dataplane helper binary not found; build make build-userspace-dp or configure system dataplane binary"
+	if len(skipped) != 0 {
+		return "", fmt.Errorf("%s; skipped candidates: %s", notFound, strings.Join(skipped, "; "))
+	}
+	return "", errors.New(notFound)
+}
+
+// executableBinaryCandidate mirrors exec.LookPath's executable access check
+// for implicit candidates with a path. An empty reason means the candidate
+// does not exist; the bare argv0-relative candidate can duplicate the cwd
+// candidate, so it is skipped and handled by the PATH fallback instead.
+func executableBinaryCandidate(path string) (bool, string) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, ""
+	}
+	if info.IsDir() {
+		return false, "is a directory"
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		return false, fmt.Sprintf("not executable (mode %s)", info.Mode())
+	}
+	if strings.Contains(path, string(filepath.Separator)) {
+		err = unix.Faccessat(unix.AT_FDCWD, path, unix.X_OK, unix.AT_EACCESS)
+		if err == nil {
+			return true, ""
+		}
+		// Go's exec.LookPath uses this same permission-bit fallback when
+		// effective-access checks are unavailable or blocked by seccomp.
+		if err != unix.ENOSYS && err != unix.EPERM {
+			return false, fmt.Sprintf("not executable (access check: %v; mode %s)", err, info.Mode())
+		}
+	}
+	return true, ""
 }
 
 func (m *Manager) stopLocked() {
