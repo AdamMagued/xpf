@@ -2062,7 +2062,7 @@ never lock an operator out of a remote box it manages.
   - **Incomplete addressing observation refuses (#6789).** `setupBootstrapLifeline`
     is a chain of fail-closed refusals — no default route, NIC enumeration
     failed, not enumeration index 0 — each of which logs and returns having
-    mutated NOTHING. The addressing snapshot used to be the one observation
+    changed no kernel interface state. The addressing snapshot used to be the one observation
     that GUESSED instead. `interfaceAddrSnapshot` returned empty slices on a
     `LinkByName` failure and discarded the `AddrList` error, while its sibling
     `isDHCPManaged` was documented to return false on any uncertainty so the
