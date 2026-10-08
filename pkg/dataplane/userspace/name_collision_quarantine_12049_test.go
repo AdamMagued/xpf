@@ -45,6 +45,26 @@ func TestLenientApplicationNameCollisionsQuarantineReferences12049(t *testing.T)
 			ref:  "web",
 		},
 		{
+			name: "authored set shadows predefined application",
+			apps: `application custom8443 { protocol tcp; destination-port 8443; } application-set junos-http { application custom8443; }`,
+			ref:  "junos-http",
+		},
+		{
+			name: "parent contains authored set shadowing predefined application",
+			apps: `application custom8443 { protocol tcp; destination-port 8443; } application-set junos-http { application custom8443; } application-set parent { application-set junos-http; }`,
+			ref:  "parent",
+		},
+		{
+			name: "term-based predefined application direct reference",
+			apps: `application junos-http { term t1 { protocol tcp; destination-port 8443; } }`,
+			ref:  "junos-http",
+		},
+		{
+			name: "term-based predefined application nested reference",
+			apps: `application junos-http { term t1 { protocol tcp; destination-port 8443; } } application-set parent { application junos-http; }`,
+			ref:  "parent",
+		},
+		{
 			name: "referenced application-set contains a colliding member",
 			apps: `application web { protocol tcp; destination-port 80; } application-set web { application junos-https; } application-set group { application web; }`,
 			ref:  "group",

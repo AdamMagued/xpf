@@ -14864,17 +14864,25 @@ The gate `validateApplicationNameCollisionsAST`
 (`pkg/config/compiler_applications_collision.go`) is an **AST pre-walk** run on
 the group-expanded, inactive-pruned tree in `compileExpanded` (alongside
 `validateUnsupportedInterfaceStanzasAST`), NOT a post-compile check on the typed
-`*Config`: by the time the maps are built the colliding definitions have already
-been merged away by last-write-wins — only the raw AST still carries every
-definition. It aggregates counts across EVERY top-level `applications {}` node (a
-hierarchical parse can emit several sibling blocks and `compileExpanded` compiles
-all of them), so a collision SPLIT across two `applications {}` blocks is caught
-just like one inside a single block — the walk must not stop at the first node.
-The predefined `junos-*` table lives outside the AST, so a user
-`application junos-http` that merely SHADOWS a predefined application is not a
-collision (one AST stanza, no peer) and is left untouched; a multi-term
-application minting an implicit set under its own name is likewise not a
-self-collision.
+`*Config`: the compiled maps do not retain whether a set came from an authored
+`application-set` or a term-based application's implicit set, and duplicate
+definitions may already have been merged away by last-write-wins. The raw AST
+preserves authored stanzas and duplicate instances so one gate can distinguish
+those cases. It aggregates counts across EVERY top-level `applications {}` node
+(a hierarchical parse can emit several sibling blocks and `compileExpanded`
+compiles all of them), so a collision SPLIT across two `applications {}` blocks
+is caught just like one inside a single block — the walk must not stop at the
+first node.
+The predefined `junos-*` table lives outside the AST, so a SIMPLE (non-term)
+user `application junos-http` that merely SHADOWS a predefined application
+remains allowed — that is the legitimate shadow/extend case. A term-based
+`application junos-http` instead mints an implicit application-set under that
+name, so direct references resolve to the predefined application while nested
+members expand the implicit set; this ambiguity is rejected under strict commit
+and warned on the lenient load path (#12220). An authored
+`application-set junos-http` has the same differing-resolution ambiguity and is
+diagnosed as well. A multi-term application minting an implicit set under its
+own name is not a self-collision.
 
 **Strict (`commit` / `commit check`):** the first collision is a HARD commit
 error naming the offending name. **Lenient (`Store.Load` / HA peer-sync —
@@ -14883,13 +14891,20 @@ error naming the offending name. **Lenient (`Store.Load` / HA peer-sync —
 `cfg.Warnings` entry so a node that committed a colliding config BEFORE this gate
 existed (or a peer-synced config) still BOOTS after upgrade instead of failing
 closed (#1960 / #3261 fail-closed-on-load doctrine); `compileApplications` keeps
-producing the same (arbitrary but stable) last-write-wins maps on that path.
+producing the same (arbitrary but stable) last-write-wins maps on that path. The
+colliding name is also recorded as compiler metadata, so userspace refuses
+affected policy references rather than publishing an arbitrary winner.
 
 Regression coverage: `pkg/config/compiler_applications_collision_3339_test.go`
 (app-vs-set collision, implicit-set-overwrite, duplicate application / set
-definition, duplicate term-generated name, distinct-names-commit incl. a
-predefined shadow, lenient-warns). Compiler-side only — not a typed `setSchema`
-leaf (applications stay opaque to `SchemaValidate`).
+definition, duplicate term-generated name, distinct-names-commit incl. a simple
+predefined shadow, #12220's authored-set and term-based predefined shadows with
+strict reject and lenient warning/quarantine, and a duplicate-warning pin).
+The userspace call site is pinned by
+`pkg/dataplane/userspace/name_collision_quarantine_12049_test.go`: direct and
+parent-nested authored-set and term-based shadows lower to the unsupported
+sentinel and rejection mirror. Applications remain opaque to `SchemaValidate`,
+not a typed `setSchema` leaf.
 
 ### #3472 — generated per-term application names join the collision namespace
 
