@@ -1895,7 +1895,11 @@ func (m *Manager) installSnapshot(fs *feedState, res fetchResult) {
 	// needsPublish = the fetched content differs from what was last CONFIRMED
 	// applied. Drives the onUpdate publish/retry. A rejected apply leaves
 	// publishedHash stale, so this stays true on an identical refetch → retry.
-	needsPublish := !fs.hasPublished || fs.publishedHash != res.hash
+	// An unconfirmed hold-drop is the same hazard in the other direction: the
+	// rejected empty apply staged (and possibly landed) the dropped overlay,
+	// so recovery must republish even content identical to publishedHash.
+	needsPublish := !fs.hasPublished || fs.publishedHash != res.hash ||
+		(fs.holdDropped && feedPublicationDebt(fs))
 	oldCount := len(fs.prefixes)
 	baselineHash := fs.hash
 	if fs.hasSnapshot && fs.shrinkHighWaterCount == 0 {
@@ -2109,6 +2113,7 @@ type feedFailureTransition struct {
 	current      bool
 	enteredStale bool
 	dropped      bool
+	retryDropped bool
 	lastError    string
 	holdInterval time.Duration
 }
@@ -2136,6 +2141,12 @@ func (m *Manager) recordFailureLocked(fs *feedState, ferr error) feedFailureTran
 			dropSnapshotToEmptyLocked(fs)
 			transition.dropped = true
 		}
+	}
+	// A rejected hold-drop leaves the desired state empty but the dataplane's
+	// published hash unchanged. Retry that debt on the next failed fetch, just
+	// as installSnapshot retries rejected good content on an identical refetch.
+	if !transition.dropped && fs.holdDropped && feedPublicationDebt(fs) {
+		transition.retryDropped = true
 	}
 	return transition
 }
@@ -2221,17 +2232,19 @@ func (m *Manager) expireStaleHold(fs *feedState) {
 }
 
 func (m *Manager) finishFailure(fs *feedState, transition feedFailureTransition, logRetained bool) {
-	if transition.dropped {
-		slog.Warn("dynamic-address: hold interval elapsed, dropping stale feed to empty",
-			"name", fs.name, "err", transition.lastError, "hold", transition.holdInterval)
+	if transition.dropped || transition.retryDropped {
+		if transition.dropped {
+			slog.Warn("dynamic-address: hold interval elapsed, dropping stale feed to empty",
+				"name", fs.name, "err", transition.lastError, "hold", transition.holdInterval)
+		}
 		if m.onUpdate != nil {
 			// An empty set has no fixed safety direction: a denylist stops
 			// denying while an allowlist stops permitting. The existing binding
 			// fail-mode controls the dataplane consequence; keep the hold policy
 			// shared by ordinary fetch failures and shrink refusals.
 			if err := m.onUpdate(); err != nil {
-				slog.Warn("dynamic-address: drop-to-empty apply rejected — dataplane retains last-good set",
-					"name", fs.name, "err", err)
+				slog.Warn("dynamic-address: drop-to-empty apply not confirmed — dataplane state may differ",
+					"name", fs.name, "err", err, "retry", transition.retryDropped)
 				return
 			}
 		}
@@ -2241,6 +2254,10 @@ func (m *Manager) finishFailure(fs *feedState, transition feedFailureTransition,
 			fs.hasPublished = true
 		}
 		m.mu.Unlock()
+		if transition.retryDropped {
+			slog.Info("dynamic-address: retried hold-drop apply accepted",
+				"name", fs.name)
+		}
 		return
 	}
 	if !logRetained {
