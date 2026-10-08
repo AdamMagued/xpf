@@ -429,4 +429,7 @@ type PolicyRuleSnapshot struct {
 	// provenance, so the Go mirror keeps these strings to identify the context
 	// that caused whole-snapshot refusal. A decoded snapshot leaves them nil.
 	malformedZonePairShapes []string
+	// unknownSecurityPoliciesChildren carries #12217 compile-time diagnostics
+	// for the skipped children that caused whole-snapshot refusal.
+	unknownSecurityPoliciesChildren []string
 }

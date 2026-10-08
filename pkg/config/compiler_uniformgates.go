@@ -229,5 +229,8 @@ func runUniformGates(tree *ConfigTree, cfg *Config, opts compileOpts) error {
 	}
 	cfg.Warnings = append(cfg.Warnings, gatewayRIRoutingWarnings...)
 
+	if err := runUniformGatesUnknownSecurityPoliciesChild12217(cfg, opts); err != nil {
+		return err
+	}
 	return nil
 }
