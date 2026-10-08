@@ -615,6 +615,11 @@ cmd_deploy() {
 	# #1875 lock discipline is PRESERVED: `make deb` builds OUTSIDE the
 	# lock (it is multi-minute and local); only the install + cut-over
 	# runs under the lock via the locked re-invocation below.
+	# #12188: this is a dogfood/dev deploy, so it deliberately does not set
+	# XPF_RELEASE. With no real archive-key drop-in, `make deb` warns loudly
+	# and installs the placeholder, which is unpublishable. Release builds
+	# must set XPF_RELEASE=1 and provide the real key; never treat this
+	# disposable-cluster package path as release packaging evidence.
 
 	# #1875: build OUTSIDE the lock — it is multi-minute and purely
 	# local, and holding the shared-cluster lock across it would

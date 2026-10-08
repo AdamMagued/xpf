@@ -191,6 +191,26 @@ sessions across the mixed-base window or must replace both nodes at once.
 See `docs/in-place-upgrade.md` (Kernel / OS upgrade lanes) for the full
 LANE-1/2/3 decision rule and the state-carry contract.
 
+### Archive keyring trust (#12188)
+
+The archive keyring is part of the image's trust state too. By default,
+`debian/rules` warns loudly and installs the `.placeholder` key when the
+real drop-in is absent, allowing dev `make deb` and dogfood builds to proceed.
+`XPF_RELEASE=1 make deb` fails early without the real key; signed releases
+should use `XPF_RELEASE=1 XPF_SIGN_SECKEY=<path> make image`. The
+`XPF_ALLOW_PLACEHOLDER_KEYRING=1` override explicitly marks a dev-only
+package build.
+
+When `XPF_SIGN_SECKEY` is set, `bake.py` reads the installed
+`/usr/share/keyrings/xpf-archive-keyring.asc` back out with `virt-cat` and
+refuses a missing, non-armored, or placeholder key before signing. An
+unsigned dev bake skips that refusal, produces an unsigned image, and is not
+publishable. `publish.py` independently opens every qcow with
+`virt-filesystems`/`virt-cat`, parses the installed OpenPGP key in a temporary
+GnuPG home, and rejects missing, unparseable, or placeholder keys. When
+`install.sh` is present, its signed embedded key must be covered by the image
+keyring. These publish gates apply regardless of package-build mode.
+
 ### Base-image pin policy (#1943 / #4904-B)
 
 The base is a **reviewed pin**, not mirror-latest. Two constants in
@@ -265,6 +285,7 @@ alongside the existing `validated` / `base_image_pinned` refusals. The
 format lives in `scripts/dist/image_inventory.py`, single-sourced because
 bake.py writes it and publish.py reads it and a divergence between those
 is always a bug.
+
 
 Full first-boot matrix (run after a bake, or standalone):
 

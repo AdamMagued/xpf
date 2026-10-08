@@ -97,10 +97,10 @@ make test            # Run BOTH the Go suite AND the Rust userspace-dp
                      # fails `make test`. `make test-go` / `make test-rust`
                      # run one leg. The Rust leg needs cargo (~minutes).
 make selftest        # Run ALL day-0/image/dist/deploy self-tests
-                     # (scripts/run-selftests.sh) in one fast hermetic pass —
-                     # grow-root, bake sign-order, dist roundtrip, validate.py
-                     # helpers, xpf-deploy mixed-base HA gate. Tool-gated legs
-                     # SKIP. Run before touching image/day-0/dist/deploy tooling.
+                     # (scripts/run-selftests.sh) is not hermetic or fast
+                     # (~13 min): image/distribution legs need host tools
+                     # such as libguestfs. Missing tools SKIP with a named
+                     # reason. Run before touching image/day-0/dist/deploy tooling.
 make harness-census  # Reachability census over the RUNNABLE harnesses, one
                      # layer above `make selftest` (#8302). Every harness under
                      # test/incus/ + scripts/userspace-*.sh must be INVOKED by a

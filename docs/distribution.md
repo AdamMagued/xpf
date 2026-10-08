@@ -277,6 +277,28 @@ superset is allowed during dual-sign) and cover the signer (so a fresh install's
 first `apt-get update`, before the packaged keyring lands, verifies the repo).
 Any mismatch fails the publish. `selftest.sh` (§5d) exercises the gate.
 
+Image rotation is stricter for retained images. `gate_provenance` checks
+every qcow against the single `install.sh` in the candidate publish set. If
+retained v1 has only K1 in its guest keyring while v2's dual-sign installer
+embeds K1+K2, v1 blocks the whole publish even though the apt package gate
+allows a keyring superset. Before publishing v2, either prune all retained v1
+artifacts from the candidate `dist/` set, or re-bake v1 with K1+K2 installed
+and regenerate its signed artifacts. Do not expect the dual-sign overlap to
+make a K1-only image publishable.
+
+Image publication has a separate guest-side check (#12188). When
+`XPF_SIGN_SECKEY` is set, `bake.py` reads the installed archive keyring back
+from the image and refuses a missing, non-armored, or placeholder key before
+signing. An unsigned dev bake skips that refusal and can produce artifacts,
+but it remains unpublishable. `publish.py gate_provenance` independently reads
+`/usr/share/keyrings/xpf-archive-keyring.asc` from every qcow with
+`virt-filesystems`/`virt-cat`, requires a parseable non-placeholder OpenPGP
+key, and, when a signed `install.sh` is present, requires the guest keyring
+to cover the installer's embedded key. Thus image-only publishing checks the
+key actually installed in the guest rather than trusting the package-build
+inputs or inventory sidecar. Missing libguestfs tools or an unreadable image
+keyring fail closed.
+
 ## Operator runbook
 
 ### Install (Tier A — one-liner)

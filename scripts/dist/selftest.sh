@@ -3,15 +3,20 @@
 #
 # Proves, end to end, with a THROWAWAY keypair (generated in a temp dir,
 # never committed) and NO hosting:
-#   1. sign a per-version manifest over fake qcow2 + metadata;
+#   1. sign a per-version manifest over a synthetic qcow2 + metadata;
 #   2. verify each artifact against the signed manifest (PASS);
 #   3. tamper-detection: a modified artifact, a tampered manifest, a
 #      tampered signature, and a wrong pubkey each MUST FAIL verify;
 #   4. build a flat signed apt repo over a fake .deb and verify InRelease;
 #   5. install.sh --dry-run preflight/source rendering.
+#   6. image-only publish refuses a signed qcow with a placeholder
+#      keyring (#12188).
 #
 # Exit 0 only if every positive check passes AND every tamper check fails.
 set -eu
+
+# Build throwaway .deb fixtures with conventional modes regardless of caller.
+umask 022
 
 # shellcheck disable=SC1007  # `CDPATH= cd` clears CDPATH for this command only
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
@@ -24,15 +29,31 @@ ok()   { echo "  PASS: $*"; PASS=$((PASS + 1)); }
 bad()  { echo "  FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 info() { echo "==> $*"; }
 
-command -v minisign >/dev/null 2>&1 || { echo "SKIP: minisign not installed (apt-get install minisign)"; exit 77; }
-command -v gpg >/dev/null 2>&1 || { echo "SKIP: gpg not installed"; exit 77; }
-command -v apt-ftparchive >/dev/null 2>&1 || { echo "SKIP: apt-ftparchive not installed (apt-utils)"; exit 77; }
+SELFTEST_CHECKS=60
+require_tool() {
+    _tool=$1
+    _hint=$2
+    command -v "$_tool" >/dev/null 2>&1 || {
+        echo "SKIP: $_tool not installed ($_hint); all $SELFTEST_CHECKS distribution checks skipped" >&2
+        exit 77
+    }
+}
+require_tool minisign "apt-get install minisign"
+require_tool gpg "apt-get install gpg"
+require_tool apt-ftparchive "apt-get install apt-utils"
+require_tool virt-make-fs "apt-get install libguestfs-tools"
+require_tool virt-filesystems "apt-get install libguestfs-tools"
+require_tool virt-cat "apt-get install libguestfs-tools"
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/xpf-dist-selftest.XXXXXX")
 GNUPGHOME="$WORK/gnupg"; export GNUPGHOME
 mkdir -p "$GNUPGHOME"; chmod 700 "$GNUPGHOME"
 cleanup() { rm -rf "$WORK"; }
-trap cleanup EXIT INT TERM
+cleanup_deb() {
+    [ -z "${FAKEDEB:-}" ] || rm -f "$FAKEDEB"
+    [ -z "${EDGEDEB:-}" ] || rm -f "$EDGEDEB"
+}
+trap 'cleanup; cleanup_deb' EXIT INT TERM
 
 VER="0.0.0-selftest"
 OUT="$WORK/dist"
@@ -44,11 +65,37 @@ minisign -G -W -p "$WORK/img.pub" -s "$WORK/img.sec" >/dev/null 2>&1
 WRONGPUB="$WORK/wrong.pub"
 minisign -G -W -p "$WRONGPUB" -s "$WORK/wrong.sec" >/dev/null 2>&1
 
-# ── fake artifacts + signed manifest ──────────────────────────────────────
-info "2. create fake artifacts + signed per-version manifest"
+# The same throwaway archive key is embedded in the synthetic guest image and
+# signs the apt repo below, so publish can verify the in-image keyring.
+cat > "$WORK/gpg-batch" <<EOF
+%no-protection
+Key-Type: eddsa
+Key-Curve: ed25519
+Key-Usage: sign
+Name-Real: xpf selftest archive
+Name-Email: selftest@xpf.invalid
+Expire-Date: 0
+%commit
+EOF
+gpg --batch --gen-key "$WORK/gpg-batch" >/dev/null 2>&1
+GPGKEY=$(gpg --batch --list-keys --with-colons selftest@xpf.invalid | awk -F: '/^fpr:/{print $10; exit}')
+[ -n "$GPGKEY" ] && ok "archive key generated ($GPGKEY)" || { bad "archive key gen failed"; }
+ARCHASC="$WORK/archive.asc"
+gpg --batch --armor --export selftest@xpf.invalid > "$ARCHASC"
+
+# ── image fixture + signed manifest ──────────────────────────────────────
+info "2. create a guest image with an installed archive keyring"
 QCOW="$OUT/xpf-$VER.qcow2"
 META="$OUT/xpf-$VER.incus-metadata.tar.gz"
-head -c 4096 /dev/urandom > "$QCOW"
+GUEST="$WORK/guest"
+mkdir -p "$GUEST/usr/share/keyrings"
+cp "$ARCHASC" "$GUEST/usr/share/keyrings/xpf-archive-keyring.asc"
+if ! virt-make-fs --format=qcow2 --type=ext4 --partition=mbr \
+     "$GUEST" "$QCOW" >/dev/null 2>"$WORK/virt-make-fs.err"; then
+    echo "ERROR: virt-make-fs failed to build guest image $QCOW: $(cat "$WORK/virt-make-fs.err")" >&2
+    exit 1
+fi
+ok "guest qcow2 carries the real archive keyring for virt-cat inspection"
 head -c 1024 /dev/urandom > "$META"
 MANIFEST="$OUT/xpf-$VER.SHA256SUMS"
 # #4904 A: the signed provenance sidecar (xpf-<ver>.manifest). Real bakes bind
@@ -164,26 +211,10 @@ fi
 
 # ── 5. flat signed apt repo + InRelease verify ─────────────────────────────
 info "5. flat signed apt repo build + InRelease verify"
-# Throwaway gpg archive key (unattended, no passphrase).
-cat > "$WORK/gpg-batch" <<EOF
-%no-protection
-Key-Type: eddsa
-Key-Curve: ed25519
-Key-Usage: sign
-Name-Real: xpf selftest archive
-Name-Email: selftest@xpf.invalid
-Expire-Date: 0
-%commit
-EOF
-gpg --batch --gen-key "$WORK/gpg-batch" >/dev/null 2>&1
-GPGKEY=$(gpg --batch --list-keys --with-colons selftest@xpf.invalid | awk -F: '/^fpr:/{print $10; exit}')
-[ -n "$GPGKEY" ] && ok "archive key generated ($GPGKEY)" || { bad "archive key gen failed"; }
-ARCHASC="$WORK/archive.asc"
-gpg --batch --armor --export selftest@xpf.invalid > "$ARCHASC"
 
 # Fake .deb carries the keyring payload checked by publish.py; apt-ftparchive
 # only needs control metadata.
-DEBDIR="$WORK/pkg"; mkdir -p "$DEBDIR/DEBIAN"
+DEBDIR="$WORK/pkg"; mkdir -p "$DEBDIR/DEBIAN"; chmod 0755 "$DEBDIR/DEBIAN"
 cat > "$DEBDIR/DEBIAN/control" <<EOF
 Package: xpf-appliance
 Version: $VER
@@ -195,9 +226,11 @@ mkdir -p "$DEBDIR/usr/share/keyrings"
 cp "$ARCHASC" "$DEBDIR/usr/share/keyrings/xpf-archive-keyring.asc"
 mkdir -p "$ROOT/dist-deb"
 FAKEDEB="$ROOT/dist-deb/xpf-appliance_${VER}_amd64.deb"
-dpkg-deb --build "$DEBDIR" "$FAKEDEB" >/dev/null 2>&1
-cleanup_deb() { rm -f "$FAKEDEB"; }
-trap 'cleanup; cleanup_deb' EXIT INT TERM
+if ! dpkg-deb --build "$DEBDIR" "$FAKEDEB" \
+     >/dev/null 2>"$WORK/dpkg-deb.err"; then
+    echo "ERROR: dpkg-deb failed to build selftest package xpf-appliance $VER: $(cat "$WORK/dpkg-deb.err")" >&2
+    exit 1
+fi
 
 if XPF_GPG_KEY="$GPGKEY" XPF_APT_VALID_DAYS=365 \
    sh "$DIST/build-apt-repo.sh" --out "$OUT" --suite stable --debs "$FAKEDEB" >/dev/null 2>&1; then
@@ -265,7 +298,7 @@ fi
 # ── 5c. apt channel isolation (#4201, HB165 H-4) ──────────────────────────
 info "5c. apt channel isolation: a stable rebuild after edge must not list edge"
 EDGEDEB="$ROOT/dist-deb/xpf-appliance_0.0.0-edge_amd64.deb"
-EDGEDIR="$WORK/pkg-edge"; mkdir -p "$EDGEDIR/DEBIAN"
+EDGEDIR="$WORK/pkg-edge"; mkdir -p "$EDGEDIR/DEBIAN"; chmod 0755 "$EDGEDIR/DEBIAN"
 cat > "$EDGEDIR/DEBIAN/control" <<EOF
 Package: xpf-appliance
 Version: 0.0.0-edge
@@ -273,8 +306,11 @@ Architecture: amd64
 Maintainer: selftest <selftest@xpf.invalid>
 Description: xpf selftest edge package
 EOF
-dpkg-deb --build "$EDGEDIR" "$EDGEDEB" >/dev/null 2>&1
-trap 'cleanup; cleanup_deb; rm -f "$EDGEDEB"' EXIT INT TERM
+if ! dpkg-deb --build "$EDGEDIR" "$EDGEDEB" \
+     >/dev/null 2>"$WORK/dpkg-deb-edge.err"; then
+    echo "ERROR: dpkg-deb failed to build edge selftest package 0.0.0-edge: $(cat "$WORK/dpkg-deb-edge.err")" >&2
+    exit 1
+fi
 XPF_GPG_KEY="$GPGKEY" sh "$DIST/build-apt-repo.sh" --out "$OUT" --suite edge \
     --debs "$EDGEDEB" >/dev/null 2>&1 || bad "edge repo build failed"
 # Rebuild stable AFTER edge exists — the exact H-4 trigger.
@@ -405,6 +441,8 @@ fi
 info "7. install.sh stamp (bake key + apt URL) + baked-default render"
 # Reuse the throwaway public key generated for this selftest's signed repo.
 # It is a real parseable OpenPGP key, but never a production or host key.
+# Use the real throwaway archive key embedded in the guest qcow, so the
+# publish keyring gate can verify the image-only installer/key agreement.
 AKEY="$ARCHASC"
 BAKED="$WORK/install.baked.sh"
 if $PY "$DIST/publish.py" stamp-installer --out "$BAKED" \
@@ -746,6 +784,31 @@ if inv_publish; then
     ok "publish passes a complete inventory set (#6500 control)"
 else
     bad "publish MUST pass a complete inventory set but FAILED (#6500 control)"
+fi
+
+# 8j-6: #12188 — a signed, validated image with a placeholder installed
+# keyring must fail image-only publish when the gate opens the qcow payload.
+inv_reset
+GUEST_BAD="$WORK/guest-placeholder"
+mkdir -p "$GUEST_BAD/usr/share/keyrings"
+cp "$DIST/xpf-archive-keyring.asc.placeholder" \
+   "$GUEST_BAD/usr/share/keyrings/xpf-archive-keyring.asc"
+if ! virt-make-fs --format=qcow2 --type=ext4 --partition=mbr \
+     "$GUEST_BAD" "$INV/xpf-$VER.qcow2" >/dev/null 2>"$WORK/virt-make-fs-bad.err"; then
+    echo "ERROR: virt-make-fs failed to build placeholder-keyring guest image: $(cat "$WORK/virt-make-fs-bad.err")" >&2
+    exit 1
+fi
+direct_sign "$INV" "$VER" "$INV/xpf-$VER.qcow2" \
+    "$INV/xpf-$VER.incus-metadata.tar.gz" "$INV/xpf-$VER.manifest" \
+    "$INV/xpf-$VER.pkgs"
+if XPF_IMAGE_PUBKEY="$WORK/img.pub" $PY "$DIST/publish.py" \
+     --dist "$INV" --channel stable --no-apt >"$WORK/keyring-placeholder.out" 2>&1; then
+    bad "publish MUST refuse a placeholder image keyring but PASSED (#12188)"
+elif grep -q "PLACEHOLDER archive keyring" "$WORK/keyring-placeholder.out"; then
+    ok "image-only publish opens the qcow and refuses its placeholder keyring (#12188)"
+else
+    bad "publish refused placeholder image for the wrong reason (#12188)"
+    cat "$WORK/keyring-placeholder.out" >&2
 fi
 
 # ── 8k. #6504: the signed channel pointer has a CONSUMER ───────────────────

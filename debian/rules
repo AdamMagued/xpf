@@ -125,14 +125,31 @@ override_dh_auto_install:
 	@# key before `apt install`, so dpkg would hit a conffile prompt (hangs
 	@# unattended installs) and `force-confnew` would clobber the real key
 	@# with the placeholder (fleet lockout). /usr/share/keyrings is
-	@# package-owned and updates seamlessly on upgrade (AGY-A1). Prefer the
-	@# real key when the release build has dropped it in; otherwise ship the
-	@# placeholder (apt rejects the signature — the correct fail-safe).
+	@# package-owned and updates seamlessly on upgrade (AGY-A1). #12188:
+	@# the real key is REQUIRED for release builds — a deb embedding the
+	@# placeholder would install into the baked image, and image-only
+	@# publish never opened the image keyring, so a signed image shipped
+	@# that could not verify the repo. XPF_RELEASE=1 FAILS when the real-key
+	@# drop-in is absent. Default/dev builds WARN loudly and ship the placeholder.
+	@# XPF_ALLOW_PLACEHOLDER_KEYRING=1 explicitly labels that dev intent.
+	@# Publish refuses placeholder-key debs AND images at both gates
+	@# regardless, so the build-time FATAL is fail-fast, not the security
+	@# property.
 	install -d debian/xpf/usr/share/keyrings
 	if [ -f scripts/dist/xpf-archive-keyring.asc ]; then \
 	    install -m 0644 scripts/dist/xpf-archive-keyring.asc \
 	            debian/xpf/usr/share/keyrings/xpf-archive-keyring.asc; \
+	elif [ "$${XPF_RELEASE:-}" = "1" ]; then \
+	    echo "FATAL: XPF_RELEASE=1 but scripts/dist/xpf-archive-keyring.asc is missing — refusing to embed the placeholder archive keyring in a release build (#12188)" >&2; \
+	    echo "FATAL: drop in the real key (see scripts/dist/README.md)" >&2; \
+	    exit 1; \
+	elif [ "$${XPF_ALLOW_PLACEHOLDER_KEYRING:-}" = "1" ]; then \
+	    echo "WARNING: shipping the PLACEHOLDER archive keyring (XPF_ALLOW_PLACEHOLDER_KEYRING=1) — this .deb is NOT releasable and its images are NOT publishable" >&2; \
+	    install -m 0644 scripts/dist/xpf-archive-keyring.asc.placeholder \
+	            debian/xpf/usr/share/keyrings/xpf-archive-keyring.asc; \
 	else \
+	    echo "WARNING: scripts/dist/xpf-archive-keyring.asc is missing — shipping the PLACEHOLDER archive keyring in a DEV .deb (#12188)" >&2; \
+	    echo "WARNING: this .deb is NOT releasable and its images are NOT publishable; drop in the real key (see scripts/dist/README.md), or set XPF_RELEASE=1 to fail closed" >&2; \
 	    install -m 0644 scripts/dist/xpf-archive-keyring.asc.placeholder \
 	            debian/xpf/usr/share/keyrings/xpf-archive-keyring.asc; \
 	fi
