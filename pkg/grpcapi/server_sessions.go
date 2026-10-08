@@ -130,9 +130,9 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 }
 
 // getSessionsCursor implements cursor-based pagination.
-// It iterates only up to page_size matching entries, avoids full-table
-// scans for the total count (uses SessionCount instead), and skips
-// enrichment when no_enrich is set.
+// It iterates only up to page_size matching entries, skips enrichment when
+// no_enrich is set, and computes the exact Total with a cancellation-sampled
+// count-only scan shared by the filtered and unfiltered cases.
 //
 // The cursor-iteration provider interface (sessionCursorIterator)
 // lives in runtime.go alongside grpcRuntime and the userspace
@@ -213,8 +213,12 @@ func (s *Server) getSessionsCursor(ctx context.Context, req *pb.GetSessionsReque
 	// the legacy offset/limit pagination preserves the master/
 	// pre-#1516 user-visible behavior in those edge cases instead
 	// of surfacing a codes.Internal to the client.
+	cancelled := newSessionWalkCancelSampler(ctx, sessionWalkCancelInterval9060)
 	if startV4 {
 		if err := iterDP.IterateSessionsFrom(cursorV4, func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+			if cancelled() {
+				return false
+			}
 			if len(all) >= pageSize {
 				return false // page full
 			}
@@ -237,10 +241,16 @@ func (s *Server) getSessionsCursor(ctx context.Context, req *pb.GetSessionsReque
 			lastV4Key = key
 			return true
 		}); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, status.FromContextError(ctxErr).Err()
+			}
 			if errors.Is(err, dpuserspace.ErrCursorIterationUnsupported) {
 				return s.getSessionsLegacy(ctx, req)
 			}
 			return nil, status.Errorf(codes.Internal, "v4 session iteration: %v", err)
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, status.FromContextError(ctxErr).Err()
 		}
 		if len(all) >= pageSize {
 			// Page is full from v4; next page token resumes v4.
@@ -248,7 +258,7 @@ func (s *Server) getSessionsCursor(ctx context.Context, req *pb.GetSessionsReque
 				Sessions:      all,
 				NextPageToken: encodePageTokenV4(lastV4Key),
 			}
-			if err := s.setSessionsTotal(resp, filter); err != nil {
+			if err := s.setSessionsTotal(ctx, resp, filter); err != nil {
 				return nil, err
 			}
 			s.setSessionsNodeID(resp)
@@ -263,6 +273,9 @@ func (s *Server) getSessionsCursor(ctx context.Context, req *pb.GetSessionsReque
 	if startV6 {
 		v6Exhausted = false
 		if err := iterDP.IterateSessionsV6From(cursorV6, func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+			if cancelled() {
+				return false
+			}
 			if len(all) >= pageSize {
 				return false
 			}
@@ -285,17 +298,23 @@ func (s *Server) getSessionsCursor(ctx context.Context, req *pb.GetSessionsReque
 			lastV6Key = key
 			return true
 		}); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, status.FromContextError(ctxErr).Err()
+			}
 			if errors.Is(err, dpuserspace.ErrCursorIterationUnsupported) {
 				return s.getSessionsLegacy(ctx, req)
 			}
 			return nil, status.Errorf(codes.Internal, "v6 session iteration: %v", err)
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, status.FromContextError(ctxErr).Err()
 		}
 		if len(all) >= pageSize {
 			resp := &pb.GetSessionsResponse{
 				Sessions:      all,
 				NextPageToken: encodePageTokenV6(lastV6Key),
 			}
-			if err := s.setSessionsTotal(resp, filter); err != nil {
+			if err := s.setSessionsTotal(ctx, resp, filter); err != nil {
 				return nil, err
 			}
 			s.setSessionsNodeID(resp)
@@ -312,7 +331,7 @@ func (s *Server) getSessionsCursor(ctx context.Context, req *pb.GetSessionsReque
 		Sessions: all,
 		// NextPageToken is empty — no more data.
 	}
-	if err := s.setSessionsTotal(resp, filter); err != nil {
+	if err := s.setSessionsTotal(ctx, resp, filter); err != nil {
 		return nil, err
 	}
 	s.setSessionsNodeID(resp)
@@ -323,41 +342,63 @@ func (s *Server) getSessionsCursor(ctx context.Context, req *pb.GetSessionsReque
 // setSessionsTotal sets the Total field on the response to the exact count
 // of filter-matching sessions.
 //
-// With no filters active, the lightweight SessionCount() avoids a scan (it
-// counts forward map entries directly). With filters active, a count-only
-// scan — no reverse-entry merge, no app resolution, no allocation — yields
-// the REAL filtered total instead of the -1 sentinel the cursor path used
-// to return (#5034 / C175-HC-073). matchV4/matchV6 already skip reverse
-// entries, so the count is forward-only, matching both SessionCount() and
-// the legacy path's idx total. A filtered session view — including a
-// cluster peer's session detail — now reports a meaningful "Total
-// sessions" count rather than a negative sentinel.
+// The count is a cancellation-sampled count-only scan — no reverse-entry
+// merge, no app resolution, no allocation — shared by the filtered and
+// unfiltered cases (#5034 / C175-HC-073, #12180). matchV4/matchV6 already
+// skip reverse entries, so the count is forward-only, matching the legacy
+// path's idx total. A filtered session view — including a cluster peer's
+// session detail — now reports a meaningful "Total sessions" count rather
+// than a negative sentinel.
+//
+// The unfiltered case deliberately does NOT use SessionCount(): that call
+// walks both maps with no cancellation hook, so every unfiltered cursor page
+// would pay a full v4+v6 walk under a shared scan slot even after the caller
+// cancelled (#12180 F1). The sampled walk below stops at the next sampling
+// point instead.
 //
 // An iterator error is propagated (codes.Internal) so a partial count
 // fails the RPC rather than surfacing as a successful under-count, matching
 // the #2469 discipline for the page-iteration scans above.
-func (s *Server) setSessionsTotal(resp *pb.GetSessionsResponse, f *sessionFilter) error {
-	if !f.hasFilters {
-		v4, v6 := s.dp.SessionCount()
-		resp.Total = clampInt32(int64(v4) + int64(v6))
-		return nil
+// Cancellation aborts a partial count and skips the second full-table walk.
+func (s *Server) setSessionsTotal(ctx context.Context, resp *pb.GetSessionsResponse, f *sessionFilter) error {
+	if err := ctx.Err(); err != nil {
+		return status.FromContextError(err).Err()
 	}
 	total := 0
+	cancelled := newSessionWalkCancelSampler(ctx, sessionWalkCancelInterval9060)
 	if err := s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+		if cancelled() {
+			return false
+		}
 		if f.matchV4(key, val) {
 			total++
 		}
 		return true
 	}); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return status.FromContextError(ctxErr).Err()
+		}
 		return status.Errorf(codes.Internal, "v4 session count: %v", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return status.FromContextError(err).Err()
+	}
 	if err := s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		if cancelled() {
+			return false
+		}
 		if f.matchV6(key, val) {
 			total++
 		}
 		return true
 	}); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return status.FromContextError(ctxErr).Err()
+		}
 		return status.Errorf(codes.Internal, "v6 session count: %v", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return status.FromContextError(err).Err()
 	}
 	resp.Total = clampInt32(int64(total))
 	return nil
