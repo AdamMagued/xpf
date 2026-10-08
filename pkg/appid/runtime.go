@@ -188,6 +188,14 @@ func CatalogNames(cfg *config.Config, includeAll bool) ([]string, error) {
 // honor a configured `source-port` constraint (#3428). Both the source and the
 // destination port are threaded through to the fallback matcher.
 func ResolveSessionName(appNames map[uint16]string, cfg *config.Config, proto uint8, srcPort, dstPort uint16, appID uint16) string {
+	return ResolveSessionNameWithIndex(appNames, cfg, nil, proto, srcPort, dstPort, appID)
+}
+
+// ResolveSessionNameWithIndex is ResolveSessionName with a per-config snapshot
+// fallback index. Build the index once before rendering or matching a session
+// batch; a nil index is accepted for one-off callers and creates a temporary
+// index only if the disabled-path tie needs it.
+func ResolveSessionNameWithIndex(appNames map[uint16]string, cfg *config.Config, fallback *FallbackIndex, proto uint8, srcPort, dstPort uint16, appID uint16) string {
 	if appID != 0 {
 		if name := appNames[appID]; name != "" {
 			return name
@@ -205,7 +213,7 @@ func ResolveSessionName(appNames map[uint16]string, cfg *config.Config, proto ui
 		return Unknown
 	}
 
-	return resolveTupleFallback(proto, srcPort, dstPort, cfg, appNames)
+	return resolveTupleFallbackWithIndex(proto, srcPort, dstPort, cfg, appNames, fallback)
 }
 
 // SessionMatches reports whether a session's resolved application name equals
@@ -222,10 +230,16 @@ func ResolveSessionName(appNames map[uint16]string, cfg *config.Config, proto ui
 // broaden a filtered clear to delete sessions the operator did not name. Junos
 // application filters are case-exact, so exact `==` here is the parity contract.
 func SessionMatches(filter string, appNames map[uint16]string, cfg *config.Config, proto uint8, srcPort, dstPort uint16, appID uint16) bool {
+	return SessionMatchesWithIndex(filter, appNames, cfg, nil, proto, srcPort, dstPort, appID)
+}
+
+// SessionMatchesWithIndex is SessionMatches with a per-config snapshot fallback
+// index; see ResolveSessionNameWithIndex.
+func SessionMatchesWithIndex(filter string, appNames map[uint16]string, cfg *config.Config, fallback *FallbackIndex, proto uint8, srcPort, dstPort uint16, appID uint16) bool {
 	if filter == "" {
 		return true
 	}
-	return ResolveSessionName(appNames, cfg, proto, srcPort, dstPort, appID) == filter
+	return ResolveSessionNameWithIndex(appNames, cfg, fallback, proto, srcPort, dstPort, appID) == filter
 }
 
 func sortedNames(names map[string]struct{}) []string {
@@ -237,24 +251,132 @@ func sortedNames(names map[string]struct{}) []string {
 	return out
 }
 
-// assignedIDForName resolves a catalog name's actual app_id without allocating
-// a second map for each session-name lookup. Most names retain their natural
-// hash, so the common case is one map lookup. Only a name whose natural slot is
-// occupied needs a scan to find its collision-displaced assigned id.
-func assignedIDForName(appNames map[uint16]string, name string) uint16 {
+type fallbackSlot struct {
+	firstName    string
+	multiplicity uint8
+}
+
+// FallbackIndex is a per-config-snapshot cache for the AppID-disabled tuple
+// fallback's collision work (#12225 F1). Both the collision predicate and the
+// full-catalog reassignment map depend only on the configured name universe
+// (predefined plus user applications), so recomputing them on every rendered
+// session turns each same-tier tie into O(P+N) hashing — and each colliding
+// tie into a full AssignStableAppIDsQuiet reassignment with 24-82 transient
+// allocs. Callers that render sessions in a loop (REST/gRPC show, CLI filters,
+// top-talkers) build one index per request and pass it to the index-taking
+// resolver variants, amortizing that work to once per config snapshot.
+//
+// The index is a snapshot: mutating cfg.Applications.Applications after New-
+// FallbackIndex (as some tests do in place) requires rebuilding the index.
+// There is intentionally no package-global memo keyed by *config.Config — a
+// shared cache would go stale on such in-place mutation. A single index is
+// used single-threaded by one session scan; concurrent scans must use their
+// own index (no mutex is held so the warmed path stays allocation-free).
+type FallbackIndex struct {
+	// multiplicity counts distinct names per natural StableAppID, capped at
+	// two because the resolver only needs to know whether a slot collides.
+	// It covers predefined and user names, including shadowed names and
+	// present-but-nil user entries.
+	slots map[uint16]fallbackSlot
+	// names is the full-universe list for the lazy reassignment; the config
+	// assignment helper deduplicates a name shadowing a predefined app.
+	names []string
+	// fullIDs caches the AssignStableAppIDsQuiet result (or its error) on
+	// first colliding-tie use so one request reuses one assignment.
+	fullIDs map[string]uint16
+	fullErr error
+	fullOK  bool
+}
+
+// NewFallbackIndex builds the per-request collision index for cfg. A nil cfg
+// yields a predefined-only universe, whose frozen IDs are collision-free;
+// callers may also pass a nil *FallbackIndex to the index-taking resolvers,
+// which defer index construction until a same-tier tie needs it.
+func NewFallbackIndex(cfg *config.Config) *FallbackIndex {
+	nameCount := len(config.PredefinedApplications)
+	if cfg != nil {
+		nameCount += len(cfg.Applications.Applications)
+	}
+	names := make([]string, 0, nameCount)
+	ix := &FallbackIndex{
+		slots: make(map[uint16]fallbackSlot, nameCount),
+	}
+	add := func(name string) {
+		names = append(names, name)
+		id := config.StableAppID(name)
+		slot, exists := ix.slots[id]
+		if !exists {
+			slot.firstName = name
+			slot.multiplicity = 1
+		} else if slot.firstName != name && slot.multiplicity < 2 {
+			slot.multiplicity++
+		}
+		ix.slots[id] = slot
+	}
+	for name := range config.PredefinedApplications {
+		add(name)
+	}
+	if cfg != nil {
+		for name := range cfg.Applications.Applications {
+			add(name)
+		}
+	}
+	ix.names = names
+	return ix
+}
+
+// Collides reports whether another full-catalog name shares name's natural
+// StableAppID slot. It is O(1) work with zero allocations: one StableAppID
+// hash plus one map load.
+func (ix *FallbackIndex) Collides(name string) bool {
+	if ix == nil {
+		return false
+	}
+	return ix.slots[config.StableAppID(name)].multiplicity > 1
+}
+
+// FullIDs returns the quiet full-universe name -> assigned-id map, building
+// it once on first use. The error (a >65535-name catalog) is cached like the
+// map so a pathological config cannot turn every colliding tie into a
+// rebuild-and-error storm.
+func (ix *FallbackIndex) FullIDs() (map[string]uint16, error) {
+	if ix == nil {
+		return nil, nil
+	}
+	if !ix.fullOK {
+		ix.fullIDs, ix.fullErr = config.AssignStableAppIDsQuiet(ix.names)
+		ix.fullOK = true
+	}
+	return ix.fullIDs, ix.fullErr
+}
+
+// assignedIDForName resolves a catalog name's actual app_id and reports whether
+// it is present. Most names retain their natural hash, so the common case is one
+// map lookup. Only a collision-displaced name needs a scan to find its assigned
+// id; returning presence alongside that result also avoids a duplicate scan for
+// the #12225 referenced-tie gate.
+func assignedIDForName(appNames map[uint16]string, name string) (uint16, bool) {
 	naturalID := config.StableAppID(name)
-	if owner := appNames[naturalID]; owner == "" || owner == name {
-		return naturalID
+	if owner := appNames[naturalID]; owner == name {
+		return naturalID, true
+	} else if owner == "" {
+		return naturalID, false
 	}
 	for assignedID, assignedName := range appNames {
 		if assignedName == name {
-			return assignedID
+			return assignedID, true
 		}
 	}
-	return naturalID
+	return naturalID, false
 }
 
+// resolveTupleFallback keeps the one-off/internal test seam while batch
+// callers use resolveTupleFallbackWithIndex to share the config-derived work.
 func resolveTupleFallback(proto uint8, srcPort, dstPort uint16, cfg *config.Config, appNames map[uint16]string) string {
+	return resolveTupleFallbackWithIndex(proto, srcPort, dstPort, cfg, appNames, nil)
+}
+
+func resolveTupleFallbackWithIndex(proto uint8, srcPort, dstPort uint16, cfg *config.Config, appNames map[uint16]string, fallback *FallbackIndex) string {
 	if cfg != nil {
 		// #2578: cfg.Applications.Applications is a Go map; iterating it and
 		// returning the first match is non-deterministic. When BOTH a
@@ -264,19 +386,23 @@ func resolveTupleFallback(proto uint8, srcPort, dstPort uint16, cfg *config.Conf
 		// (a source-port and/or destination-port constraint) over a
 		// protocol-only one, and break same-tier ties by LOWEST assigned app_id.
 		//
-		// #10722: use the assigned app_id carried by the catalog, not the natural
-		// StableAppID hash. AssignStableAppIDs displaces a user app that collides
-		// with an already-placed id, so its assigned id can differ from its hash.
-		// Rust resolves same-tier overlaps by the lowest assigned app_id; using
-		// this map keeps the AppID-disabled Go label path in parity, including
-		// collision-displaced apps (#5296/#5988/#3612).
-		//
-		// Names absent from this catalog map (for example, a tolerated config
-		// entry not referenced by policy) retain the natural hash fallback so
-		// the disabled label path keeps its existing configured-app coverage.
+		// #10722/#12225: use assigned IDs, not natural StableAppID hashes, for
+		// same-tier ties involving an uncatalogued candidate and a hash
+		// collision. The per-request index makes that collision check O(1) and
+		// lazily caches the full-universe assignment. If all tied candidates are
+		// already in the AppID-off catalog, keep that catalog's own assigned-ID
+		// order: sessions stamped by the off dataplane and unstamped sessions
+		// must retain the same fallback label (#12225 F3).
 		best := ""
 		bestPortBased := false
 		var bestID uint16
+		bestCatalogued := false
+		hasTie := false
+		needsAssignedIDs := false
+		anyUncatalogued := false
+		var fullIDs map[string]uint16
+		fullIDsTried := false
+		fullIDsActive := false
 		for name, app := range cfg.Applications.Applications {
 			// #4865: skip a tolerated nil user-application value (a JSON null
 			// decoding to a nil pointer on a lenient/HA-synced load, #3494).
@@ -301,12 +427,53 @@ func resolveTupleFallback(proto uint8, srcPort, dstPort uint16, cfg *config.Conf
 				continue
 			}
 			portBased := app.DestinationPort != "" || app.SourcePort != ""
-			id := assignedIDForName(appNames, name)
-			if best == "" || (portBased && !bestPortBased) ||
-				(portBased == bestPortBased && id < bestID) {
+			id, catalogued := assignedIDForName(appNames, name)
+			if best == "" || (portBased && !bestPortBased) {
 				best = name
 				bestPortBased = portBased
 				bestID = id
+				hasTie = false
+				needsAssignedIDs = false
+				anyUncatalogued = false
+				bestCatalogued = catalogued
+				fullIDsTried = false
+				fullIDsActive = false
+			} else if portBased == bestPortBased {
+				if !hasTie {
+					hasTie = true
+					if fallback == nil {
+						fallback = NewFallbackIndex(cfg)
+					}
+					needsAssignedIDs = fallback.Collides(best) || fallback.Collides(name)
+					anyUncatalogued = !bestCatalogued || !catalogued
+				} else {
+					if !needsAssignedIDs && fallback.Collides(name) {
+						needsAssignedIDs = true
+					}
+					if !anyUncatalogued {
+						anyUncatalogued = !catalogued
+					}
+				}
+				// Switch the current tier to full-catalog IDs exactly once as
+				// soon as both conditions are known. Include the current best
+				// in that rank before comparing this candidate; continue selecting
+				// incrementally so no second tuple-matching scan is needed.
+				if needsAssignedIDs && anyUncatalogued && !fullIDsTried {
+					fullIDsTried = true
+					if ids, err := fallback.FullIDs(); err == nil {
+						fullIDs = ids
+						fullIDsActive = true
+						bestID = ids[best]
+					}
+				}
+				if fullIDsActive {
+					id = fullIDs[name]
+				}
+				if id < bestID || (id == bestID && name < best) {
+					best = name
+					bestID = id
+					bestCatalogued = catalogued
+				}
 			}
 		}
 		if best != "" {

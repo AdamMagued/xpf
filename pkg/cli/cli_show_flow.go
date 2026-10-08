@@ -408,7 +408,7 @@ func (c *CLI) showFlowSession(args []string) error {
 		fmt.Printf("  Out: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Zone: %s, Pkts: %d, Bytes: %d,\n",
 			outSrcIP, outSrcPort, outDstIP, outDstPort, protoName,
 			outIf, outZone, val.RevPackets, val.RevBytes)
-		if appName := appid.ResolveSessionName(f.appNames, f.cfg, key.Protocol, srcPort, dstPort, val.AppID); appName != "" {
+		if appName := appid.ResolveSessionNameWithIndex(f.appNames, f.cfg, f.appFallback, key.Protocol, srcPort, dstPort, val.AppID); appName != "" {
 			fmt.Printf("  Application: %s\n", appName)
 		}
 		fmt.Println()
@@ -537,7 +537,7 @@ func (c *CLI) showFlowSession(args []string) error {
 		fmt.Printf("  Out: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Zone: %s, Pkts: %d, Bytes: %d,\n",
 			outSrcIP, outSrcPort, outDstIP, outDstPort, protoName,
 			outIf, outZone, val.RevPackets, val.RevBytes)
-		if appName := appid.ResolveSessionName(f.appNames, f.cfg, key.Protocol, srcPort, dstPort, val.AppID); appName != "" {
+		if appName := appid.ResolveSessionNameWithIndex(f.appNames, f.cfg, f.appFallback, key.Protocol, srcPort, dstPort, val.AppID); appName != "" {
 			fmt.Printf("  Application: %s\n", appName)
 		}
 		fmt.Println()

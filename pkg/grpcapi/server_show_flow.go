@@ -210,11 +210,11 @@ func (s *Server) showFlowStatistics(buf *strings.Builder) {
 }
 
 // resolveSessionName is a package-level indirection over
-// appid.ResolveSessionName so the bounded top-K deferral in
+// appid.ResolveSessionNameWithIndex so the bounded top-K deferral in
 // showSessionsTop (enrich only the <=K survivors, never all N sessions)
 // can be asserted by a counting fake in tests. Production always binds
-// appid.ResolveSessionName.
-var resolveSessionName = appid.ResolveSessionName
+// appid.ResolveSessionNameWithIndex.
+var resolveSessionName = appid.ResolveSessionNameWithIndex
 
 // topSessionsK is the fixed row count `show ... sessions-top` renders
 // (Junos-style top-20). Selection is bounded to this many survivors via
@@ -301,6 +301,10 @@ func (s *Server) showSessionsTop(cfg *config.Config, topic string, buf *strings.
 	if cr := s.applyResult(); cr != nil {
 		zoneNames = config.SurvivorZoneNames(cr.ZoneIDs, cfg)
 		appNames = cr.AppNames
+	}
+	var appFallback *appid.FallbackIndex
+	if cfg != nil {
+		appFallback = appid.NewFallbackIndex(cfg)
 	}
 
 	h := &topCandHeap{}
@@ -425,7 +429,7 @@ func (s *Server) showSessionsTop(cfg *config.Config, topic string, buf *strings.
 		if now > c.created {
 			age = int64(now - c.created)
 		}
-		app := resolveSessionName(appNames, cfg, c.proto, ntohs(c.srcPort), ntohs(c.dstPort), c.appID)
+		app := resolveSessionName(appNames, cfg, appFallback, c.proto, ntohs(c.srcPort), ntohs(c.dstPort), c.appID)
 		fmt.Fprintf(buf, "%-5d %-22s %-22s %-5s %-20s %5d/%-6d %5d/%-6d %5d %s\n",
 			i+1, src, dst, protoName(c.proto), inZ+"->"+outZ,
 			c.fwdBytes, c.revBytes, c.fwdPkts, c.revPkts, age, app)

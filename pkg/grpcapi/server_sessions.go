@@ -231,7 +231,7 @@ func (s *Server) getSessionsCursor(ctx context.Context, req *pb.GetSessionsReque
 			}
 			se := sessionEntryV4(key, val, now, filter.zoneNames, filter.policyNames, filter.zoneIfaces, filter.egressIfaces, haActive)
 			if !noEnrich {
-				se.Application = appid.ResolveSessionName(filter.appNames, filter.cfg, key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID)
+				se.Application = appid.ResolveSessionNameWithIndex(filter.appNames, filter.cfg, filter.appFallback, key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID)
 			}
 			all = append(all, se)
 			lastV4Key = key
@@ -279,7 +279,7 @@ func (s *Server) getSessionsCursor(ctx context.Context, req *pb.GetSessionsReque
 			}
 			se := sessionEntryV6(key, val, now, filter.zoneNames, filter.policyNames, filter.zoneIfaces, filter.egressIfaces, haActive)
 			if !noEnrich {
-				se.Application = appid.ResolveSessionName(filter.appNames, filter.cfg, key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID)
+				se.Application = appid.ResolveSessionNameWithIndex(filter.appNames, filter.cfg, filter.appFallback, key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID)
 			}
 			all = append(all, se)
 			lastV6Key = key
@@ -386,6 +386,7 @@ type sessionFilter struct {
 	snatPoolOK   bool         // pool name resolved to a configured source pool
 	inputErr     error        // invalid filter input (bad prefix/port) — must fail the RPC
 	cfg          *config.Config
+	appFallback  *appid.FallbackIndex
 	zoneNames    map[uint16]string
 	// zoneIfaces holds EVERY interface bound to a zone, not just the first
 	// (#6960). The single-value form was the pre-#4792 approximation: a
@@ -458,6 +459,9 @@ func (s *Server) buildSessionFilter(req *pb.GetSessionsRequest) *sessionFilter {
 		zoneNames:    make(map[uint16]string),
 		zoneIfaces:   make(map[uint16][]string),
 		egressIfaces: make(map[sessionEgressKey]string),
+	}
+	if f.cfg != nil {
+		f.appFallback = appid.NewFallbackIndex(f.cfg)
 	}
 	protoOK := true
 	if req.Protocol != "" {
@@ -607,7 +611,7 @@ func (f *sessionFilter) matchV4(key dataplane.SessionKey, val dataplane.SessionV
 	if f.natOnly && val.Flags&(dataplane.SessFlagSNAT|dataplane.SessFlagDNAT) == 0 {
 		return false
 	}
-	if f.appFilter != "" && !appid.SessionMatches(f.appFilter, f.appNames, f.cfg,
+	if f.appFilter != "" && !appid.SessionMatchesWithIndex(f.appFilter, f.appNames, f.cfg, f.appFallback,
 		key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID) {
 		return false
 	}
@@ -652,7 +656,7 @@ func (f *sessionFilter) matchV6(key dataplane.SessionKeyV6, val dataplane.Sessio
 	if f.natOnly && val.Flags&(dataplane.SessFlagSNAT|dataplane.SessFlagDNAT) == 0 {
 		return false
 	}
-	if f.appFilter != "" && !appid.SessionMatches(f.appFilter, f.appNames, f.cfg,
+	if f.appFilter != "" && !appid.SessionMatchesWithIndex(f.appFilter, f.appNames, f.cfg, f.appFallback,
 		key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID) {
 		return false
 	}
@@ -873,7 +877,7 @@ func (s *Server) getSessionsLegacy(ctx context.Context, req *pb.GetSessionsReque
 			}
 			se := sessionEntryV4(key, val, now, filter.zoneNames, filter.policyNames, filter.zoneIfaces, filter.egressIfaces, haActive)
 			if !noEnrich {
-				se.Application = appid.ResolveSessionName(filter.appNames, filter.cfg, key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID)
+				se.Application = appid.ResolveSessionNameWithIndex(filter.appNames, filter.cfg, filter.appFallback, key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID)
 			}
 			all = append(all, se)
 		}
@@ -901,7 +905,7 @@ func (s *Server) getSessionsLegacy(ctx context.Context, req *pb.GetSessionsReque
 			}
 			se := sessionEntryV6(key, val, now, filter.zoneNames, filter.policyNames, filter.zoneIfaces, filter.egressIfaces, haActive)
 			if !noEnrich {
-				se.Application = appid.ResolveSessionName(filter.appNames, filter.cfg, key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID)
+				se.Application = appid.ResolveSessionNameWithIndex(filter.appNames, filter.cfg, filter.appFallback, key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID)
 			}
 			all = append(all, se)
 		}

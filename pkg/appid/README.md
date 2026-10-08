@@ -59,25 +59,33 @@ and resolves session display names from the dataplane's assigned `app_id`.
   display-only label path — it does not affect policy enforcement, which
   uses the dataplane-assigned `app_id`.
 
-  **Single precedence contract across the AppID knob (#3612):** the
-  AppID-ENABLED Rust catalog (`AppCatalog::lookup_directional` in
-  `userspace-dp/src/policy.rs`) resolves overlapping application labels by
-  the *same* binary-specificity rule — **port-constrained beats
-  protocol-only, then lowest assigned `app_id` within a tier, including
-  collision-displaced IDs (#5296/#10722).** Before #3612 the enabled
-  path tie-broke on the lowest `app_id` regardless of specificity, so
-  the same 5-tuple could be labeled with a broad protocol-only app when
-  AppID was on but the specific port-based app when AppID was off.
-  Both paths now agree; the shared, self-describing fixture
-  `userspace-dp/tests/fixtures/appid_precedence_v1.json` pins the agreement
-  (`TestAppIDPrecedenceParityFixture` here drives the disabled path;
-  `app_catalog_precedence_parity_fixture` in `policy_tests.rs` drives the
-  enabled path over the same cases). The divergence was
-  display/observability only — enforcement was never affected. Two adjacent
-  divergences are deferred out of #3612: the disabled path's non-user
-  fallback is a narrow hardcoded `builtinFallbacks` set rather than the full
-  predefined catalog the enabled path sees (S1), and the disabled path has
-  no reverse-direction service-slot model (S2). When AppID is **enabled** in
+  For AppID-off batches, `NewFallbackIndex(cfg)` caches the natural-ID
+  multiplicities and lazily builds the full predefined-plus-user assigned-ID
+  map. Build it once per request and pass it to `ResolveSessionNameWithIndex`
+  and `SessionMatchesWithIndex`; this avoids repeating collision scans and
+  catalog assignment for each rendered or filtered session (#12225).
+
+  **Specificity rule across AppID modes (#3612):** both paths prefer
+  port-constrained matches to protocol-only matches. For same-tier ties,
+  the enabled Rust catalog uses its full assigned-ID map. The disabled Go
+  resolver normally uses the current AppID-off catalog's assigned IDs; when a
+  tie has a natural-ID collision and at least one candidate is absent from
+  that catalog, it re-ranks from the full predefined-plus-user assigned-ID
+  map so an unreferenced collision partner can displace the winner (#12225).
+  When every tied candidate is catalogued, the fallback keeps the off-catalog
+  IDs so an unstamped session retains the label of an already-stamped
+  AppID-off session. The shared fixture
+  `userspace-dp/tests/fixtures/appid_precedence_v1.json` pins the baseline
+  specificity cases (`TestAppIDPrecedenceParityFixture` here drives the
+  disabled path; `app_catalog_precedence_parity_fixture` in `policy_tests.rs`
+  drives the enabled path over the same cases). Before #3612, the enabled
+  path tie-broke on lowest `app_id` regardless of specificity, so a broad
+  protocol-only app could shadow a specific port-based app.
+  This is a display/observability decision only — enforcement was never
+  affected. Two adjacent divergences are deferred out of #3612: the disabled
+  path's non-user fallback is a narrow hardcoded `builtinFallbacks` set rather
+  than the full predefined catalog the enabled path sees (S1), and the disabled
+  path has no reverse-direction service-slot model (S2). When AppID is **enabled** in
   `services.application-identification` and the dataplane has not
   assigned an `app_id` for the session (`appID == 0`), the function
   returns `UNKNOWN` rather than guessing from port heuristics. When
@@ -89,9 +97,12 @@ and resolves session display names from the dataplane's assigned `app_id`.
   and `pkg/flowexport` does not call this function — the wiring
   isn't shared with NetFlow / syslog.)
 
+  `ResolveSessionNameWithIndex` and `SessionMatchesWithIndex` take that
+  request-scoped index; their legacy counterparts remain for one-off callers.
+
 ## Callers
 
-`pkg/cli`, `pkg/dataplane` (compilation), `pkg/dataplane/userspace`
+`pkg/api`, `pkg/cli`, `pkg/dataplane` (compilation), `pkg/dataplane/userspace`
 (catalog ship via `BuildCatalog`), `pkg/grpcapi`, `pkg/daemon`.
 
 ## Dependencies

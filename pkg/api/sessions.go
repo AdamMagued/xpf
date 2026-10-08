@@ -1222,6 +1222,7 @@ type sessionView struct {
 	zoneNames   map[uint16]string
 	policyNames map[uint32]string
 	appNames    map[uint16]string
+	appFallback *appid.FallbackIndex
 	// zoneIfaces holds EVERY interface bound to a zone, not just the first
 	// (#6960): collapsing a multi-interface zone to zone.Interfaces[0] made
 	// the ingress arm of the interface filter independent of the session, so
@@ -1246,6 +1247,9 @@ func (s *Server) buildSessionView() sessionView {
 	}
 	if s.store != nil {
 		v.cfg = s.store.ActiveConfig()
+	}
+	if v.cfg != nil {
+		v.appFallback = appid.NewFallbackIndex(v.cfg)
 	}
 	if s.haActiveFn != nil {
 		v.haActive = s.haActiveFn()
@@ -1459,7 +1463,7 @@ func (q *sessionQuery) matchV4(key dataplane.SessionKey, val dataplane.SessionVa
 	if q.natOnly && val.Flags&(dataplane.SessFlagSNAT|dataplane.SessFlagDNAT) == 0 {
 		return false
 	}
-	if q.app != "" && !appid.SessionMatches(q.app, q.view.appNames, q.view.cfg,
+	if q.app != "" && !appid.SessionMatchesWithIndex(q.app, q.view.appNames, q.view.cfg, q.view.appFallback,
 		key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID) {
 		return false
 	}
@@ -1503,7 +1507,7 @@ func (q *sessionQuery) matchV6(key dataplane.SessionKeyV6, val dataplane.Session
 	if q.natOnly && val.Flags&(dataplane.SessFlagSNAT|dataplane.SessFlagDNAT) == 0 {
 		return false
 	}
-	if q.app != "" && !appid.SessionMatches(q.app, q.view.appNames, q.view.cfg,
+	if q.app != "" && !appid.SessionMatchesWithIndex(q.app, q.view.appNames, q.view.cfg, q.view.appFallback,
 		key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID) {
 		return false
 	}
@@ -1691,7 +1695,7 @@ func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now ui
 		OutZone:          val.EgressZone,
 		IngressInterface: inIf,
 		EgressInterface:  outIf,
-		Application:      appid.ResolveSessionName(view.appNames, view.cfg, key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID),
+		Application:      appid.ResolveSessionNameWithIndex(view.appNames, view.cfg, view.appFallback, key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID),
 		FwdPackets:       val.FwdPackets,
 		FwdBytes:         val.FwdBytes,
 		RevPackets:       val.RevPackets,
@@ -1746,7 +1750,7 @@ func sessionEntryV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, no
 		OutZone:          val.EgressZone,
 		IngressInterface: inIf,
 		EgressInterface:  outIf,
-		Application:      appid.ResolveSessionName(view.appNames, view.cfg, key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID),
+		Application:      appid.ResolveSessionNameWithIndex(view.appNames, view.cfg, view.appFallback, key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID),
 		FwdPackets:       val.FwdPackets,
 		FwdBytes:         val.FwdBytes,
 		RevPackets:       val.RevPackets,
