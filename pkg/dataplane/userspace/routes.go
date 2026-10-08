@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"slices"
 	"sort"
 	"strings"
@@ -589,9 +590,12 @@ func buildRouteSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot, ove
 	// Do not restate the position as a safety property: it is not one, and a
 	// comment claiming a guarantee the code does not depend on is how the
 	// next reader stops looking for the guarantee that matters.
-	capped, err := addLearnedRouteSnapshots(cfg, out, addSnapshot)
+	capped, suppressedMTUs, err := addLearnedRouteSnapshots(cfg, out, addSnapshot)
 	if err != nil {
 		return nil, false, err
+	}
+	for index, mtu := range suppressedMTUs {
+		out[index].MTU = mtu
 	}
 
 	out = applyRouteOverlay(out, overlay)
@@ -1269,6 +1273,133 @@ func learnedRouteTableName(tableID int, family string, instByTableID map[int]str
 // kernel constant, not on a shared policy.
 const learnedRouteMainTableID = 254
 
+type routeNextHopAddress struct {
+	ip   netip.Addr
+	raw  string
+	isIP bool
+}
+
+type routeNextHopMeaning struct {
+	address routeNextHopAddress
+	iface   string
+}
+
+func routeNextHopMeaningOf(nextHop string, cfg *config.Config, configSide bool) routeNextHopMeaning {
+	address, iface, _ := strings.Cut(nextHop, "@")
+	meaning := routeNextHopMeaning{address: routeNextHopAddress{raw: address}}
+	if ip, err := netip.ParseAddr(address); err == nil {
+		meaning.address = routeNextHopAddress{ip: ip.Unmap(), isIP: true}
+	}
+	if iface != "" {
+		if configSide && routeInterfaceRefIsDeclared(cfg, iface) {
+			iface = cfg.ResolveKernelIfName(iface)
+		} else if strings.Contains(iface, "/") && strings.HasSuffix(iface, ".0") {
+			iface = strings.TrimSuffix(iface, ".0")
+		}
+		meaning.iface = config.LinuxIfName(iface)
+	}
+	return meaning
+}
+
+func routeInterfaceRefIsDeclared(cfg *config.Config, ref string) bool {
+	if cfg == nil {
+		return false
+	}
+	split := cfg.SplitInterfaceUnitRef(ref)
+	_, ifc, ok := config.LookupInterfaceByLinuxName(cfg, split.Base)
+	if !ok {
+		return false
+	}
+	if !split.HasUnit {
+		return true
+	}
+	unitNumber, _, err := config.CanonicalLogicalUnit(split.UnitTok)
+	if err != nil {
+		return false
+	}
+	_, ok = config.LookupUnit(ifc, unitNumber)
+	return ok
+}
+
+// routeNextHopsMatchByMeaning compares gateway members independent of order.
+// Declared config-side interface refs use the config's kernel-name resolver;
+// undeclared refs retain unit-0 fallback normalization. An absent interface is
+// unknown scope, so it matches a qualified gateway with the same address; two
+// explicit interfaces must identify the same link.
+func routeNextHopsMatchByMeaning(cfg *config.Config, a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	count := len(a)
+	if count == 0 {
+		return true
+	}
+	const stackNextHopLimit = 8
+	var identityStack [stackNextHopLimit * 2]routeNextHopMeaning
+	var matchedStack [stackNextHopLimit * 2]bool
+	var identities []routeNextHopMeaning
+	var matched []bool
+	if count <= stackNextHopLimit {
+		identities = identityStack[:count*2]
+		matched = matchedStack[:count*2]
+	} else {
+		identities = make([]routeNextHopMeaning, count*2)
+		matched = make([]bool, count*2)
+	}
+	for i := range a {
+		identities[i] = routeNextHopMeaningOf(a[i], cfg, true)
+		identities[count+i] = routeNextHopMeaningOf(b[i], cfg, false)
+	}
+	left, right := identities[:count], identities[count:]
+	leftMatched, rightMatched := matched[:count], matched[count:]
+
+	// Match exact scoped members first, preserving duplicate-member counts.
+	for i, hop := range left {
+		if hop.iface == "" {
+			continue
+		}
+		for j, candidate := range right {
+			if !rightMatched[j] && candidate.iface != "" &&
+				hop.address == candidate.address && hop.iface == candidate.iface {
+				leftMatched[i], rightMatched[j] = true, true
+				break
+			}
+		}
+	}
+	// Remaining scoped members can only pair with an unqualified member.
+	for i, hop := range left {
+		if leftMatched[i] || hop.iface == "" {
+			continue
+		}
+		for j, candidate := range right {
+			if !rightMatched[j] && candidate.iface == "" && hop.address == candidate.address {
+				leftMatched[i], rightMatched[j] = true, true
+				break
+			}
+		}
+		if !leftMatched[i] {
+			return false
+		}
+	}
+	// The remaining left members are unqualified; they can match either
+	// an unqualified or a still-unmatched scoped member of the same address.
+	for i, hop := range left {
+		if leftMatched[i] {
+			continue
+		}
+		for j, candidate := range right {
+			if !rightMatched[j] && hop.address == candidate.address {
+				leftMatched[i], rightMatched[j] = true, true
+				break
+			}
+		}
+		if !leftMatched[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // addLearnedRouteSnapshots imports kernel-learned routes and feeds the ones
 // that fill a genuine gap or outrank the configured route at that prefix to
 // addSnapshot.
@@ -1288,10 +1419,12 @@ const learnedRouteMainTableID = 254
 // The bool reports whether the #8355 cap shed any complete (table, protocol)
 // group. It is distinct from "nothing was imported": an empty kernel table and
 // a budget-limited table both may add zero routes, but only the latter leaves
-// the helper FIB deliberately incomplete.
-func addLearnedRouteSnapshots(cfg *config.Config, existing []RouteSnapshot, addSnapshot func(RouteSnapshot)) (bool, error) {
+// the helper FIB deliberately incomplete. The returned index-to-MTU map
+// identifies existing snapshots whose forwarding path matched a suppressed
+// learned route; callers apply it after additions.
+func addLearnedRouteSnapshots(cfg *config.Config, existing []RouteSnapshot, addSnapshot func(RouteSnapshot)) (bool, map[int]int, error) {
 	if learnedRouteImportFn == nil {
-		return false, nil
+		return false, nil, nil
 	}
 	instByTableID := make(map[int]string)
 	instanceTableIDs := make([]int, 0, len(cfg.RoutingInstances))
@@ -1306,17 +1439,17 @@ func addLearnedRouteSnapshots(cfg *config.Config, existing []RouteSnapshot, addS
 
 	learned, err := learnedRouteImportFn(routing.LearnedRouteTableIDs(instanceTableIDs))
 	if err != nil {
-		return false, fmt.Errorf("route snapshot: %w", err)
+		return false, nil, fmt.Errorf("route snapshot: %w", err)
 	}
 	if len(learned) == 0 {
-		return false, nil
+		return false, nil, nil
 	}
 	// #10824: shed complete (table, protocol) groups rather than declining the
 	// entire learned-route import. The cap-hit counters identify the affected
 	// protocol so one flooded BGP peer cannot evict unrelated learned routes.
 	learned, capped := capLearnedRouteGroups(learned)
 	if capped && len(learned) == 0 {
-		return true, nil
+		return true, nil, nil
 	}
 
 	configuredPreference := make(map[string]int, len(existing))
@@ -1367,6 +1500,7 @@ func addLearnedRouteSnapshots(cfg *config.Config, existing []RouteSnapshot, addS
 	var lastMetricKey string
 	var lowestMetric int
 	haveMetricKey := false
+	var suppressedMTUs map[int]int
 	for _, lr := range sorted {
 		family := "inet"
 		if lr.Family == netlink.FAMILY_V6 {
@@ -1420,6 +1554,29 @@ func addLearnedRouteSnapshots(cfg *config.Config, existing []RouteSnapshot, addS
 				// Keep a configured route that is at least as preferred as
 				// the learned protocol route. A worse configured fallback
 				// remains beside it for the Rust FIB's preference ordering.
+				//
+				// A same-prefix kernel route can be suppressed even though its
+				// route-wide MTU still constrains its forwarding path. Carry it
+				// only to the best configured candidate whose next hops match
+				// after declared config-side interfaces are resolved. Prefix
+				// matching uses the same canonical identity as suppression.
+				if lr.MTU > 0 && !lr.Discard {
+					for i, snap := range existing {
+						if snap.NextTable != "" || snap.Discard ||
+							snap.Table != table || snap.Family != family ||
+							canonicalRoutePrefix(snap.Destination) != canonicalRoutePrefix(dest) ||
+							snap.Preference != best ||
+							!routeNextHopsMatchByMeaning(cfg, snap.NextHops, lr.NextHops) {
+							continue
+						}
+						if suppressedMTUs == nil {
+							suppressedMTUs = make(map[int]int)
+						}
+						if mtu, ok := suppressedMTUs[i]; !ok || lr.MTU < mtu {
+							suppressedMTUs[i] = lr.MTU
+						}
+					}
+				}
 				continue
 			}
 		}
@@ -1434,7 +1591,7 @@ func addLearnedRouteSnapshots(cfg *config.Config, existing []RouteSnapshot, addS
 			MTU:            lr.MTU,
 		})
 	}
-	return capped, nil
+	return capped, suppressedMTUs, nil
 }
 
 // learnedRouteProtocolDistance returns FRR's default distance for dynamic
