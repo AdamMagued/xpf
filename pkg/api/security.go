@@ -978,6 +978,7 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 		// fail-closed retention + the offending content, NOT a fabricated
 		// permit/deny/default verdict.
 		writeOK(w, MatchPoliciesResult{
+			PostNATInputNote:        res.PostNATInputNote,
 			ContentRejected:         true,
 			ContentRejectionReasons: res.ContentRejectionReasons,
 			Action:                  res.DisplayAction(),
@@ -989,6 +990,7 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 	if res.HostInboundUnmatched {
 		writeOK(w, MatchPoliciesResult{
 			HostInboundUnmatched: true,
+			PostNATInputNote:     res.PostNATInputNote,
 			Action:               res.DisplayAction(),
 			// #3627 M06: echo the queried zone pair on the host-inbound path so
 			// the diagnostic names the tested zones (the host gate returns no
@@ -1005,6 +1007,7 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if !res.Matched {
 		writeOK(w, MatchPoliciesResult{
+			PostNATInputNote:         res.PostNATInputNote,
 			Action:                   res.DisplayAction(),
 			DefaultUsed:              res.DefaultUsed,
 			FeedPublicationDebt:      res.FeedPublicationDebt,
@@ -1029,11 +1032,12 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	matchedID := res.PolicyID
 	writeOK(w, MatchPoliciesResult{
-		Matched:    true,
-		PolicyName: res.PolicyName,
-		Global:     res.Global,
-		FromZone:   res.FromZone,
-		ToZone:     res.ToZone,
+		PostNATInputNote: res.PostNATInputNote,
+		Matched:          true,
+		PolicyName:       res.PolicyName,
+		Global:           res.Global,
+		FromZone:         res.FromZone,
+		ToZone:           res.ToZone,
 		// #3627 M06: also echo the queried zone pair on a positive match. It is
 		// the query context, distinct from FromZone/ToZone (the matched policy's
 		// declared scope), which can differ for a wildcard-zone or global match.
