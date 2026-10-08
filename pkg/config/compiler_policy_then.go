@@ -759,8 +759,9 @@ func validatePolicyUnsupportedThenSiblings(nodes []*Node, lenient bool) ([]strin
 }
 
 // validatePolicyEnforcementSubtrees rejects direct policy `term` and
-// `session-options` children, plus unknown children that can carry dropped
-// enforcement content. Harmless unknown scalar metadata remains advisory-only.
+// `session-options` children, plus every other unknown direct child except
+// scalar one-edit `description` typos with at most one value token and no
+// children, and Junos apply statements skipped by this gate.
 func validatePolicyEnforcementSubtrees(nodes []*Node, lenient bool) ([]string, error) {
 	var warnings []string
 	checkPolicy := func(scope, policyName string, polNode *Node) error {
@@ -777,7 +778,7 @@ func validatePolicyEnforcementSubtrees(nodes []*Node, lenient bool) ([]string, e
 		}
 		for _, child := range policyUnknownEnforcementChildren(polNode) {
 			msg := fmt.Sprintf(
-				"security policies %s policy %q contains unknown enforcement-bearing child %q "+
+				"security policies %s policy %q contains unknown child %q "+
 					"that the compiler drops; the incomplete policy is poisoned on tolerant load (#12234)",
 				scope, policyName, child,
 			)

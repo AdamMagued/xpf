@@ -394,9 +394,11 @@ func compilePolicy(polInst struct {
 	}
 
 	// #4232 (fable-167 P-4b): record any DIRECT policy child whose keyword the
-	// compiler does not read. The advisory reports unknown children; enforcement-
-	// bearing typos and unknown nested subtrees also poison the tolerant policy
-	// snapshot below (#12234). Iterate in config order for deterministic warnings.
+	// compiler does not read. The advisory reports unknown children; every
+	// unknown child poisons the tolerant snapshot except a scalar one-edit
+	// `description` typo with at most one value token and no children, plus
+	// Junos apply statements (#12234). Iterate in config order for deterministic
+	// warnings.
 	for _, child := range polInst.node.Children {
 		switch child.Name() {
 		case "match", "then", "description", "scheduler-name":
@@ -409,8 +411,10 @@ func compilePolicy(polInst struct {
 	// #11014: directly dropped term or session-options children can carry
 	// enforcement constraints; dropping them must poison any direct policy action.
 	droppedEnforcementSubtrees := policyDroppedEnforcementSubtrees(polInst.node)
-	// #12234: an unknown nested child or a one-edit typo of an enforcement
-	// keyword (including scheduler-name) may carry constraints the compiler drops.
+	// #12234: unknown direct policy children are quarantined except scalar
+	// one-edit `description` typos with at most one value token and no children,
+	// plus Junos apply statements. Nested unknown subtrees and packed description
+	// typos are poisoned.
 	unknownEnforcementChildren := policyUnknownEnforcementChildren(polInst.node)
 	// #4626 M03: canonicalize the accumulated scoped-global zone sets to a
 	// sorted, de-duplicated form so display is stable, HA expansion is
@@ -423,11 +427,11 @@ func compilePolicy(polInst struct {
 
 	// #5575 / #11013 / #11014 / #11023 / #11063 / #12234: fail-CLOSED on
 	// tolerant load / peer-sync. A policy the strict gates reject for dropped
-	// match/then enforcement, unsupported then-log mode, or an enforcement-like
-	// unknown direct child is downgraded to a warning, but the compiler silently
+	// match/then enforcement, unsupported then-log mode, or unknown direct
+	// policy content is downgraded to a warning, but the compiler silently
 	// discards that content. Empty match dimensions become match-ANY; a dropped
 	// then sibling can leave an earlier permit active; an unknown log mode drops
-	// configured session logging; and an unknown nested policy child can carry
+	// configured session logging; and an unknown policy child can carry
 	// constraints the direct policy compiler ignores. Record those invalidations
 	// so the userspace snapshot builder poisons the rule with the __unsupported__
 	// sentinel instead of publishing incomplete policy content. Direct terminal-
@@ -436,8 +440,10 @@ func compilePolicy(polInst struct {
 	// pre-fold clone.
 	//
 	// These per-policy predicates share their definitions with strict gates
-	// where available. Enforcement-bearing unknown children are distinguished
-	// from unrelated unknown scalar metadata, which remains advisory-only.
+	// where available. The unknown-child predicate exempts only scalar one-edit
+	// `description` typos with at most one value token and no children, plus
+	// Junos apply statements explicitly skipped by this gate; all other unknown
+	// direct children are quarantined.
 	// Explicit `any` remains distinguishable from omitted or valueless match
 	// content; the AST predicates below preserve that distinction.
 	//
@@ -604,10 +610,13 @@ func policyDroppedEnforcementSubtrees(polNode *Node) []string {
 }
 
 // policyUnknownEnforcementChildren identifies unknown direct policy children
-// that could carry enforcement content the policy compiler drops. Nested
-// children may contain arbitrary match/action constraints; scalar keywords
-// one edit away from known enforcement children are likely misspellings such
-// as `scheduler-nam`. Other unknown scalar metadata remains advisory-only.
+// the compiler drops, except for scalar one-edit typos of `description`
+// with at most one value token and no children, and Junos apply
+// statements skipped by this predicate. Every other unknown child may carry
+// enforcement or scheduler intent; nested unknown subtrees are quarantined
+// regardless of their name, as are description typos carrying more than one
+// value token (a packed `descripton x scheduler-name <s>` line drops the
+// scheduler binding).
 func policyUnknownEnforcementChildren(polNode *Node) []string {
 	var unknown []string
 	if polNode == nil {
@@ -618,26 +627,21 @@ func policyUnknownEnforcementChildren(polNode *Node) []string {
 		case "match", "then", "description", "scheduler-name", "term", "session-options":
 			continue
 		}
-		if len(child.Children) > 0 || policyEnforcementKeywordTypo(child.Name()) {
+		// #7029/#12217: group expansion honors apply-groups-except, while
+		// apply-macro is not compiled. Neither is dropped content to quarantine.
+		if isApplyStatementKeyword(child.Name()) {
+			continue
+		}
+		if len(child.Children) > 0 || len(child.Keys) > 2 ||
+			!policyKeywordDiffersByOneEdit(child.Name(), "description") {
 			unknown = append(unknown, child.Name())
 		}
 	}
 	return unknown
 }
 
-// policyEnforcementKeywordTypo recognizes one insertion, deletion,
-// substitution, or adjacent transposition from a policy enforcement keyword.
-// It is deliberately limited to enforcement-bearing children, leaving
-// unrelated unknown metadata on the #4232 advisory path.
-func policyEnforcementKeywordTypo(keyword string) bool {
-	for _, known := range [...]string{"match", "then", "scheduler-name", "term", "session-options"} {
-		if policyKeywordDiffersByOneEdit(keyword, known) {
-			return true
-		}
-	}
-	return false
-}
-
+// policyKeywordDiffersByOneEdit recognizes a single insertion, deletion,
+// substitution, or adjacent transposition between two policy child keywords.
 func policyKeywordDiffersByOneEdit(candidate, known string) bool {
 	if candidate == known || len(candidate) > len(known)+1 || len(known) > len(candidate)+1 {
 		return false

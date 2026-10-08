@@ -577,10 +577,11 @@ type Policy struct {
 	terminalActions []PolicyAction
 	// UnknownChildren records DIRECT children of a `policy <name>` node whose
 	// keyword the compiler does not read (match / then / description /
-	// scheduler-name). They feed the #4232 probable-typo advisory; unknown
-	// nested children and one-edit typos of enforcement keywords also poison
-	// the tolerant policy snapshot (#12234). Unrelated unknown scalar metadata
-	// remains advisory-only. Recorded in config order for deterministic warnings.
+	// scheduler-name). They feed the #4232 probable-typo advisory. Unknown
+	// direct children poison tolerant loads except for scalar one-edit
+	// `description` typos with at most one value token and no children, and
+	// Junos apply statements skipped by the policy poison gate (#12234).
+	// Recorded in config order for deterministic warnings.
 	UnknownChildren []string
 	// LenientContentDropped marks a policy the TOLERANT compile path
 	// (CompileConfigLenient / CompileConfigForNodeLenient) accepted only by
@@ -588,12 +589,13 @@ type Policy struct {
 	// enforcement constraint: a MISSING required match dimension (#3044), an
 	// UNSUPPORTED `match` leaf (#3113, incl. #3142/#3673), an unsupported
 	// `then permit` modifier (#3114), an unrecognized `then` sibling (#11013),
-	// an enforcement-bearing unknown policy subtree (#11014), or an unknown
-	// nested child / one-edit typo of an enforcement keyword (#12234). Missing
-	// or dropped match content can widen a policy because the userspace matcher
-	// reads empty dimensions as match-ANY; dropped policy actions or subtrees
-	// can also leave a direct permit active when the authored enforcement intent
-	// was different. Strict gates reject unsupported content and strict schema
+	// or an unknown direct child other than a scalar one-edit `description`
+	// typo with at most one value token and no children, or a Junos apply
+	// statement (#12234). Missing or dropped match content can widen a policy
+	// because empty match dimensions mean match-ANY; dropped policy actions or
+	// subtrees can also leave a direct permit active when the authored
+	// enforcement intent was different.
+	// Strict gates reject unsupported content and strict schema
 	// validation rejects unknown policy children.
 	//
 	// For authored policy content, compilePolicy derives this (never from raw

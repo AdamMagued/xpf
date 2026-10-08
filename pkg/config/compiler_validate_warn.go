@@ -1037,9 +1037,10 @@ func ValidateConfig(cfg *Config) []string {
 	// #4232 (fable-167 P-4b): a DIRECT child of `policy <name>` whose keyword
 	// the compiler does not read (anything but match/then/description/
 	// scheduler-name) was silently dropped — a typo'd `descripton` /
-	// `scheduler-nam` vanished. Report the fully-qualified policy path so the
-	// operator can find the offending line. Unknown enforcement-bearing
-	// children also poison the tolerant policy snapshot (#12234).
+	// `scheduler-nam` vanished. Report the fully-qualified policy path. Unknown
+	// direct children poison tolerant loads except scalar one-edit `description`
+	// typos with at most one value token and no children, and Junos apply
+	// statements skipped by the policy poison gate (#12234).
 	var policyUnknown []string
 	for _, zpp := range cfg.Security.Policies {
 		if zpp == nil {
@@ -1065,7 +1066,7 @@ func ValidateConfig(cfg *Config) []string {
 	}
 	if len(policyUnknown) > 0 {
 		warnings = append(warnings, fmt.Sprintf(
-			"security policy: unrecognized child keyword(s) accepted but dropped (probable typo — xpf reads only match/then/description/scheduler-name at the policy level; unknown nested children or one-edit enforcement-keyword typos quarantine the policy on tolerant loads; Junos rejects unknown keywords at commit): %s (#4232)",
+			"security policy: unrecognized child keyword(s) accepted but dropped (probable typo — xpf reads only match/then/description/scheduler-name at the policy level; on tolerant loads every unknown child quarantines the policy except a scalar one-edit `description` typo with at most one value token and no children, or a Junos apply statement; Junos rejects unknown keywords at commit): %s (#4232)",
 			strings.Join(policyUnknown, ", ")))
 	}
 

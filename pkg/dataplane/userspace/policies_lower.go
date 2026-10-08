@@ -206,7 +206,7 @@ func buildOneRuleSnapshot(
 	// compile path accepted only by DOWNGRADING a reject for dropped
 	// enforcement content had its constraint silently discarded, leaving an
 	// empty match dimension, an unconditional direct permit, or an incomplete
-	// policy subtree / enforcement-like unknown child. Poison the rule with the
+	// policy subtree / unknown direct policy child. Poison the rule with the
 	// __unsupported__ application sentinel so the Rust integrity preflight
 	// rejects the WHOLE snapshot (previous-good retained; fresh-boot
 	// default-deny) — an action-agnostic fail-CLOSED instead of publishing
