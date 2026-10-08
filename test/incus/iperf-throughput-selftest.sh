@@ -24,6 +24,13 @@ PASS=0
 ok()   { PASS=$((PASS + 1)); echo "PASS ($PASS): $*"; }
 bad()  { echo "FAIL: $*" >&2; exit 1; }
 
+SELFTEST_HARNESS="${1:-}"
+if [[ $# -gt 1 ]]; then bad "usage: $0 [test-double-failover.sh|test-chained-crash.sh|test-active-active.sh]"; fi
+case "$SELFTEST_HARNESS" in
+	""|test-double-failover.sh|test-chained-crash.sh|test-active-active.sh) ;;
+	*) bad "unknown harness self-test target: $SELFTEST_HARNESS" ;;
+esac
+
 # --- unit normalisation -------------------------------------------------
 # Real [SUM] sender lines. The Mbits row is the #6897 case: the old parser
 # matched only "Gbits" and silently produced no cell for it.
@@ -150,9 +157,11 @@ for fixture_mode in absent malformed valid; do
 	mkdir "${fixture_dir}/${fixture_mode}"
 	CALL_MARKER="${fixture_dir}/${fixture_mode}/verdict-called"
 	(
-		source "$ASSURANCE_LIB"
+		# shellcheck source=test/incus/ha-assurance-lib.sh
+		source "${SCRIPT_DIR}/ha-assurance-lib.sh"
 		SCRIPT_DIR="$SCRIPT_DIR"
 		CLUSTER_LAN_HOST=fixture
+		# shellcheck disable=SC2034 # Used by the extracted production fixture.
 		MIN_THROUGHPUT=1.0
 		VOID=0
 		TMPDIR="${fixture_dir}/${fixture_mode}"
@@ -192,6 +201,7 @@ print(len(metrics["interval_gbps"]))
 PY
 )"
 			printf 'FIXTURE_INTERVAL_COUNT=%s\n' "$fixture_interval_count"
+			# shellcheck disable=SC2154 # ha_metrics_gate assignments are in eval output.
 			printf 'GATE_COUNT=%s\n' "$full_interval_count"
 		else
 			printf 'VOID_COUNT=%s\n' "$VOID"
@@ -256,14 +266,257 @@ fi
 summary_out="${fixture_dir}/summary-clean.out"
 (
 	PASS=4
+	# shellcheck disable=SC2034 # Read by the extracted summary fixture.
 	FAIL=0
 	VOID=0
+	# shellcheck disable=SC2034 # Read by the extracted summary fixture.
 	ERRORS=()
 	eval "$summary_fixture"
 ) >"$summary_out"
 grep -q '^  Failover test: 4 passed, 0 failed$' "$summary_out" \
 	|| bad "clean run must retain the existing summary grammar"
 ok "FAIL outranks ordinary VOID; VOID-only suppresses summary and exits 77"
+
+# --- Two-transition JSON-stream regression fixture ---------------------
+# Both event checks must catch their own lost-stream recovery window while the
+# aggregate remains far above the throughput floor. Each event is tested
+# against the same stream with all expected IDs present before that transition.
+dual_transition_fixture="${fixture_dir}/dual-transition.jsonl"
+python3 - "$dual_transition_fixture" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+events = []
+for second in range(33):
+    streams = []
+    total_bps = 0
+    for stream_id in range(1, 5):
+        stalled = (stream_id == 4 and 11 <= second <= 13) or (
+            stream_id == 3 and 21 <= second <= 23
+        )
+        bps = 0 if stalled else 6_000_000_000
+        total_bps += bps
+        streams.append({
+            "socket": stream_id,
+            "start": second,
+            "end": second + 1,
+            "bits_per_second": bps,
+        })
+    events.append({
+        "event": "interval",
+        "data": {
+            "sum": {
+                "start": second,
+                "end": second + 1,
+                "bits_per_second": total_bps,
+            },
+            "streams": streams,
+        },
+    })
+events.append({
+    "event": "end",
+    "data": {
+        "sum_sent": {"bits_per_second": 18_000_000_000, "retransmits": 0},
+        "sum_received": {"bits_per_second": 18_000_000_000},
+    },
+})
+path.write_text(
+    "\n".join(json.dumps(event, separators=(",", ":")) for event in events) + "\n",
+    encoding="utf-8",
+)
+PY
+for transition in 10 20; do
+	oracle_output=$(python3 "${SCRIPT_DIR}/iperf3_sum_parse.py" \
+		--failover-check --json-stream --streams 4 --min-throughput-gbps 1 \
+		--crash-at "$transition" <"$dual_transition_fixture")
+	grep -q '^PASS ' <<<"$(sed -n '1p' <<<"$oracle_output")" \
+		|| bad "transition $transition: healthy aggregate interval verdict must pass"
+	case "$transition" in
+	10) expected_lost_stream=4 ;;
+	20) expected_lost_stream=3 ;;
+	esac
+	grep -q "^FAIL streams ${expected_lost_stream} " <<<"$(sed -n '2p' <<<"$oracle_output")" \
+		|| bad "transition $transition: stream $expected_lost_stream loss must fail its own recovery check"
+done
+ok "two transition events reject subset stream stalls despite a healthy aggregate"
+# Exercise the production capture/metrics/oracle validator against the same
+# fixture; only the remote log read and completion wait are locally stubbed.
+# All JSON parsing, metrics gating, and per-transition verdicts are real.
+# shellcheck source=test/incus/ha-smoke-iperf-lib.sh
+source "${SCRIPT_DIR}/ha-smoke-iperf-lib.sh"
+CLUSTER_LAN_HOST=fixture-lan
+incus() {
+	[[ "$1" == exec && "$2" == "$CLUSTER_LAN_HOST" && "$3" == -- ]] || return 90
+	if [[ "$4" == bash && "$5" == -c ]]; then
+		return 0
+	fi
+	if [[ "$4" == cat && "$5" == /fixture/* ]]; then
+		if [[ "${MOCK_CAPTURE_MODE:-ok}" == fail ]]; then
+			echo "fixture capture denied" >&2
+			return 1
+		fi
+		cat "${MOCK_CAPTURE_FILE:-$dual_transition_fixture}"
+		return
+	fi
+	return 91
+}
+smoke_verdicts=$(ha_smoke_iperf_verdicts /fixture/iperf.jsonl 33 4 1 10 20)
+grep -q '^PASS iperf3 throughput:' <<<"$smoke_verdicts" \
+	|| bad "shared validator must keep a passing whole-run throughput cell"
+grep -q '^PASS iperf3 intervals:' <<<"$smoke_verdicts" \
+	|| bad "shared validator must pass the healthy aggregate intervals"
+grep -q '^FAIL iperf3 transition 1 streams: streams 4 ' <<<"$smoke_verdicts" \
+	|| bad "shared validator must fail the stream lost at transition 1"
+grep -q '^FAIL iperf3 transition 2 streams: streams 3 ' <<<"$smoke_verdicts" \
+	|| bad "shared validator must fail the stream lost at transition 2"
+ok "shared smoke validator emits anchored throughput and both transition-specific failures"
+missing_smoke_verdicts=$(MOCK_CAPTURE_MODE=fail \
+	ha_smoke_iperf_verdicts /fixture/missing.jsonl 33 4 1 10 20)
+grep -q '^FAIL iperf3 throughput: JSON metrics unavailable: fixture capture denied$' \
+	<<<"$missing_smoke_verdicts" \
+	|| bad "shared validator must fail when remote JSON log capture fails"
+! grep -q '^PASS ' <<<"$missing_smoke_verdicts" \
+	|| bad "failed remote capture must never produce a pass cell"
+[[ $(grep -c '^FAIL iperf3 transition' <<<"$missing_smoke_verdicts") -eq 2 ]] \
+	|| bad "failed remote capture must fail both transition stream checks"
+ok "shared smoke validator fails closed when log capture fails"
+
+# A late stream stall is outside both transition recovery windows but must
+# still fail the whole-run per-stream budget.
+late_stall_fixture="${fixture_dir}/late-stall.jsonl"
+python3 - "$late_stall_fixture" <<'PY'
+import json
+import pathlib
+import sys
+
+events = []
+for second in range(45):
+    streams = []
+    total_bps = 0
+    for stream_id in range(1, 9):
+        bps = 0 if stream_id == 5 and second >= 24 else 6_000_000_000
+        total_bps += bps
+        streams.append({
+            "socket": stream_id,
+            "start": second,
+            "end": second + 1,
+            "bits_per_second": bps,
+        })
+    events.append({
+        "event": "interval",
+        "data": {
+            "sum": {
+                "start": second,
+                "end": second + 1,
+                "bits_per_second": total_bps,
+            },
+            "streams": streams,
+        },
+    })
+events.append({
+    "event": "end",
+    "data": {
+        "sum_sent": {"bits_per_second": 42_000_000_000, "retransmits": 0},
+        "sum_received": {"bits_per_second": 42_000_000_000},
+    },
+})
+pathlib.Path(sys.argv[1]).write_text(
+    "\n".join(json.dumps(event, separators=(",", ":")) for event in events) + "\n",
+    encoding="utf-8",
+)
+PY
+late_stall_verdicts=$(HA_SMOKE_MAX_STREAM_ZERO_INTERVALS=0 \
+	MOCK_CAPTURE_FILE="$late_stall_fixture" \
+	ha_smoke_iperf_verdicts /fixture/late.jsonl 45 8 1 10 20)
+grep -q '^FAIL iperf3 whole-run per-stream zero intervals (21, limit 0; 1 affected stream(s)):' \
+	<<<"$late_stall_verdicts" \
+	|| bad "late stream stall must fail the whole-run per-stream zero budget"
+grep -q '^PASS iperf3 transition 1 streams:' <<<"$late_stall_verdicts" \
+	|| bad "late stream stall must not be attributed to transition 1"
+grep -q '^PASS iperf3 transition 2 streams:' <<<"$late_stall_verdicts" \
+	|| bad "late stream stall must not be attributed to transition 2"
+ok "whole-run per-stream zero budget fails a late stall outside both recovery windows"
+
+# Completion requires an end event or evidence that the expected duration ran.
+incomplete_fixture="${fixture_dir}/incomplete.jsonl"
+python3 - "$dual_transition_fixture" "$incomplete_fixture" <<'PY'
+import json
+import pathlib
+import sys
+
+events = [
+    event
+    for event in (json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines())
+    if event.get("event") != "end"
+]
+pathlib.Path(sys.argv[2]).write_text(
+    "\n".join(json.dumps(event, separators=(",", ":")) for event in events) + "\n",
+    encoding="utf-8",
+)
+PY
+completion_python_dir="${fixture_dir}/completion-python"
+mkdir -p "$completion_python_dir"
+REAL_PYTHON="$(command -v python3)"
+cat >"$completion_python_dir/python3" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-}" == */iperf-json-metrics.py ]]; then
+	"$REAL_PYTHON" "$@" |
+		"$REAL_PYTHON" -c 'import json, sys; metrics = json.load(sys.stdin); metrics["avg_gbps"] = 1.0; print(json.dumps(metrics))'
+	exit $?
+fi
+exec "$REAL_PYTHON" "$@"
+SH
+chmod +x "$completion_python_dir/python3"
+#
+# Keep a healthy measured rate while the fixture has no end event, so the
+# duration threshold—not the throughput floor—determines completion.
+incomplete_verdicts=$(REAL_PYTHON="$REAL_PYTHON" \
+	PATH="$completion_python_dir:$PATH" MOCK_CAPTURE_FILE="$incomplete_fixture" \
+	ha_smoke_iperf_verdicts /fixture/incomplete.jsonl 45 4 1 10 20)
+grep -q '^FAIL iperf3 completion: JSON stream ended at 33.000s of 45s without a valid end event$' \
+	<<<"$incomplete_verdicts" \
+	|| bad "truncated JSON stream must fail completion below duration-2"
+ok "truncated stream below the duration threshold fails completion"
+
+# Invalid UTF-8 must fail closed with one-line oracle diagnostics.
+invalid_utf8_fixture="${fixture_dir}/invalid-utf8.jsonl"
+printf '\377\n' >"$invalid_utf8_fixture"
+invalid_utf8_verdicts=$(MOCK_CAPTURE_FILE="$invalid_utf8_fixture" \
+	ha_smoke_iperf_verdicts /fixture/invalid-utf8.jsonl 45 4 1 10 20)
+grep -q '^FAIL iperf3 intervals: UnicodeDecodeError:' <<<"$invalid_utf8_verdicts" \
+	|| bad "invalid UTF-8 must fail interval validation with the final oracle error line"
+[[ $(grep -c '^FAIL iperf3 transition' <<<"$invalid_utf8_verdicts") -eq 2 ]] \
+	|| bad "invalid UTF-8 must fail both transition checks"
+[[ $(grep -c '^FAIL iperf3 intervals:' <<<"$invalid_utf8_verdicts") -eq 1 ]] \
+	|| bad "invalid UTF-8 diagnostics must remain a single interval cell"
+ok "invalid UTF-8 fails intervals and both transitions with single-line errors"
+
+# The shared oracle must convert any status other than PASS/FAIL to FAIL.
+unknown_python_dir="${fixture_dir}/unknown-python"
+mkdir -p "$unknown_python_dir"
+
+cat >"$unknown_python_dir/python3" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-}" == */iperf3_sum_parse.py ]]; then
+	printf 'MAYBE intervals\nMAYBE streams\n'
+	exit 0
+fi
+exec "$REAL_PYTHON" "$@"
+SH
+chmod +x "$unknown_python_dir/python3"
+unknown_verdicts=$(REAL_PYTHON="$REAL_PYTHON" PATH="$unknown_python_dir:$PATH" \
+	ha_smoke_iperf_verdicts /fixture/iperf.jsonl 33 4 1 10 20)
+grep -q '^FAIL iperf3 intervals: unrecognized failover interval verdict: MAYBE intervals$' \
+	<<<"$unknown_verdicts" \
+	|| bad "unknown interval oracle status must be converted to FAIL"
+[[ $(grep -c '^FAIL iperf3 transition .*: unrecognized transition stream verdict: MAYBE streams$' \
+	<<<"$unknown_verdicts") -eq 2 ]] \
+	|| bad "unknown transition oracle statuses must be converted to FAIL"
+ok "unknown oracle statuses fail closed for intervals and both transitions"
+
+
 
 # --- WIRING + the #7673 PORT AGREEMENT, for EVERY HA smoke with a throughput cell ---
 # Binding the lib alone would leave a green if someone deleted the CALL from a
@@ -274,7 +527,7 @@ ok "FAIL outranks ordinary VOID; VOID-only suppresses summary and exits 77"
 #
 # #9690/#9691: these cells used to read test-failover.sh ONLY, and its four
 # siblings kept both defects it had fixed: a Gbits-only parse with no else
-# (#6897), and the 5201 default port that cos-iperf-config.set shapes to 100m
+# (#6897), and the 5201 default port that cos-iperf-config.set shapes to 100m.
 # This legacy source-shape guard covers four sibling harnesses. test-failover
 # is covered behaviorally by its interval/stream oracle tests instead.
 #
@@ -283,29 +536,92 @@ ok "FAIL outranks ordinary VOID; VOID-only suppresses summary and exits 77"
 # side is trusted, and the side that was wrong in #7673 is the one nobody
 # suspected. Port to class is read in two steps (port to term, term to class)
 # rather than assuming term 11.
+#
+# The current JSON smokes route the port through failover_start_main_iperf;
+# stress-failover retains its text-client command. The per-sibling branch below
+# checks each wiring shape without weakening the common port/class agreement.
 COS_SET="$(dirname "$0")/cos-iperf-config.set"
+ORACLE_LIB="${SCRIPT_DIR}/ha-smoke-iperf-lib.sh"
+grep -q -- '--failover-check --json-stream --streams "$streams"' "$ORACLE_LIB" \
+	|| bad "shared smoke oracle does not route JSON interval telemetry to --failover-check"
+grep -Fq -- '--crash-at "${events[$((event_number - 1))]}"' "$ORACLE_LIB" \
+	|| bad "shared smoke oracle does not evaluate every supplied transition timestamp"
+
 SMOKES=(test-double-failover.sh test-chained-crash.sh test-active-active.sh test-stress-failover.sh)
 for smoke in "${SMOKES[@]}"; do
+	[[ -z "$SELFTEST_HARNESS" || "$smoke" == "$SELFTEST_HARNESS" ]] || continue
 	f="${SCRIPT_DIR}/${smoke}"
 	[[ -f "$f" ]] || bad "$smoke not found at $f"
 
 	grep -q 'source "${SCRIPT_DIR}/iperf-throughput-lib.sh"' "$f" \
 		|| bad "$smoke does not source iperf-throughput-lib.sh"
-	grep -q 'iperf_throughput_verdict "$MIN_THROUGHPUT" "$sum_line"' "$f" \
-		|| bad "$smoke does not call iperf_throughput_verdict -- its throughput cell can go silent again (#6897/#9690)"
-	# The catch-all is what makes the caller total. Without it an unknown status
-	# falls through the case and emits nothing -- #6897 one level up.
-	awk '/^throughput_verdict=/,/^esac$/' "$f" | grep -qE '^\*\)[[:space:]]+fail ' \
-		|| bad "$smoke: the throughput verdict case has no catch-all '*) fail' -- an unhandled status would emit no cell"
-	# No inline Gbits-only parse may come back, in either the grep -oP or the
-	# grep -oiE spelling; it silently reintroduces the value that matched no branch.
+	if [[ "$smoke" == "test-stress-failover.sh" ]]; then
+		grep -q 'iperf_throughput_verdict "$MIN_THROUGHPUT" "$sum_line"' "$f" \
+			|| bad "$smoke does not call iperf_throughput_verdict"
+		awk '/^throughput_verdict=/,/^esac$/' "$f" | grep -qE '^\*\)[[:space:]]+fail ' \
+			|| bad "$smoke: the text throughput verdict has no catch-all '*) fail'"
+	else
+		grep -q 'source "${SCRIPT_DIR}/ha-smoke-iperf-lib.sh"' "$f" \
+			|| bad "$smoke does not source the tracked JSON smoke client/oracle"
+		grep -q 'failover_start_main_iperf "$IPERF_DURATION" "$IPERF_TARGET" "$IPERF_PORT" "$IPERF_STREAMS"' "$f" \
+			|| bad "$smoke does not start its main client through failover_start_main_iperf"
+		grep -q '"$LOG" "$PIDFILE" 1' "$f" \
+			|| bad "$smoke does not provide its log, pidfile, and one-second interval"
+		grep -q 'failover_main_iperf_running "$PIDFILE" "$IPERF_TARGET" "$IPERF_PORT" "$IPERF_STREAMS"' "$f" \
+			|| bad "$smoke does not scope client liveness to its pidfile and command tuple"
+		grep -q 'ha_smoke_iperf_verdicts "$LOG" "$IPERF_DURATION" "$IPERF_STREAMS"' "$f" \
+			|| bad "$smoke does not run per-transition stream and interval verdicts"
+		[[ "$(grep -c 'FAILOVER_EVENTS+=' "$f")" == 2 ]] \
+			|| bad "$smoke does not record exactly one timestamp per transition"
+		grep -q 'source "${SCRIPT_DIR}/deploy-lib.sh"' "$f" &&
+			grep -q 'deploy_node_role_every_rg_ok' "$f" \
+			|| bad "$smoke does not assert roles with deploy_node_role_every_rg_ok"
+		role_gate_count=$(grep -c 'deploy_node_role_every_rg_ok' "$f")
+		case "$smoke" in
+		test-double-failover.sh)
+			[[ "$role_gate_count" -eq 5 ]] &&
+				grep -qF 'deploy_node_role_every_rg_ok node1 primary' "$f" &&
+				grep -qF 'deploy_node_role_every_rg_ok node0 secondary' "$f" \
+				|| bad "$smoke does not check every whole-cluster role cell"
+			;;
+		test-chained-crash.sh)
+			[[ "$role_gate_count" -eq 5 ]] &&
+				grep -qF 'deploy_node_role_every_rg_ok "$node" primary' "$f" &&
+				grep -qF 'deploy_node_role_every_rg_ok node0 secondary' "$f" &&
+				grep -qF 'deploy_node_role_every_rg_ok node1 secondary' "$f" \
+				|| bad "$smoke does not check every whole-cluster role cell"
+			grep -Fq 'restart_time=$(wait_for_xpfd "$FW0" "$VM_RESTART_WAIT" || true)' "$f" &&
+				grep -Fq 'restart_time=$(wait_for_xpfd "$FW1" "$VM_RESTART_WAIT" || true)' "$f" \
+				|| bad "$smoke must keep bounded xpfd restart waits for both phases"
+
+			;;
+		test-active-active.sh)
+			[[ "$role_gate_count" -eq 2 ]] \
+				|| bad "$smoke must gate preflight and reunification across all RGs"
+			preflight_status_reads=$(sed -n '/^# Ensure all RGs are on fw0/,/^if printf/p' "$f" \
+				| grep -c 'fw0_status=$(incus exec')
+			[[ "$preflight_status_reads" -eq 2 ]] \
+				|| bad "$smoke must refresh fw0_status after its preflight correction"
+
+			;;
+		esac
+		if grep -vE '^[[:space:]]*#' "$f" | grep -qE 'pgrep.*iperf3|pkill.*iperf3'; then
+			bad "$smoke retains unscoped iperf3 process matching or termination"
+		fi
+	fi
 	if grep -vE '^[[:space:]]*#' "$f" | grep -qE "grep -o[a-zA-Z]* ['\"][^'\"]*Gbits"; then
 		bad "$smoke: an inline Gbits-only throughput parse is back"
 	fi
-	ok "$smoke: sources the lib, calls the total verdict with a catch-all, no inline Gbits parse"
+	ok "$smoke: client/verdict wiring is scoped and total"
 
-	grep -q -- '-p ${IPERF_PORT}' "$f" \
-		|| bad "$smoke does not pass -p \${IPERF_PORT} to iperf3 -- it measures the 5201 default, the 100m-shaped class (#7673/#9691)"
+	if [[ "$smoke" == "test-stress-failover.sh" ]]; then
+		grep -q -- '-p ${IPERF_PORT}' "$f" \
+			|| bad "$smoke does not pass -p \${IPERF_PORT} to iperf3"
+	else
+		grep -q 'failover_start_main_iperf "$IPERF_DURATION" "$IPERF_TARGET" "$IPERF_PORT" "$IPERF_STREAMS"' "$f" \
+			&& grep -q ' -p "$3" ' "${SCRIPT_DIR}/failover-client-lib.sh" \
+			|| bad "$smoke does not pass its configured port through the tracked client helper"
+	fi
 	port=$(sed -n 's/^IPERF_PORT="\${IPERF_PORT:-\([0-9]*\)}"/\1/p' "$f")
 	[ -n "$port" ] || bad "could not read the IPERF_PORT default out of $smoke -- this cell would otherwise pass having checked nothing"
 	term=$(sed -n "s/^set firewall family inet filter bandwidth-output term \([0-9]*\) from destination-port ${port}$/\1/p" "$COS_SET" | head -1)
@@ -318,6 +634,7 @@ for smoke in "${SMOKES[@]}"; do
 		bad "$smoke: iperf port $port lands in $fc/$sched, which HAS a transmit-rate -- the throughput gate is measuring a deliberately shaped class (#7673/#9691)"
 	fi
 	ok "$smoke: -p \${IPERF_PORT} default $port -> term $term -> $fc/$sched, unshaped"
+
 done
 
 
