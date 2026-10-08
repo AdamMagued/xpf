@@ -7,6 +7,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -19,13 +20,14 @@ import (
 
 func isolateFactoryResetOwnershipPaths(t *testing.T) {
 	t.Helper()
-	oldLease, oldSurfaceA, oldIPsec := resetDDNSLeaseStatePath, resetDDNSSurfaceAPath, resetIPsecStatePath
+	oldLease, oldSurfaceA, oldIPsec, oldHistory := resetDDNSLeaseStatePath, resetDDNSSurfaceAPath, resetIPsecStatePath, feedShrinkHistoryPath
 	root := t.TempDir()
 	resetDDNSLeaseStatePath = filepath.Join(root, "dhcp-ddns-state.json")
 	resetDDNSSurfaceAPath = filepath.Join(root, "interface-ddns-state.json")
 	resetIPsecStatePath = filepath.Join(root, "ipsec-conn-state.json")
+	feedShrinkHistoryPath = filepath.Join(root, "state", "feed-shrink-history.json")
 	t.Cleanup(func() {
-		resetDDNSLeaseStatePath, resetDDNSSurfaceAPath, resetIPsecStatePath = oldLease, oldSurfaceA, oldIPsec
+		resetDDNSLeaseStatePath, resetDDNSSurfaceAPath, resetIPsecStatePath, feedShrinkHistoryPath = oldLease, oldSurfaceA, oldIPsec, oldHistory
 	})
 }
 
@@ -150,4 +152,76 @@ func TestFactoryResetFailClosedClearsResetGeneration(t *testing.T) {
 		t.Fatalf("applySem must be released after a failed factoryReset; got %v", err)
 	}
 	d.applySem.Release(1)
+}
+
+func TestFactoryResetFailedWipeResumesFeedHistoryPersistence12170(t *testing.T) {
+	isolateFactoryResetOwnershipPaths(t)
+	isolateFactoryResetIdentityPaths(t)
+	isolateHandoffFlag(t)
+	oldPath := feedShrinkHistoryPath
+	feedShrinkHistoryPath = filepath.Join(t.TempDir(), "state", "feed-shrink-history.json")
+	t.Cleanup(func() { feedShrinkHistoryPath = oldPath })
+	if err := os.MkdirAll(filepath.Dir(feedShrinkHistoryPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	history := []byte(`[{"name":"stable-feed","count":64,"hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}]`)
+	if err := os.WriteFile(feedShrinkHistoryPath, history, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d := &Daemon{applySem: semaphore.NewWeighted(1)}
+	d.ensureFeedManager()
+	t.Cleanup(d.feeds.StopAll)
+	wantErr := errors.New("wipe failed")
+	if err := d.factoryReset(context.Background(), func() error {
+		if err := os.Remove(feedShrinkHistoryPath); err != nil {
+			return err
+		}
+		return wantErr
+	}); !errors.Is(err, wantErr) {
+		t.Fatalf("factoryReset error = %v, want %v", err, wantErr)
+	}
+	d.persistFeedShrinkHistory(d.feeds)
+	records := readFeedShrinkHistory()
+	if len(records) != 1 || records[0].Name != "stable-feed" || records[0].Count != 64 {
+		t.Fatalf("failed wipe did not resume prior-tenant history persistence: %+v", records)
+	}
+}
+
+func TestFactoryResetSuccessKeepsFeedHistoryFenceSticky12170(t *testing.T) {
+	isolateFactoryResetOwnershipPaths(t)
+	isolateFactoryResetIdentityPaths(t)
+	isolateHandoffFlag(t)
+	oldPath := feedShrinkHistoryPath
+	feedShrinkHistoryPath = filepath.Join(t.TempDir(), "state", "feed-shrink-history.json")
+	t.Cleanup(func() { feedShrinkHistoryPath = oldPath })
+	if err := os.MkdirAll(filepath.Dir(feedShrinkHistoryPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	history := []byte(`[{"name":"stable-feed","count":64,"hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}]`)
+	if err := os.WriteFile(feedShrinkHistoryPath, history, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d := &Daemon{applySem: semaphore.NewWeighted(1)}
+	d.ensureFeedManager()
+	t.Cleanup(d.feeds.StopAll)
+	if err := d.factoryReset(context.Background(), func() error {
+		if err := os.Remove(feedShrinkHistoryPath); err != nil {
+			return err
+		}
+		return fakePendingWipe(t)()
+	}); err != nil {
+		t.Fatalf("successful factoryReset: %v", err)
+	}
+	d.persistFeedShrinkHistory(d.feeds)
+	if _, err := os.Stat(feedShrinkHistoryPath); !os.IsNotExist(err) {
+		t.Fatalf("successful wipe must keep history fenced: %v", err)
+	}
+	busy := errors.New("zeroize: upgrade lock busy")
+	if err := d.factoryReset(context.Background(), func() error { return busy }); !errors.Is(err, busy) {
+		t.Fatalf("second factoryReset error = %v, want %v", err, busy)
+	}
+	d.persistFeedShrinkHistory(d.feeds)
+	if _, err := os.Stat(feedShrinkHistoryPath); !os.IsNotExist(err) {
+		t.Fatalf("failed re-entry lifted the successful wipe's history fence: %v", err)
+	}
 }

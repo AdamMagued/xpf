@@ -14,6 +14,7 @@ import (
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/ddns"
 	"github.com/psaab/xpf/pkg/dhcpserver"
+	"github.com/psaab/xpf/pkg/feeds"
 	"github.com/psaab/xpf/pkg/fsatomic"
 	"github.com/psaab/xpf/pkg/ipsec"
 )
@@ -276,13 +277,12 @@ func verifyKeaLeasesErasedForReset() error {
 	return nil
 }
 
-// verifyStateTempsErasedForReset re-checks the DDNS/IPsec state files and
-// their crash-temp sets after the wipe reports success, mirroring the Kea
-// lease re-verification: state recreated in the sweep→success window must
-// fail the reset, not survive silently beside a clean receipt. Canonicals
-// are checked as well as temps: a writer that completed a full save leaves
-// a canonical with no temp behind, and temps-only verification would clear
-// over it.
+// verifyStateTempsErasedForReset re-checks DDNS/IPsec state canonicals and
+// DDNS/IPsec/feed-history crash-temp sets after the wipe reports success,
+// mirroring the Kea lease re-verification: state recreated in the
+// sweep→success window must fail the reset, not survive silently beside a
+// clean receipt. The feed-history canonical is checked in the gRPC seal-leg
+// final verification, not in this daemon-local check.
 func verifyStateTempsErasedForReset() error {
 	var errs []error
 	for _, path := range []string{resetDDNSLeaseStatePath, resetDDNSSurfaceAPath, resetIPsecStatePath} {
@@ -307,6 +307,11 @@ func verifyStateTempsErasedForReset() error {
 	} else if len(temps) != 0 {
 		errs = append(errs, fmt.Errorf("factory reset: IPsec crash temps reappeared after the wipe: %v", temps))
 	}
+	if temps, err := feeds.ListShrinkHistoryCrashTemps(feedShrinkHistoryPath); err != nil {
+		errs = append(errs, err)
+	} else if len(temps) != 0 {
+		errs = append(errs, fmt.Errorf("factory reset: feed shrink history crash temps reappeared after the wipe: %v", temps))
+	}
 	return errors.Join(errs...)
 }
 
@@ -322,6 +327,9 @@ func eraseStateTempsForReset() error {
 		errs = append(errs, err)
 	}
 	if err := ipsec.EraseConnStateIfEmpty(resetIPsecStatePath); err != nil {
+		errs = append(errs, err)
+	}
+	if err := feeds.EraseShrinkHistoryCrashTemps(feedShrinkHistoryPath); err != nil {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
@@ -429,6 +437,11 @@ func (d *Daemon) factoryReset(ctx context.Context, wipe func() error) error {
 	}
 	defer d.applySem.Release(1)
 	d.enterResetGeneration()
+	// Feed refresh callbacks bypass applySem. Fence and drain their durable
+	// high-water writes before the wipe erases FeedShrinkHistoryPath; otherwise
+	// a completion from a still-running producer could recreate prior-tenant
+	// history after the seal-residue leg.
+	resumeFeedShrinkHistoryPersistence := d.fenceFeedShrinkHistoryPersistence()
 	// #5869: fence + drain the async config-archive writers BEFORE the wipe
 	// erases /var/lib/xpf/archive. Auto-archive launches a fire-and-forget
 	// configstore goroutine per commit that the #5281 reset generation does NOT
@@ -480,6 +493,13 @@ func (d *Daemon) factoryReset(ctx context.Context, wipe func() error) error {
 			if restoreErr := d.restoreDHCPAfterFailedReset(); restoreErr != nil {
 				errs = append(errs, fmt.Errorf("restore DHCP after failed factory reset: %w", restoreErr))
 			}
+		}
+		// An incomplete wipe leaves the old tenant live, so its feed history
+		// writes resume. After a successful wipe, keep the fence even if later
+		// verification fails: the in-memory producers still describe the prior
+		// tenant and must not recreate the erased epoch.
+		if !wipeSucceeded {
+			resumeFeedShrinkHistoryPersistence()
 		}
 		if d.store != nil {
 			d.store.ResumeArchival()
@@ -533,6 +553,7 @@ func (d *Daemon) factoryReset(ctx context.Context, wipe func() error) error {
 	var verifyErr error
 	if wipeErr == nil {
 		wipeSucceeded = true
+		d.markFeedShrinkHistoryWipeSucceeded()
 		// The config is gone: stop serving the prior tenant at once rather
 		// than until the process stop ~1s later. Kernel transit is disarmed
 		// (fail-closed fence + sysctls, mirroring shutdown order); a live
