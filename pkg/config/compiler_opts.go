@@ -783,12 +783,12 @@ type compileOpts struct {
 	// doctrine as lenientVRRPTrackDuplicates / lenientLogProfileStreamRef.
 	lenientUnsupportedInterfaceStanzas bool
 
-	// lenientUnsupportedForwardingOptionsFilters (#12090) downgrades the
-	// forwarding-options `filter` / `simple-filter` silent-drop gate to a
+	// lenientForwardingFilters (#12090) downgrades the forwarding-options
+	// `filter` / `simple-filter` silent-drop gate to a
 	// warning on tolerant load / peer-sync paths. These spellings have no
 	// compiler or dataplane consumer; old persisted configurations must still
 	// boot while new strict commits reject them.
-	lenientUnsupportedForwardingOptionsFilters bool
+	lenientForwardingFilters bool
 
 	// lenientQinQVLANStack (#5879) downgrades the canonical per-physical-
 	// interface QinQ / stacked-VLAN honesty gate (validateQinQVLANStackAST:
@@ -3186,7 +3186,7 @@ func lenientCompileOpts() compileOpts {
 		lenientNATPoolAlarmThreshold:           true,
 		lenientNATHostMask:                     true,
 		lenientUnsupportedInterfaceStanzas:     true,
-		lenientUnsupportedForwardingOptionsFilters: true,
+		lenientForwardingFilters:               true,
 		lenientQinQVLANStack:                   true,
 		lenientVLANMap:                         true,
 		lenientRoutingExportRef:                true,
