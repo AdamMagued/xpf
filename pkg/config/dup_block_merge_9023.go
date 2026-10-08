@@ -104,17 +104,33 @@ var dupUnnamedRoutingMergeSites12120 = []struct {
 	{"root", "root", "protocols"},
 }
 
+type duplicateBlockMergeKind9023 uint8
+
+const (
+	duplicateBlockMergeContainer9023 duplicateBlockMergeKind9023 = iota
+	duplicateBlockMergeNamed9023
+	duplicateBlockMergeUnnamed9023
+)
+
+type duplicateBlockMerge9023 struct {
+	kind            duplicateBlockMergeKind9023
+	parent, keyword string
+	name            string
+}
+
 // mergeDuplicateBlocks9023 folds the explicitly enumerated repeated named
-// and unnamed containers and returns a description of each merge performed.
-func mergeDuplicateBlocks9023(tree *ConfigTree) []string {
+// and unnamed containers and returns structured context for each merge.
+func mergeDuplicateBlocks9023(tree *ConfigTree) []duplicateBlockMerge9023 {
 	if tree == nil {
 		return nil
 	}
-	var merged []string
+	var merged []duplicateBlockMerge9023
 	var rootsMerged bool
 	tree.Children, rootsMerged = mergeDuplicateRoutingInstanceContainers9023(tree.Children)
 	if rootsMerged {
-		merged = append(merged, "routing-instances")
+		merged = append(merged, duplicateBlockMerge9023{
+			kind: duplicateBlockMergeContainer9023, parent: "routing-instances",
+		})
 	}
 	var walk func(n *Node, depth int)
 	walk = func(n *Node, depth int) {
@@ -124,7 +140,9 @@ func mergeDuplicateBlocks9023(tree *ConfigTree) []string {
 		var containersMerged bool
 		n.Children, containersMerged = mergeDuplicateRoutingInstanceContainers9023(n.Children)
 		if containersMerged {
-			merged = append(merged, "routing-instances")
+			merged = append(merged, duplicateBlockMerge9023{
+				kind: duplicateBlockMergeContainer9023, parent: "routing-instances",
+			})
 		}
 		for _, site := range dupBlockMergeSites9023 {
 			if n.Name() != site.parent {
@@ -132,13 +150,18 @@ func mergeDuplicateBlocks9023(tree *ConfigTree) []string {
 			}
 			if site.keyword == "*" {
 				for _, name := range mergeDuplicateNamedChildren9023(n) {
-					merged = append(merged, site.parent+" "+name)
+					merged = append(merged, duplicateBlockMerge9023{
+						kind: duplicateBlockMergeNamed9023, parent: site.parent, name: name,
+					})
 				}
 				continue
 			}
 			names, _, _ := mergeInstancesUnder(n, site.keyword, askNone9571)
 			for _, name := range names {
-				merged = append(merged, site.parent+" "+site.keyword+" "+name)
+				merged = append(merged, duplicateBlockMerge9023{
+					kind: duplicateBlockMergeNamed9023, parent: site.parent,
+					keyword: site.keyword, name: name,
+				})
 			}
 		}
 		if n.Name() == "routing-instances" {
@@ -153,7 +176,10 @@ func mergeDuplicateBlocks9023(tree *ConfigTree) []string {
 					children, didMerge := mergeDuplicateUnnamedRoutingChildren(instance.Children, site.keyword)
 					instance.Children = children
 					if didMerge {
-						merged = append(merged, "routing-instances "+instance.Name()+" "+site.keyword)
+						merged = append(merged, duplicateBlockMerge9023{
+							kind: duplicateBlockMergeUnnamed9023, parent: site.parent,
+							keyword: site.keyword, name: instance.Name(),
+						})
 					}
 				}
 			}
@@ -164,7 +190,10 @@ func mergeDuplicateBlocks9023(tree *ConfigTree) []string {
 				children, didMerge := mergeDuplicateUnnamedRoutingChildren(n.Children, site.keyword)
 				n.Children = children
 				if didMerge {
-					merged = append(merged, site.parent+" "+site.keyword)
+					merged = append(merged, duplicateBlockMerge9023{
+						kind: duplicateBlockMergeUnnamed9023, parent: site.parent,
+						keyword: site.keyword,
+					})
 				}
 			}
 		}
@@ -178,7 +207,9 @@ func mergeDuplicateBlocks9023(tree *ConfigTree) []string {
 			var didMerge bool
 			tree.Children, didMerge = mergeDuplicateUnnamedRoutingChildren(tree.Children, site.keyword)
 			if didMerge {
-				merged = append(merged, site.keyword)
+				merged = append(merged, duplicateBlockMerge9023{
+					kind: duplicateBlockMergeUnnamed9023, keyword: site.keyword,
+				})
 			}
 		}
 	}
@@ -190,7 +221,10 @@ func mergeDuplicateBlocks9023(tree *ConfigTree) []string {
 			children, didMerge := mergeDuplicateUnnamedRoutingChildren(root.Children, site.keyword)
 			root.Children = children
 			if didMerge {
-				merged = append(merged, site.parent+" "+site.keyword)
+				merged = append(merged, duplicateBlockMerge9023{
+					kind: duplicateBlockMergeUnnamed9023, parent: site.parent,
+					keyword: site.keyword,
+				})
 			}
 		}
 		walk(root, 0)

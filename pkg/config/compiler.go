@@ -38,46 +38,60 @@ var ErrEBPFDataplaneRetired = errors.New(
 		"use 'set system dataplane-type userspace' " +
 		"(see #1373)")
 
-// duplicateBlockMergeWarning9023 gives named and explicitly registered
-// unnamed-block folds truthful diagnostics.
-func duplicateBlockMergeWarning9023(what string) string {
-	switch what {
-	case "routing-options generate", "routing-options interface-routes":
-		return "duplicate unnamed `" + what + "` containers were merged in source order (#12120)"
-	case "rib static":
-		return "duplicate unnamed `static` containers under `rib` were merged in source order (#12120)"
-	case "protocols":
-		return "duplicate top-level `protocols` containers were merged in source order (#12120)"
-	case "protocols ospf", "protocols bgp":
-		keyword := strings.TrimPrefix(what, "protocols ")
-		return "duplicate unnamed `" + keyword + "` containers under `protocols` were merged in source order (#12120)"
-	}
-	if what == "routing-instances" {
+// duplicateBlockMergeWarning9023 formats the explicit context recorded by the
+// merge walk, without trying to recover token boundaries from a description.
+func duplicateBlockMergeWarning9023(merge duplicateBlockMerge9023) string {
+	if merge.kind == duplicateBlockMergeContainer9023 && merge.parent == "routing-instances" {
 		return "duplicate `routing-instances` containers were merged in source order (#9023)"
 	}
-	if what == "routing-options static" {
-		return "duplicate unnamed `routing-options static` containers were merged in source order (#12043)"
-	}
-	for _, keyword := range []string{"routing-options", "protocols"} {
-		if strings.Count(what, " ") == 2 &&
-			strings.HasPrefix(what, "routing-instances ") && strings.HasSuffix(what, " "+keyword) {
-			scope := strings.TrimSuffix(what, " "+keyword)
-			return "duplicate unnamed `" + keyword + "` containers under " + scope +
+	if merge.kind == duplicateBlockMergeUnnamed9023 {
+		switch {
+		case merge.parent == "" && merge.keyword == "protocols":
+			return "duplicate top-level `protocols` containers were merged in source order (#12120)"
+		case merge.parent == "routing-instances":
+			scope := "routing-instances " + diagnosticMergeName9023(merge.name)
+			return "duplicate unnamed `" + merge.keyword + "` containers under " + scope +
 				" were merged in source order (#12043)"
+		case merge.parent == "routing-options" && merge.keyword == "static":
+			return "duplicate unnamed `routing-options static` containers were merged in source order (#12043)"
+		case merge.parent == "routing-options" &&
+			(merge.keyword == "generate" || merge.keyword == "interface-routes"):
+			return "duplicate unnamed `routing-options " + merge.keyword +
+				"` containers were merged in source order (#12120)"
+		case merge.parent == "rib" && merge.keyword == "static":
+			return "duplicate unnamed `static` containers under `rib` were merged in source order (#12120)"
+		case merge.parent == "protocols" && (merge.keyword == "ospf" || merge.keyword == "bgp"):
+			return "duplicate unnamed `" + merge.keyword +
+				"` containers under `protocols` were merged in source order (#12120)"
 		}
 	}
-	if strings.HasPrefix(what, "routing-instances ") {
-		name := strings.TrimPrefix(what, "routing-instances ")
-		return "duplicate routing-instance definition `" + name + "` was merged into one typed instance in source order (#11459/#9023)"
+	if merge.kind == duplicateBlockMergeNamed9023 {
+		if merge.parent == "routing-instances" {
+			return "duplicate routing-instance definition `" + merge.name +
+				"` was merged into one typed instance in source order (#11459/#9023)"
+		}
+		if merge.parent == "rib-groups" {
+			return "duplicate rib-group definition `" + merge.name + "` was merged into one " +
+				"rib-group in source order (#11791)"
+		}
 	}
-	if strings.HasPrefix(what, "rib-groups ") {
-		name := strings.TrimPrefix(what, "rib-groups ")
-		return "duplicate rib-group definition `" + name + "` was merged into one " +
-			"rib-group in source order (#11791)"
+	what := merge.parent
+	if merge.keyword != "" {
+		what += " " + merge.keyword
+	}
+	if merge.name != "" {
+		what += " " + merge.name
 	}
 	return "duplicate block `" + what + "` — the repeated statements were merged into the " +
 		"first occurrence (#9023); previously the later block replaced the earlier " +
 		"one and its configuration was discarded"
+}
+
+func diagnosticMergeName9023(name string) string {
+	if strings.ContainsAny(name, " \t\r\n\"'") {
+		return fmt.Sprintf("%q", name)
+	}
+	return name
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -375,8 +389,8 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 	// so strict and tolerant paths produce one deterministic record per name;
 	// the policy fold below remains tolerant-only because strict commits reject
 	// duplicate policy names.
-	for _, what := range mergeDuplicateBlocks9023(tree) {
-		dupMergeWarnings = append(dupMergeWarnings, duplicateBlockMergeWarning9023(what))
+	for _, merge := range mergeDuplicateBlocks9023(tree) {
+		dupMergeWarnings = append(dupMergeWarnings, duplicateBlockMergeWarning9023(merge))
 	}
 	// Keep the pre-fold tree for group conflict provenance. The main tolerant
 	// fold remains pre-expansion; the clone preserves source boundaries while
@@ -740,8 +754,8 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 	// so strict and tolerant paths produce one deterministic record per name;
 	// the policy fold below remains tolerant-only because strict commits reject
 	// duplicate policy names.
-	for _, what := range mergeDuplicateBlocks9023(tree) {
-		dupMergeWarnings = append(dupMergeWarnings, duplicateBlockMergeWarning9023(what))
+	for _, merge := range mergeDuplicateBlocks9023(tree) {
+		dupMergeWarnings = append(dupMergeWarnings, duplicateBlockMergeWarning9023(merge))
 	}
 	// Keep the pre-fold tree for group conflict provenance. The main tolerant
 	// fold remains pre-expansion; the clone preserves source boundaries while
