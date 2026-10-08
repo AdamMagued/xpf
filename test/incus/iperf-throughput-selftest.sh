@@ -547,7 +547,7 @@ grep -q -- '--failover-check --json-stream --streams "$streams"' "$ORACLE_LIB" \
 grep -Fq -- '--crash-at "${events[$((event_number - 1))]}"' "$ORACLE_LIB" \
 	|| bad "shared smoke oracle does not evaluate every supplied transition timestamp"
 
-SMOKES=(test-double-failover.sh test-chained-crash.sh test-active-active.sh test-stress-failover.sh)
+SMOKES=(test-double-failover.sh test-chained-crash.sh test-active-active.sh test-stress-failover.sh test-rolling-upgrade.sh)
 for smoke in "${SMOKES[@]}"; do
 	[[ -z "$SELFTEST_HARNESS" || "$smoke" == "$SELFTEST_HARNESS" ]] || continue
 	f="${SCRIPT_DIR}/${smoke}"
@@ -560,6 +560,22 @@ for smoke in "${SMOKES[@]}"; do
 			|| bad "$smoke does not call iperf_throughput_verdict"
 		awk '/^throughput_verdict=/,/^esac$/' "$f" | grep -qE '^\*\)[[:space:]]+fail ' \
 			|| bad "$smoke: the text throughput verdict has no catch-all '*) fail'"
+	elif [[ "$smoke" == "test-rolling-upgrade.sh" ]]; then
+		grep -q 'source "${SCRIPT_DIR}/failover-client-lib.sh"' "$f" \
+			&& grep -Fq 'failover_start_main_iperf "$ROLLING_IPERF_DURATION"' "$f" \
+			&& grep -Fq '"$IPERF_STREAMS" "$REMOTE_LOG" "$REMOTE_PID" "$ROLLING_IPERF_INTERVAL"' "$f" \
+			|| bad "$smoke does not use the tracked 100-ms client helper"
+		grep -q 'failover_main_iperf_running "$REMOTE_PID" "$IPERF_TARGET" "$IPERF_PORT" "$IPERF_STREAMS"' "$f" \
+			|| bad "$smoke does not scope client liveness to its pidfile and tuple"
+		grep -q 'rolling_upgrade_oracle.py' "$f" \
+			|| bad "$smoke does not run the per-stream rolling-upgrade oracle"
+		grep -Fq -- '--max-interval-sec 0.25' "$f" \
+			|| bad "$smoke does not pin the oracle's 250-ms interval-width limit"
+		grep -Fq 'ROLLING_IPERF_INTERVAL="0.1"' "$f" \
+			|| bad "$smoke does not pin the 100-ms iperf3 sampling interval"
+		if grep -vE '^[[:space:]]*#' "$f" | grep -qE 'pgrep.*iperf3|pkill.*iperf3'; then
+			bad "$smoke retains unscoped iperf3 process matching or termination"
+		fi
 	else
 		grep -q 'source "${SCRIPT_DIR}/ha-smoke-iperf-lib.sh"' "$f" \
 			|| bad "$smoke does not source the tracked JSON smoke client/oracle"
@@ -609,19 +625,22 @@ for smoke in "${SMOKES[@]}"; do
 			bad "$smoke retains unscoped iperf3 process matching or termination"
 		fi
 	fi
-	if grep -vE '^[[:space:]]*#' "$f" | grep -qE "grep -o[a-zA-Z]* ['\"][^'\"]*Gbits"; then
-		bad "$smoke: an inline Gbits-only throughput parse is back"
-	fi
-	ok "$smoke: client/verdict wiring is scoped and total"
-
 	if [[ "$smoke" == "test-stress-failover.sh" ]]; then
 		grep -q -- '-p ${IPERF_PORT}' "$f" \
 			|| bad "$smoke does not pass -p \${IPERF_PORT} to iperf3"
+	elif [[ "$smoke" == "test-rolling-upgrade.sh" ]]; then
+		grep -Fq 'IPERF_PORT="${IPERF_PORT:-5211}"' "$f" \
+			|| bad "$smoke does not retain the dedicated port 5211"
 	else
 		grep -q 'failover_start_main_iperf "$IPERF_DURATION" "$IPERF_TARGET" "$IPERF_PORT" "$IPERF_STREAMS"' "$f" \
 			&& grep -q ' -p "$3" ' "${SCRIPT_DIR}/failover-client-lib.sh" \
 			|| bad "$smoke does not pass its configured port through the tracked client helper"
 	fi
+	if grep -vE '^[[:space:]]*#' "$f" | grep -qE "grep -o[a-zA-Z]* ['\"][^'\"]*Gbits"; then
+		bad "$smoke: an inline Gbits-only throughput parse is back"
+	fi
+	ok "$smoke: client/verdict wiring is scoped and total"
+
 	port=$(sed -n 's/^IPERF_PORT="\${IPERF_PORT:-\([0-9]*\)}"/\1/p' "$f")
 	[ -n "$port" ] || bad "could not read the IPERF_PORT default out of $smoke -- this cell would otherwise pass having checked nothing"
 	term=$(sed -n "s/^set firewall family inet filter bandwidth-output term \([0-9]*\) from destination-port ${port}$/\1/p" "$COS_SET" | head -1)

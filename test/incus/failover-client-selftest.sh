@@ -182,14 +182,14 @@ else
 	bad "omitted interval keeps the existing iperf3 command unchanged"
 fi
 
-failover_start_main_iperf 60 192.0.2.1 5212 2 "$TMP_DIR/interval.log" "$TMP_DIR/interval.pid" 1
+failover_start_main_iperf 60 192.0.2.1 5212 2 "$TMP_DIR/interval.log" "$TMP_DIR/interval.pid" 0.1
 interval_pid=$(cat "$TMP_DIR/interval.pid" 2>/dev/null || true)
 if [[ "$interval_pid" =~ ^[0-9]+$ ]] &&
    failover_main_iperf_running "$TMP_DIR/interval.pid" 192.0.2.1 5212 2 &&
-   grep -qE '(^| )-i 1( |$)' "$TMP_DIR/interval.args"; then
-	ok "optional interval is passed to the tracked iperf3 client"
+   grep -qE '(^| )-i 0\.1( |$)' "$TMP_DIR/interval.args"; then
+	ok "tracked client passes the configured 100-ms interval"
 else
-	bad "optional interval is passed to the tracked iperf3 client"
+	bad "tracked client passes the configured 100-ms interval"
 fi
 
 failover_start_main_iperf 60 192.0.2.1 5210 2 "$TMP_DIR/pool.log" "$TMP_DIR/pool.pid"
