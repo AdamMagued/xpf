@@ -318,10 +318,11 @@ type compileOpts struct {
 	// lenientIPsecPolicyProposalRef.
 	lenientSchedulerMapRef bool
 	// lenientSchedulerWindowPairs11358 downgrades conflicting repeated
-	// start-time/stop-time boundaries within one scheduler day from a strict
-	// compile error to a warning on tolerant load / peer-sync paths. The typed
-	// scheduler model has one window per day, so silently accepting conflicting
-	// boundaries loses authored scheduling semantics (#11358).
+	// start-time/stop-time boundaries (#11358) and weekday all-day, exclude,
+	// and time-window meanings split across separate weekday statements
+	// (#12238) from strict compile errors to warnings on tolerant load /
+	// peer-sync paths. The typed scheduler model has one window per day, so
+	// silently accepting either conflict loses authored scheduling semantics.
 	lenientSchedulerWindowPairs11358 bool
 
 	// lenientCoSInterfaceRefs (#7337) downgrades the class-of-service

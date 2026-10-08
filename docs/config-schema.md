@@ -8839,6 +8839,45 @@ legacy direct daily leaves. Regression coverage:
 `pkg/config/compiler_scheduler_window_pairs_11358_test.go` and
 `pkg/config/compiler_scheduler_window_pairs_11681_test.go`.
 
+### Contradictory weekday scheduler statements are diagnosed (#12238)
+
+The compiled scheduler model carries one window per weekday, and the weekday
+merge ORs `all-day` and `exclude` across every statement for that day. The
+validator therefore records each weekday statement (one `monday …` node after
+flat-run expansion, including flags carried in the node's keys) separately and
+diagnoses two splits:
+
+- an `all-day` or `exclude` statement that does not itself carry the complete
+  start/stop pair that the day's statements supply; and
+- `all-day` in one statement and `exclude` in another.
+
+Statements count separately whether they sit in one `scheduler` block, in
+repeated same-name blocks, or in repeated `schedulers` roots. The validator
+checks the effective node0 and node1 group expansions, so separate statements
+that a peer-only group supplies are rejected on either node.
+
+- Strict compilation (commit check and commit) rejects with the scheduler
+  name, the weekday, and the split that was found.
+- Tolerant compilation (`Store.Load`, `SyncApply`) warns and keeps the
+  pre-existing union window, so an already-stored config still boots. The
+  strict gate then refuses the next commit, including a commit after a
+  rollback to such a revision, until the statements are combined or removed.
+- A flag next to only a partial start/stop pair, distinct weekdays, and
+  repeated `daily` statements (a last-wins scalar window) remain valid.
+- One weekday statement keeps the #10006 behavior: `monday { all-day;
+  start-time …; stop-time …; }` is accepted.
+- The outcome depends on the stored shape. Flat `set` lines that build one
+  `monday` node, `load merge` into an existing `monday { … }` container, and
+  group inheritance that merges into an inline `monday { … }` each produce ONE
+  statement, which is not diagnosed even when it mixes `all-day` with a time
+  window. `set … monday start-time …` on top of a stored `monday all-day;` leaf
+  produces a second statement and is rejected. The single-statement and
+  group-merged shapes are tracked by #12643.
+
+Regression coverage is in
+`pkg/config/compiler_scheduler_weekday_reject_12238_test.go` and
+`pkg/configstore/scheduler_reject_12238_test.go`.
+
 ### Quoted-value escape round-trip contract (#3854)
 
 When a key or value is not safe to emit bare (see the next section for the

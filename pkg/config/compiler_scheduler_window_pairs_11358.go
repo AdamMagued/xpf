@@ -17,10 +17,102 @@ type schedulerWindowBoundaryValues11358 struct {
 	repeatedStop  bool
 }
 
-// validateSchedulerWindowPairs11358 checks each effective cluster-node view
-// before node-local expansion can hide a peer-only group. The scheduler model
-// stores one scalar time pair per day, so conflicting repeats cannot be
-// represented without losing a boundary.
+type schedulerWindowFinding11358 uint8
+
+const (
+	schedulerWindowFindingRepeatedBoundary11358 schedulerWindowFinding11358 = 1 << iota
+	schedulerWindowFindingAllDayExclude12238
+	schedulerWindowFindingFlagWindow12238
+)
+
+// schedulerWeekdayContribution12238 is what one weekday statement (one
+// `monday ...` node after flat-run expansion) declares for its day.
+// Contributors are keyed per statement: a flag and a complete window inside one
+// statement keep the #10006 behavior, while the same meanings split across
+// separate statements are diagnosed whether those statements sit in one
+// scheduler block or in repeated blocks. Fragments that `set`, `load merge`, or
+// group inheritance compose into one existing statement cannot be told apart
+// from one authored statement and are not diagnosed (#12643).
+type schedulerWeekdayContribution12238 struct {
+	allDay  bool
+	exclude bool
+	start   bool
+	stop    bool
+}
+
+type schedulerWeekdayContributors12238 struct {
+	allDay  map[*Node]struct{}
+	exclude map[*Node]struct{}
+	start   map[*Node]struct{}
+	stop    map[*Node]struct{}
+}
+
+func (c *schedulerWeekdayContributors12238) add(statement *Node, contribution schedulerWeekdayContribution12238) {
+	if contribution.allDay {
+		if c.allDay == nil {
+			c.allDay = make(map[*Node]struct{})
+		}
+		c.allDay[statement] = struct{}{}
+	}
+	if contribution.exclude {
+		if c.exclude == nil {
+			c.exclude = make(map[*Node]struct{})
+		}
+		c.exclude[statement] = struct{}{}
+	}
+	if contribution.start {
+		if c.start == nil {
+			c.start = make(map[*Node]struct{})
+		}
+		c.start[statement] = struct{}{}
+	}
+	if contribution.stop {
+		if c.stop == nil {
+			c.stop = make(map[*Node]struct{})
+		}
+		c.stop[statement] = struct{}{}
+	}
+}
+
+// splitAllDayExclude reports all-day and exclude declared by different
+// statements for the same day.
+func (c *schedulerWeekdayContributors12238) splitAllDayExclude() bool {
+	for allDayStatement := range c.allDay {
+		for excludeStatement := range c.exclude {
+			if allDayStatement != excludeStatement {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// splitFlagWindow reports an all-day or exclude statement that does not itself
+// carry the complete start/stop pair the day's statements supply. A flag next
+// to only a partial start/stop preserves complementary-fragment behavior
+// (#11641).
+func (c *schedulerWeekdayContributors12238) splitFlagWindow() bool {
+	if len(c.start) == 0 || len(c.stop) == 0 {
+		return false
+	}
+	lacksOwnWindow := func(flags map[*Node]struct{}) bool {
+		for flagStatement := range flags {
+			_, hasStart := c.start[flagStatement]
+			_, hasStop := c.stop[flagStatement]
+			if !hasStart || !hasStop {
+				return true
+			}
+		}
+		return false
+	}
+	return lacksOwnWindow(c.allDay) || lacksOwnWindow(c.exclude)
+}
+
+// validateSchedulerWindowPairs11358 checks effective cluster-node views before
+// node-local expansion can hide a peer-only group. It rejects conflicting
+// boundary repeats (#11358) and weekday all-day, exclude, and time-window
+// meanings split across separate weekday statements (#12238), because the
+// scheduler model stores only one window per day.
 func validateSchedulerWindowPairs11358(tree *ConfigTree, lenient bool) ([]string, error) {
 	if tree == nil {
 		return nil, nil
@@ -28,7 +120,7 @@ func validateSchedulerWindowPairs11358(tree *ConfigTree, lenient bool) ([]string
 	if !hasSchedulerWindowCandidate11358(tree) {
 		return nil, nil
 	}
-	findings := make(map[schedulerWindowKey11358]struct{})
+	findings := make(map[schedulerWindowKey11358]schedulerWindowFinding11358)
 	for _, nodeID := range []int{0, 1} {
 		view := tree.Clone()
 		vars := map[string]string{"node": fmt.Sprintf("node%d", nodeID)}
@@ -54,9 +146,28 @@ func validateSchedulerWindowPairs11358(tree *ConfigTree, lenient bool) ([]string
 
 	warnings := make([]string, 0, len(keys))
 	for _, key := range keys {
-		message := fmt.Sprintf(
-			"scheduler %q %s has conflicting repeated time boundaries; xpf stores one window per day, so conflicting repeats do not define a supported multiple-window representation and later definitions may replace earlier boundary values or whole windows (#11358)",
-			key.scheduler, key.day)
+		var message string
+		addMessage := func(part string) {
+			if message != "" {
+				message += "; "
+			}
+			message += part
+		}
+		if findings[key]&schedulerWindowFindingRepeatedBoundary11358 != 0 {
+			addMessage(fmt.Sprintf(
+				"scheduler %q %s has conflicting repeated time boundaries; xpf stores one window per day, so conflicting repeats do not define a supported multiple-window representation and later definitions may replace earlier boundary values or whole windows (#11358)",
+				key.scheduler, key.day))
+		}
+		if findings[key]&schedulerWindowFindingAllDayExclude12238 != 0 {
+			addMessage(fmt.Sprintf(
+				"scheduler %q %s combines all-day and exclude from separate weekday statements; xpf stores one window per day and cannot represent both meanings (#12238)",
+				key.scheduler, key.day))
+		}
+		if findings[key]&schedulerWindowFindingFlagWindow12238 != 0 {
+			addMessage(fmt.Sprintf(
+				"scheduler %q %s combines an all-day or exclude flag with start-time/stop-time bounds from a separate weekday statement; xpf stores one window per day and cannot represent both meanings (#12238)",
+				key.scheduler, key.day))
+		}
 		if !lenient {
 			return nil, fmt.Errorf("%s", message)
 		}
@@ -93,11 +204,12 @@ func containsSchedulerSection11358(nodes []*Node) bool {
 }
 
 // collectSchedulerWindowPairFindings11358 scans one already-expanded view.
-// Findings are unioned by scheduler/day across node0 and node1; boundary
-// values are intentionally compared only within one view so legitimate
-// node-specific windows are not mistaken for duplicate statements.
-func collectSchedulerWindowPairFindings11358(tree *ConfigTree, findings map[schedulerWindowKey11358]struct{}) {
+// Findings are unioned by scheduler/day across node0 and node1. Boundary
+// repeats and weekday contributors are compared only within one view so
+// legitimate node-specific windows are not mistaken for repeated statements.
+func collectSchedulerWindowPairFindings11358(tree *ConfigTree, findings map[schedulerWindowKey11358]schedulerWindowFinding11358) {
 	var windows map[schedulerWindowKey11358]*schedulerWindowBoundaryValues11358
+	var weekdayContributors map[schedulerWindowKey11358]*schedulerWeekdayContributors12238
 	record := func(scheduler, day, boundary, value string) {
 		if value == "" {
 			return
@@ -151,6 +263,25 @@ func collectSchedulerWindowPairFindings11358(tree *ConfigTree, findings map[sche
 					// Legacy direct scheduler leaves are the daily scalar window.
 					record(inst.name, "daily", prop.Name(), nodeVal(prop))
 				case "daily", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday":
+					if _, isWeekday := schedulerWeekdays[prop.Name()]; isWeekday {
+						if win, ok := schedulerWindowFromNode(prop); ok {
+							if weekdayContributors == nil {
+								weekdayContributors = make(map[schedulerWindowKey11358]*schedulerWeekdayContributors12238)
+							}
+							key := schedulerWindowKey11358{scheduler: inst.name, day: prop.Name()}
+							contributors := weekdayContributors[key]
+							if contributors == nil {
+								contributors = &schedulerWeekdayContributors12238{}
+								weekdayContributors[key] = contributors
+							}
+							contributors.add(prop, schedulerWeekdayContribution12238{
+								allDay:  win.AllDay,
+								exclude: win.Exclude,
+								start:   win.StartTime != "",
+								stop:    win.StopTime != "",
+							})
+						}
+					}
 					for _, leaf := range expandFlatRun(prop.Children, schedulerDayLeafSchema8939()) {
 						if leaf == nil {
 							continue
@@ -164,9 +295,17 @@ func collectSchedulerWindowPairFindings11358(tree *ConfigTree, findings map[sche
 		}
 	}
 
+	for key, contributors := range weekdayContributors {
+		if contributors.splitAllDayExclude() {
+			findings[key] |= schedulerWindowFindingAllDayExclude12238
+		}
+		if contributors.splitFlagWindow() {
+			findings[key] |= schedulerWindowFindingFlagWindow12238
+		}
+	}
 	for key, values := range windows {
 		if values.repeatedStart || values.repeatedStop {
-			findings[key] = struct{}{}
+			findings[key] |= schedulerWindowFindingRepeatedBoundary11358
 		}
 	}
 }
