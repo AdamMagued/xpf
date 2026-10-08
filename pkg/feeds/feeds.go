@@ -1264,6 +1264,33 @@ func (m *Manager) refreshLoop(ctx context.Context, fs *feedState, interval time.
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	var holdTimer *time.Timer
+	var holdExpiry <-chan time.Time
+	resetHoldTimer := func() {
+		if holdTimer != nil && !holdTimer.Stop() {
+			select {
+			case <-holdTimer.C:
+			default:
+			}
+		}
+		delay, armed := m.holdExpiryDelay(fs)
+		if !armed {
+			holdExpiry = nil
+			return
+		}
+		if holdTimer == nil {
+			holdTimer = time.NewTimer(delay)
+		} else {
+			holdTimer.Reset(delay)
+		}
+		holdExpiry = holdTimer.C
+	}
+	defer func() {
+		if holdTimer != nil {
+			holdTimer.Stop()
+		}
+	}()
+	resetHoldTimer()
 
 	for {
 		select {
@@ -1271,6 +1298,10 @@ func (m *Manager) refreshLoop(ctx context.Context, fs *feedState, interval time.
 			return
 		case <-ticker.C:
 			m.fetchFeed(ctx, fs)
+			resetHoldTimer()
+		case <-holdExpiry:
+			m.expireStaleHold(fs)
+			resetHoldTimer()
 		}
 	}
 }
@@ -2130,6 +2161,63 @@ func (m *Manager) recordFailure(fs *feedState, ferr error) {
 		return
 	}
 	m.finishFailure(fs, transition, true)
+}
+
+// holdDeadlineLocked returns the wall-clock time at which a current feed's
+// retained snapshot reaches its hold deadline. It is the single source for
+// both arming (holdExpiryDelay) and expiry (expireStaleHold): the refresh
+// loop only makes progress if an armed timer implies the expiry path either
+// drops the snapshot or computes a positive delay. Callers must hold m.mu
+// (read or write); staleSince keeps its monotonic reading across calls.
+func (m *Manager) holdDeadlineLocked(fs *feedState) (time.Time, bool) {
+	if cur, ok := m.feeds[fs.name]; !ok || cur != fs ||
+		fs.holdInterval <= 0 || !fs.hasSnapshot || len(fs.prefixes) == 0 ||
+		fs.staleSince.IsZero() {
+		return time.Time{}, false
+	}
+	return fs.staleSince.Add(fs.holdInterval), true
+}
+
+// holdExpiryDelay returns the time until a current feed's retained snapshot
+// reaches its hold deadline. The refresh loop uses this to wake independently
+// of the (potentially much longer) fetch cadence.
+func (m *Manager) holdExpiryDelay(fs *feedState) (time.Duration, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	deadline, ok := m.holdDeadlineLocked(fs)
+	if !ok {
+		return 0, false
+	}
+	delay := deadline.Sub(m.now())
+	if delay < 0 {
+		delay = 0
+	}
+	return delay, true
+}
+
+// expireStaleHold applies a due hold expiry without waiting for another fetch
+// failure. The drop is applied under m.mu; its log and onUpdate publication
+// run outside m.mu, as in recordFailure.
+func (m *Manager) expireStaleHold(fs *feedState) {
+	m.mu.Lock()
+	deadline, ok := m.holdDeadlineLocked(fs)
+	if !ok {
+		m.mu.Unlock()
+		return
+	}
+	if m.now().Before(deadline) {
+		m.mu.Unlock()
+		return
+	}
+	transition := feedFailureTransition{
+		current:      true,
+		dropped:      true,
+		lastError:    fs.lastError,
+		holdInterval: fs.holdInterval,
+	}
+	dropSnapshotToEmptyLocked(fs)
+	m.mu.Unlock()
+	m.finishFailure(fs, transition, false)
 }
 
 func (m *Manager) finishFailure(fs *feedState, transition feedFailureTransition, logRetained bool) {
