@@ -1412,15 +1412,18 @@ directly:
   ALONGSIDE the poison counter above, never as a substitute: a poison
   recovery keeps the committed queue and loses nothing, a capacity drop
   discards a command, and the two have opposite remediations.
-  - The expected steady-state value is **0**, and not because the queue
-    is roomy: what a producer has to outrun is the consumer's
-    ~1 µs/command PROCESSING rate, which no control-plane producer
-    sustains. A rising counter therefore does not mean "busy" — it means
-    a worker has STOPPED draining. `spawn_supervised_worker` catches a
-    `worker_loop` panic, sets `runtime_atomics.dead = true` and lets the
-    thread exit, but the worker RECORD is never removed and producers
-    fan out over `records.values()` with no `dead` check, so they keep
-    enqueueing into a queue nothing will drain.
+  - The expected steady-state value is **0**, but read it alongside the
+    dead-worker SHED counter (`xpf_userspace_worker_command_queue_shed_total`):
+    capacity drops mean a command was refused, while a dead-worker shed means
+    a producer deliberately skipped a queue its worker cannot consume.
+    Session-upsert replication and record-keyed producers count dead-worker
+    skips as SHED instead of filling the dead queue. CoS redirect, PPTP
+    broadcast, session-delete replication, and local-tunnel `UpsertLocal`
+    fan-out still lack a dead check, so they can continue feeding a dead
+    worker's bounded queue until it reaches capacity. A rising DROPS count
+    therefore means a producer hit the queue cap—not simply that the dataplane
+    is busy—and SHED is the signal for dead workers that liveness-aware
+    producers skipped.
     - #6929 originally justified this as "the consumer drains the WHOLE
       deque in one `core::mem::take` per poll". **That is no longer how
       the drain works** — see the bounded prefix drain below — but the

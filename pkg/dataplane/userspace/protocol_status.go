@@ -382,7 +382,9 @@ type ProcessStatus struct {
 	// shared-map mutex pair scoped to publish_shared_session alone; their
 	// ratio is the publish leg's blocked fraction.
 	// SessionReplication{Upserts,Enqueued}Total give the replication call
-	// rate and, as Enqueued/Upserts, the N-way sibling fan-out multiplier.
+	// rate and, as Enqueued/Upserts, the live-sibling multiplier: dead-worker
+	// legs skipped by #12192 are excluded, so this can be below the configured
+	// sibling count.
 	// SessionReplicationLockContendedTotal is the blocked subset of those
 	// enqueues (denominator: Enqueued).
 	// SessionReplicationQueueDepthSum accumulates the per-call deepest

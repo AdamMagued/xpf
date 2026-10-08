@@ -273,10 +273,10 @@ func (c *xpfCollector) initUserspaceSessionDescriptors() {
 		"xpf_userspace_session_replication_enqueued_total",
 		"Individual UpsertSynced commands enqueued by the sibling "+
 			"session-replication fan-out. Divided by "+
-			"..._replication_upserts_total this recovers the N-way fan-out "+
-			"multiplier (the sibling worker count) without the consumer "+
-			"having to know it out of band; it is also the denominator for "+
-			"the replication contention counter (#4800).",
+			"..._replication_upserts_total this is the live-sibling "+
+			"multiplier: dead-worker legs skipped by #12192 are excluded, "+
+			"so it need not equal the configured sibling count. It is also "+
+			"the denominator for the replication contention counter (#4800).",
 		nil, nil,
 	)
 	c.userspaceSessionReplicationLockBlocked = prometheus.NewDesc(

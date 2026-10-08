@@ -585,14 +585,14 @@ pub(in crate::afxdp) fn replay_preserved_sessions(
     workers: &BTreeMap<u32, Vec<BindingPlan>>,
     tunnel_purge_ids: &[u16],
     session_map: SteeringMap<'_>,
-) -> Arc<BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>> {
-    let worker_command_queues: Arc<BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>> = Arc::new(
+) -> Arc<WorkerCommandQueues> {
+    let worker_command_queues = Arc::new(WorkerCommandQueues::new(
         workers
             .keys()
             .copied()
             .map(|worker_id| (worker_id, Arc::new(Mutex::new(VecDeque::new()))))
             .collect(),
-    );
+    ));
     let mut replay_entries = coord.snapshot_shared_session_entries();
     crate::afxdp::coordinator::purge_stale_replayed_synced_sessions(coord, &replay_entries);
     crate::afxdp::coordinator::filter_replayed_synced_sessions(
@@ -785,7 +785,7 @@ fn spawn_workers(
     coord: &mut Coordinator,
     workers: BTreeMap<u32, Vec<BindingPlan>>,
     node_id: u8,
-    worker_command_queues: Arc<BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>>,
+    worker_command_queues: Arc<WorkerCommandQueues>,
     tunnel_purge_ids: &[u16],
     dnat_fds: DnatTableFds,
     startup_report_tx: &mpsc::Sender<WorkerStartupReport>,
@@ -829,10 +829,15 @@ fn spawn_workers(
         let session_export_ack = Arc::new(AtomicU64::new(0));
         let export_buffer = Arc::new(crate::afxdp::binding_state::ExportBufferState::new());
         let cos_status = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        // #12192: the queue map is built from the same `workers` map this
+        // loop iterates (`replay_preserved_sessions` keys it by worker id),
+        // so every spawned worker has a generation queue. A missing entry
+        // is a reconcile bug, not a fallback case — an orphan queue here
+        // would never match the generation projection below.
         let commands = worker_command_queues
             .get(&worker_id)
             .cloned()
-            .unwrap_or_else(|| Arc::new(Mutex::new(VecDeque::new())));
+            .expect("worker command queue built from the same workers map");
         // #5289: give each worker its OWN exception ring + last-resolution
         // slot so the ~1 Hz status thread can drain them. This replaces the
         // shared process-global `recent_exceptions`/`last_resolution` mutexes
@@ -869,8 +874,10 @@ fn spawn_workers(
         let worker_poll_mode = coord.poll_mode;
         let event_stream_handle = coord.event_stream_worker_handle();
         let cos_status_clone = cos_status.clone();
-        let runtime_atomics =
-            std::sync::Arc::new(crate::afxdp::worker_runtime::WorkerRuntimeAtomics::new());
+        let runtime_atomics = worker_command_queues
+            .runtime_atomics_for_queue(&commands)
+            .cloned()
+            .expect("worker command queue has generation-matched runtime atomics");
         let runtime_atomics_clone = runtime_atomics.clone();
         // #1621: sibling per-worker WorkerColdPathAtomics, allocated
         // alongside the runtime_atomics so the publish + snapshot
@@ -1445,3 +1452,7 @@ pub(in crate::afxdp) fn planned_worker_slots<V>(workers: &BTreeMap<u32, V>) -> u
         .map(|&id| id as usize + 1)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+#[path = "bringup_dead_worker_12192_tests.rs"]
+mod dead_worker_wiring_tests;

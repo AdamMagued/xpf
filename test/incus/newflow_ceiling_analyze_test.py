@@ -486,10 +486,10 @@ class QueueDepthIsItsOwnFinding(unittest.TestCase):
         self.assertEqual(a.culprits, [])
 
     def test_fanout_multiplier_is_recovered_from_the_counter_pair(self):
-        """enqueued/upserts must reproduce the sibling worker count.
+        """On an all-live run, enqueued/upserts reproduces sibling count.
 
-        The analysis layer never learns the worker count out of band; it
-        divides. Six workers must read back as 6.0.
+        In general the ratio is the live-sibling count because dead-worker
+        legs are excluded. Six live workers must read back as 6.0.
         """
         a = analyze(
             snap(0.0, workers=six_even_workers(0)),

@@ -109,7 +109,7 @@ Process-global, on `ProcessStatus`:
 | `xpf_userspace_shared_session_publish_lock_acquisitions_total` | shared-map acquisitions **scoped to publish only** |
 | `xpf_userspace_shared_session_publish_lock_contended_total` | the blocked subset |
 | `xpf_userspace_session_replication_upserts_total` | replication calls |
-| `xpf_userspace_session_replication_enqueued_total` | individual sibling enqueues, counted immediately BEFORE each acquisition so `contended/enqueued` is a ratio over acquisitions actually ATTEMPTED at any instant, not over a fan-out booked up front; at rest `enqueued/upserts` **is** the N-way fan-out multiplier |
+| `xpf_userspace_session_replication_enqueued_total` | individual sibling enqueues, counted immediately BEFORE each acquisition so `contended/enqueued` is a ratio over acquisitions actually ATTEMPTED at any instant, not over a fan-out booked up front; at rest `enqueued/upserts` is the **live-sibling multiplier** (dead-worker legs skipped by #12192 are excluded), not necessarily the configured sibling count |
 | `xpf_userspace_session_replication_lock_contended_total` | sibling-queue acquisitions that blocked |
 | `xpf_userspace_session_replication_queue_depth_sum` | sum of the per-call **worst** sibling-queue depth; `Δsum / Δupserts` is the mean worst-sibling depth per replication CALL (not per connection — see the per-call note above) — **the backlog statistic** |
 | `xpf_userspace_session_replication_queue_depth_max` | process-lifetime high-water. **Operator context only** — see below |
@@ -397,7 +397,8 @@ Per cell, under `artifacts/newflow-ceiling/<UTC>/rate-<N>/`:
    window set the record).
 4. `active_workers >= 3` and `max_worker_share <= 0.60` (proving the
    cross-worker path was genuinely exercised).
-5. `replication_fanout` reads back as the real sibling worker count.
+5. `replication_fanout` reports the live sibling count (equal to the configured
+   worker count for this all-live run).
 6. `accept_ratio >= 0.95` against the REQUESTED rate (not the achieved one —
    achieved/achieved is ~1 by construction and gates nothing).
 7. `generator.json` accounts for every attempt:

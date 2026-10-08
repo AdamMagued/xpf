@@ -739,7 +739,7 @@ def render(a: Analysis) -> str:
         "and never gates a culprit"
     )
     if a.replication_fanout is not None:
-        lines.append(f"  replication fan-out (enqueued/upserts): {a.replication_fanout:.2f}")
+        lines.append(f"  live-sibling fan-out (enqueued/upserts): {a.replication_fanout:.2f}")
     lines.append("")
     if a.culprits:
         lines.append("saturated: " + ", ".join(a.culprits))

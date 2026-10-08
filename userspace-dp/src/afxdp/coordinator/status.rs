@@ -237,9 +237,9 @@ impl super::Coordinator {
     /// `shared_session_publish_lock_{acquisitions,contended}_total` are the
     /// map-mutex pair scoped to `publish_shared_session` alone.
     /// `session_replication_{upserts,enqueued}_total` give the call rate
-    /// and the N-way fan-out multiplier (`enqueued / upserts` = sibling
-    /// worker count), `session_replication_lock_contended_total` is the
-    /// blocked subset of those enqueues, and
+    /// and the live-sibling multiplier (`enqueued / upserts`), which excludes
+    /// dead-worker legs skipped by #12192; `session_replication_lock_contended_total`
+    /// is the blocked subset of those live enqueues, and
     /// `session_replication_queue_depth_max` is the monotonic high-water
     /// sibling-queue depth — contention means producers collided, depth
     /// means the consumer is not keeping up, and the two have different
@@ -410,7 +410,7 @@ impl super::Coordinator {
     /// #5674: total peer-synced session imports rejected by the coordinator's
     /// aggregate admission bound (`upsert_synced_session`). Locally-created
     /// sessions are capped per worker at `DEFAULT_MAX_SESSIONS`; peer-synced
-    /// imports were previously uncapped and fanned out to every worker, so a
+    /// imports were previously uncapped and fanned out to every live worker, so a
     /// peer under session-table pressure (or a compromised peer) could drive
     /// this node past its own aggregate session ceiling. A rising value means a
     /// peer exceeded this appliance's ceiling.
