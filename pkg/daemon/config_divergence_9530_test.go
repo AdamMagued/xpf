@@ -1,7 +1,10 @@
 package daemon
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +14,7 @@ import (
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/configstore"
+	"github.com/psaab/xpf/pkg/dataplane"
 )
 
 // #9530: the daemon half of the partition-commit divergence alarm. The store
@@ -112,6 +116,42 @@ func TestHealSyncRaisesTheDivergenceEventOnce_9530(t *testing.T) {
 	d.reportConfigSyncDivergence()
 	if got := events(); len(got) != 1 {
 		t.Errorf("a converged re-push raised the divergence again: %d events", len(got))
+	}
+}
+
+func TestDeferredConfigSyncPendingReportsDivergenceAtInfo12235(t *testing.T) {
+	dp := &runtimeOnlyApplyTestDP{applyResult: &dataplane.ApplyResult{SnapshotPublishDeferred: true}}
+	d, _ := reinjectProductionHarness9637(t, dp)
+	d.cluster = newClusterManager(false)
+	d.applySem = semaphore.NewWeighted(1)
+	d.store = newConfigSyncStore(t, "c0-host")
+	markPartitionCommit9530(t, d.store)
+	d.store.SetClusterReadOnly(true)
+
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	err := d.handleConfigSync(winnerText9530(t))
+	var pending *cluster.ConfigApplyPendingError
+	if !errors.As(err, &pending) || pending.Completion == nil {
+		t.Fatalf("handleConfigSync = %v, want pending publication", err)
+	}
+	output := logs.String()
+	if !strings.Contains(output, "level=INFO msg=\"cluster: config sync apply pending publication\"") {
+		t.Fatalf("deferred sync was not logged at Info:\n%s", output)
+	}
+	if strings.Contains(output, "level=ERROR msg=\"cluster: config sync apply failed\"") {
+		t.Fatalf("deferred sync was incorrectly logged as an apply failure:\n%s", output)
+	}
+	var divergenceEvents int
+	for _, event := range d.cluster.EventHistoryFor(cluster.EventConfigSync) {
+		if strings.Contains(fmt.Sprintf("%+v", event), "never held") {
+			divergenceEvents++
+		}
+	}
+	if divergenceEvents != 1 {
+		t.Fatalf("deferred sync raised %d config-divergence events, want 1", divergenceEvents)
 	}
 }
 

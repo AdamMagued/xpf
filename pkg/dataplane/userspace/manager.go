@@ -212,6 +212,7 @@ type Manager struct {
 	// policySnapshotPrepublishIdentity binds that capture to the policy/rename
 	// inputs. Neighbor, fabric, and FIB-only partial updates preserve this proof.
 	policySnapshotPrepublishIdentity [32]byte
+	policySnapshotPublishFailure     func(generation uint64, err error)
 	// helperHAStatePublished records whether THIS helper process has been sent a
 	// non-empty HA group inventory (a successful update_ha_state with a
 	// non-empty group set). It is NOT derivable from len(m.haGroups): that is the

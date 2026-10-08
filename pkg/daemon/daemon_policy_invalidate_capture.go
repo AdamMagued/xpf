@@ -100,6 +100,174 @@ type policyInvalidationDebt struct {
 	landed *policyInvalidationDebt
 }
 
+// deferredSnapshotApply retains the applied-marker digest and HA completion
+// for one full snapshot until the helper accepts it. An in-band refusal
+// resolves the current HA attempt as failed but retains the marker record for
+// the status loop's later successful retry.
+type deferredSnapshotApply struct {
+	cfg        *config.Config
+	generation uint64
+	digest     string
+	completion chan error
+	reported   bool
+}
+
+var errDeferredSnapshotSuperseded = errors.New("deferred config snapshot superseded before publication")
+
+func (d *Daemon) recordDeferredSnapshotApply(cfg *config.Config, generation uint64) {
+	if cfg == nil || generation == 0 {
+		return
+	}
+	var digest string
+	if d.store != nil {
+		digest = d.store.ActiveDigest()
+	}
+	pending := &deferredSnapshotApply{
+		cfg: cfg, generation: generation, digest: digest,
+		completion: make(chan error, 1),
+	}
+	d.deferredSnapshotApplyMu.Lock()
+	if previous := d.deferredSnapshotApply; previous != nil {
+		sameTarget := (previous.digest != "" && previous.digest == digest) || previous.cfg == cfg
+		if sameTarget {
+			previous.cfg = cfg
+			previous.generation = generation
+			if previous.reported {
+				previous.completion = make(chan error, 1)
+				previous.reported = false
+			}
+			d.deferredSnapshotApplyMu.Unlock()
+			return
+		}
+		if !previous.reported {
+			previous.reported = true
+			previous.completion <- errDeferredSnapshotSuperseded
+		}
+	}
+	d.deferredSnapshotApply = pending
+	d.deferredSnapshotApplyMu.Unlock()
+}
+
+func (d *Daemon) resolveDeferredSnapshotApplyAfterSynchronousPublish(cfg *config.Config, generation uint64) {
+	var digest string
+	if d.store != nil {
+		digest = d.store.ActiveDigest()
+	}
+	d.deferredSnapshotApplyMu.Lock()
+	pending := d.deferredSnapshotApply
+	if pending == nil {
+		d.deferredSnapshotApplyMu.Unlock()
+		return
+	}
+	sameTarget := (pending.digest != "" && pending.digest == digest) || pending.cfg == cfg
+	if sameTarget && d.policyInvalidationDebt != nil {
+		pending.cfg = cfg
+		pending.generation = generation
+		d.deferredSnapshotApplyMu.Unlock()
+		return
+	}
+	d.deferredSnapshotApply = nil
+	d.deferredSnapshotApplyMu.Unlock()
+
+	if sameTarget {
+		if d.store != nil {
+			d.store.MarkAppliedDigest(pending.digest)
+		}
+		if !pending.reported {
+			pending.completion <- nil
+		}
+		return
+	}
+	if !pending.reported {
+		pending.completion <- errDeferredSnapshotSuperseded
+	}
+}
+
+func (d *Daemon) deferredSnapshotCompletion(generation uint64) <-chan error {
+	d.deferredSnapshotApplyMu.Lock()
+	defer d.deferredSnapshotApplyMu.Unlock()
+	if pending := d.deferredSnapshotApply; pending != nil && generation >= pending.generation {
+		return pending.completion
+	}
+	return nil
+}
+
+func (d *Daemon) failDeferredSnapshotApplyForConfig(cfg *config.Config, err error) {
+	if d == nil || cfg == nil || err == nil {
+		return
+	}
+	var digest string
+	if d.store != nil {
+		digest = d.store.ActiveDigest()
+	}
+	d.deferredSnapshotApplyMu.Lock()
+	pending := d.deferredSnapshotApply
+	if pending == nil || !((pending.digest != "" && pending.digest == digest) || pending.cfg == cfg) {
+		d.deferredSnapshotApplyMu.Unlock()
+		return
+	}
+	d.deferredSnapshotApply = nil
+	if !pending.reported {
+		pending.reported = true
+		pending.completion <- err
+	}
+	d.deferredSnapshotApplyMu.Unlock()
+}
+
+func (d *Daemon) deferredSnapshotCompletionForConfig(cfg *config.Config) <-chan error {
+	d.deferredSnapshotApplyMu.Lock()
+	defer d.deferredSnapshotApplyMu.Unlock()
+	if pending := d.deferredSnapshotApply; pending != nil && pending.cfg == cfg {
+		return pending.completion
+	}
+	return nil
+}
+
+// rejectDeferredSnapshotApply runs from Manager's status-loop callback under
+// Manager.mu, so it only performs a bounded channel send and never waits.
+func (d *Daemon) rejectDeferredSnapshotApply(generation uint64, err error) {
+	d.deferredSnapshotApplyMu.Lock()
+	defer d.deferredSnapshotApplyMu.Unlock()
+	if pending := d.deferredSnapshotApply; pending != nil &&
+		generation >= pending.generation && !pending.reported {
+		pending.reported = true
+		pending.completion <- err
+	}
+}
+
+func (d *Daemon) completeDeferredSnapshotApply(generation uint64) {
+	var activeDigest string
+	if d.store != nil {
+		activeDigest = d.store.ActiveDigest()
+	}
+	d.deferredSnapshotApplyMu.Lock()
+	pending := d.deferredSnapshotApply
+	if pending == nil || generation < pending.generation {
+		d.deferredSnapshotApplyMu.Unlock()
+		return
+	}
+	d.deferredSnapshotApply = nil
+	d.deferredSnapshotApplyMu.Unlock()
+
+	// A newer generation proves only that SOME snapshot landed. Settle this
+	// record as applied only while its config is still the active target;
+	// a different promoted config supersedes it (HA NACK, peer re-push).
+	if pending.digest != "" && activeDigest != pending.digest {
+		if !pending.reported {
+			pending.completion <- errDeferredSnapshotSuperseded
+		}
+		return
+	}
+	// A retained scan-failure debt keeps the marker withheld, matching every
+	// other marker site's debt gate (#12072/#12323).
+	if d.store != nil && d.policyInvalidationDebt == nil {
+		d.store.MarkAppliedDigest(pending.digest)
+	}
+	if !pending.reported {
+		pending.completion <- nil
+	}
+}
+
 // capturedSessions is one change class's pre-publication candidate set: the
 // forward session entries that carried a target policy id when the capture ran.
 // targets is the number of policy ids the class was looking for, kept for the
@@ -869,7 +1037,7 @@ func (d *Daemon) policyInvalidationSnapshotPublished(generation uint64) {
 	if d.applySem.TryAcquire(1) {
 		owed := d.policyInvalidationDebt != nil
 		d.applySem.Release(1)
-		if !owed {
+		if !owed && d.deferredSnapshotCompletion(generation) == nil {
 			return
 		}
 	}
@@ -882,6 +1050,10 @@ func (d *Daemon) policyInvalidationSnapshotPublished(generation uint64) {
 	}()
 }
 
+func (d *Daemon) rejectDeferredSnapshotPublish(generation uint64, err error) {
+	d.rejectDeferredSnapshotApply(generation, err)
+}
+
 func (d *Daemon) dischargePolicyInvalidationAfterPublish(generation uint64) {
 	if d == nil || d.applySem == nil {
 		return
@@ -892,37 +1064,38 @@ func (d *Daemon) dischargePolicyInvalidationAfterPublish(generation uint64) {
 	defer d.applySem.Release(1)
 
 	debt := d.policyInvalidationDebt
-	if debt == nil {
-		return
-	}
-	if debt.publishGeneration == 0 {
-		// A status-loop catch-up may publish a snapshot whose original ACK
-		// was lost. Stamp that successful completion only when the manager
-		// now confirms this exact config under a known authority.
-		if generation == 0 || policyInvalidationAppliedConfig(d.dataplane()) != debt.newCfg {
+	if debt != nil {
+		if debt.publishGeneration == 0 {
+			// A status-loop catch-up may publish a snapshot whose original ACK
+			// was lost. Stamp that successful completion only when the manager
+			// now confirms this exact config under a known authority.
+			if generation == 0 || policyInvalidationAppliedConfig(d.dataplane()) != debt.newCfg {
+				return
+			}
+			debt.publishGeneration = generation
+		}
+		if generation < debt.publishGeneration {
 			return
 		}
-		debt.publishGeneration = generation
-	}
-	if generation < debt.publishGeneration {
-		return
-	}
-	if d.store != nil {
-		active := d.store.ActiveConfig()
-		if active != nil && active != debt.newCfg {
+		if d.store != nil {
+			active := d.store.ActiveConfig()
+			if active != nil && active != debt.newCfg {
+				return
+			}
+			if active == debt.newCfg && debt.appliedDigest == "" {
+				// The catch-up callback is a successful apply boundary even
+				// when the original caller lost its response.
+				debt.appliedDigest = d.store.ActiveDigest()
+			}
+		}
+		if err := d.dischargePolicyInvalidationDebtLocked(debt.oldCfg, debt.newCfg); err != nil {
+			slog.Error("deferred policy session invalidation was PARTIAL; some sessions may keep forwarding under stale authorization",
+				"err", err, "generation", generation)
+			d.rejectDeferredSnapshotApply(generation, err)
 			return
 		}
-		if active == debt.newCfg && debt.appliedDigest == "" {
-			// The catch-up callback is a successful apply boundary even
-			// when the original caller lost its response.
-			debt.appliedDigest = d.store.ActiveDigest()
-		}
 	}
-	if err := d.dischargePolicyInvalidationDebtLocked(debt.oldCfg, debt.newCfg); err != nil {
-		slog.Error("deferred policy session invalidation was PARTIAL; some sessions may keep forwarding under stale authorization",
-			"err", err, "generation", generation)
-		return
-	}
+	d.completeDeferredSnapshotApply(generation)
 }
 
 // dischargePolicyInvalidationDebtLocked consumes the captured debt only after

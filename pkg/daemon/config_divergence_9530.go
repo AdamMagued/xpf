@@ -67,8 +67,8 @@ func (d *Daemon) noteConfigSharedWithPeerAtEpoch(pushedText string, epoch uint64
 	return true
 }
 
-// reportConfigSyncDivergence raises the divergence as a cluster event once, after
-// a peer config sync applied. The store has already logged it at Error.
+// reportConfigSyncDivergence raises the divergence as a cluster event after a
+// peer config sync is accepted, including one pending deferred publication.
 func (d *Daemon) reportConfigSyncDivergence() {
 	if d.store == nil {
 		return

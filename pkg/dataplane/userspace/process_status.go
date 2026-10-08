@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -257,6 +258,9 @@ func (m *Manager) syncSnapshotLocked() error {
 	// snapshot (fail OPEN). publishPreparedSnapshotFailClosedLocked disables ctrl on a
 	// rejection so transit drops to the kernel-only fail-closed posture.
 	if err := m.publishPreparedSnapshotFailClosedLocked(&publishSnap, &status, true); err != nil {
+		if errors.Is(err, errHelperRejected) && m.policySnapshotPublishFailure != nil {
+			m.policySnapshotPublishFailure(m.lastSnapshot.Generation, err)
+		}
 		return err
 	}
 	m.lastSnapshot.Interfaces = publishSnap.Interfaces
