@@ -738,8 +738,9 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 					// silently fell back to the default) while still accepting
 					// an explicit 0.
 					// #3895: bound at the RFC 4861 §4.6.2 32-bit PIO lifetime
-					// field maximum (0xffffffff = infinity). A larger value
-					// silently truncates in the RA sender's ndp uint32(lifetime).
+					// field maximum (0xffffffff = infinity). Strict validation
+					// rejects larger values at commit; tolerant inputs saturate
+					// at the RA send sink (#12193), rather than truncating.
 					"valid-lifetime": {desc: "Prefix valid lifetime in seconds (0 = SLAAC default)", args: 1, placeholder: "<seconds>",
 						valueType: ValueInteger, valueDesc: "prefix valid lifetime in seconds (RFC 4861 §4.6.2 32-bit)",
 						valueExamples: []string{"0", "86400", "2592000"}, validator: ValidateInteger(0, raPrefixMaxLifetimeSeconds), children: nil},

@@ -457,7 +457,7 @@ never retried and the stale IPv6 default-router identity lingered on hosts
   which internally marshals every option, so a single option whose lifetime
   overflows its on-wire field aborts the ENTIRE advertisement — the segment
   then silently stops receiving RAs and hosts lose their default route / SLAAC
-  when the current RAs expire. Three guards, in depth:
+  when the current RAs expire. Four guards, in depth:
   - **Primary (commit-time gate, `pkg/config` `schema_routing.go`):** the
     router-advertisement lifetime leaves are bounded to their wire fields —
     `default-lifetime` ≤ 65535 (RFC 4861 §4.2 16-bit), `prefix
@@ -480,6 +480,18 @@ never retried and the stale IPv6 default-router identity lingered on hosts
     saturate to 65528 with one warning per sender instead of pruning the option.
     If the router lifetime is 0, inherited RDNSS/PREF64 fall back to 1800 seconds
     (with PREF64 still subject to its 65528-second cap).
+  - **PIO lifetimes saturate at the send sink (`buildRA`, `sender.go`,
+    #12193):** valid and preferred lifetimes saturate to `0xffffffff`
+    AFTER the `<=0` default substitution and BEFORE the
+    seconds-to-`time.Duration` conversion, so a tolerant-load value of
+    2^32 no longer wraps to 0 and larger values cannot overflow
+    `Duration`. `ndp` marshals a PIO without error even when wrapping,
+    so `pruneUnmarshalableOptions` never backstopped PIO — the doc gap
+    that led #12564 to implement prune. Saturate-not-prune because it
+    is monotone where wrapping is not, leaves in-range values
+    unchanged, matches the #8597/#9914/#12134 sink-clamp precedent, and
+    keeps SLAAC alive via RFC 4861 infinity instead of dropping the
+    operator prefix.
 - **`configEqual` must track EVERY field `buildRA` stamps onto the wire.**
   `Apply` gates the sender restart on `configEqual(existing.cfg, cfg)` — an
   interface whose config compares EQUAL keeps running untouched (no RA gap),
