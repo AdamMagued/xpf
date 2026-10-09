@@ -1200,7 +1200,7 @@ rejected. VPN-object validation, such as the separate missing-bind-interface
 gate (#10638), is independent.
 
 
-**Tolerant policy enforcement poison (#5575, #11013, #11014, #11023, #12234):** the #1960
+**Tolerant policy enforcement poison (#5575, #11013, #11014, #11023, #12234, #12244):** the #1960
 lenient downgrade keeps the daemon booting, but the compiler may silently drop
 authored enforcement or audit content. Missing required match dimensions
 (#3044) and unsupported `match` leaves / `then permit` modifiers (#3113/#3114)
@@ -1219,7 +1219,8 @@ existing match/permit gates, `policyUnsupportedThenSiblings` checks child and
 compact `then` tails, `policyUnsupportedThenLogTokens` checks log-leaf values
 and compact `then` tails; `policyUnknownEnforcementChildren` quarantines every
 unknown nested child and every unknown direct child except the description/apply
-cases.
+cases. `runEarlyStrictAndFolds` also sets the flag for undefined-scheduler
+DENY/REJECT policies (#12244), which would otherwise load inactive.
 The userspace snapshot builder (`buildOneRuleSnapshot`) poisons such a rule with
 the `__unsupported__` application sentinel, so the Rust integrity preflight
 rejects the WHOLE snapshot (previous-good retained; fresh-boot default-deny) —
