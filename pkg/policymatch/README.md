@@ -489,7 +489,8 @@ the helper. It covers every fail-closed policy-content axis:
   `buildSnapshot` itself errors (#3438), and the policy snapshot builder poisons
   the rule with the `__unsupported__` sentinel the helper integrity preflight
   rejects (#3261). The catalog path is ORDER-INSENSITIVE, so `[ any bad-set ]`
-  fails closed too (the per-rule scan short-circuits a leading `any`).
+  fails closed too (and since #12223 the per-rule scan also validates every
+  reference beside `any`, so both orders carry the same per-rule reason).
 - **Protocol-less application (#3323)** — a named app with no protocol
   (`proto == ""`) is unrepresentable (`expandUserspacePolicyApplications` returns
   `ok=false` → `__unsupported__`).
