@@ -449,10 +449,11 @@ func runUniformGatesClusterZone(tree *ConfigTree, cfg *Config, opts compileOpts)
 		}
 	}
 
-	// The schema may reject these children on the normal store path, but direct
-	// compiler callers and tolerant ingestion must not silently drop them.
+	// #12219: tolerant ingestion warns about retained unknown children at both
+	// zone and interface scope. Strict unknown-child validation is zone-level;
+	// per-interface packed-tail rejection remains owned by #6735.
 	if opts.lenientHostInboundTokens {
-		cfg.Warnings = append(cfg.Warnings, ToleratedUnknownHostInboundChildWarnings(cfg)...)
+		cfg.Warnings = append(cfg.Warnings, toleratedUnknownHostInboundChildWarnings(cfg)...)
 	} else if err := validateHostInboundUnknownChildrenStrict(cfg); err != nil {
 		return err
 	}

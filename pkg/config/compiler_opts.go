@@ -1841,17 +1841,15 @@ type compileOpts struct {
 	// operator-visible warning naming what was lost. Same doctrine as
 	// lenientZoneInterfacesNonEmpty.
 	lenientZoneInterfacePackedTail bool
-	// lenientHostInboundTokens (#3200) downgrades only the unknown-token gate
-	// (validateHostInboundTokensStrict) from a hard compile error to a warning.
-	// The strict path rejects a system-services / protocols token outside the
+	// lenientHostInboundTokens (#3200/#12219) selects tolerant handling for
+	// unknown tokens and retained zone-level children. For token values, the
+	// strict path rejects system-services / protocols entries outside the
 	// recognized SSOT (host_inbound_tokens.go), which could otherwise make the
 	// nftables kernel mirror and Rust AF_XDP classifier enforce inconsistently.
-	// Tolerant loads retain the historical behavior and warn about the unknown
-	// token; enforcement ignores it. The separate full-admit-except gate below
-	// has its own flag so neither diagnostic masks the other.
-	// The same option retains unknown host-inbound child warnings recorded by
-	// the compiler so tolerant ingestion does not silently discard keywords
-	// (#12219).
+	// Tolerant loads retain historical enforcement and warn about unknown
+	// tokens; retained unknown children are likewise reported instead of being
+	// silently discarded. The full-admit-except gate has a separate flag so
+	// neither diagnostic masks the other.
 	lenientHostInboundTokens bool
 	// lenientHostInboundFullAdmitExcept downgrades inert known `except`
 	// exclusions under `any-service` from a strict error to one warning per
