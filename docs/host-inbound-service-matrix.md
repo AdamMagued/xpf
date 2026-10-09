@@ -1715,6 +1715,17 @@ admit IPv4 protocol 2. If a token admits multiple tuples and any intersects an
 excluded tuple, that token is removed as a whole. The compiler preserves
 unknown modifiers for strict validation and emits the resulting positive-token
 representation consumed by both enforcement paths.
+
+**Cross-scope interface union keeps exclusions (#12317).** Physical-interface
+and unit-level overrides are both interface-level statements and union under
+#3720. Their exclusion provenance is retained through that union and reapplied
+to the combined service tuples: a physical `netconf-ssh` plus a unit
+`all; ssh except` admits TCP/830 via the independent `netconf` token, but not
+TCP/22 via the alias. Reversing the physical and unit scopes has the same
+result. This does not combine a zone stanza with an interface stanza: under
+#6515 the interface stanza replaces the zone stanza, so a zone-level exclusion
+does not filter a replacing interface override.
+
 `any-service` is not that service union: xpf cannot subtract a named service or
 protocol exclusion from its packet-wide full-admit. A strict commit therefore
 rejects known `system-services` or `protocols` `except` exclusions in the same
