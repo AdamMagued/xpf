@@ -1459,6 +1459,10 @@ func buildInterfaceNetworkdModels(cfg *config.Config, result *CompileResult, see
 					MACAddress:   mac,
 					OriginalName: originalName,
 					IsVLANParent: true,
+					Disable:      ifCfg.Disable,
+					Speed:        ifCfg.Speed,
+					Duplex:       ifCfg.Duplex,
+					MTU:          ifCfg.MTU,
 					Description:  ifCfg.Description,
 					VRFName:      mgmtVRFName,
 					// #9721: the advert source, plus KeepAddresses so a
@@ -1489,6 +1493,7 @@ func buildInterfaceNetworkdModels(cfg *config.Config, result *CompileResult, see
 							DHCPv4:           unit.DHCP,
 							DHCPv6:           unit.DHCPv6,
 							DADDisable:       unit.DADDisable,
+							MTU:              unit.MTU,
 							Description:      unit.Description,
 							KeepAddresses:    isVRRPReth,
 							VRFName:          mgmtVRFName,
@@ -1555,6 +1560,8 @@ func buildInterfaceNetworkdModels(cfg *config.Config, result *CompileResult, see
 					Duplex:           ifCfg.Duplex,
 					MTU:              mtu,
 					VRFName:          mgmtVRFName,
+					Description:      ifCfg.Description,
+					KeepAddresses:    isVRRPReth,
 				})
 			}
 		}

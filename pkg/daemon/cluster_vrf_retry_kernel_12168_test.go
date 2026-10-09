@@ -410,7 +410,7 @@ func TestReassertConvergenceRestartsCommsWithoutCommit12168(t *testing.T) {
 	if ctxErr, vrfErr := d.applyVRFReconcile(context.Background(), cfg); ctxErr != nil || vrfErr != nil {
 		t.Fatalf("device reconcile: %v %v", ctxErr, vrfErr)
 	}
-	if err := d.rebindManagementVRFIfaces(); !errors.Is(err, unix.EBUSY) {
+	if err := d.rebindManagementVRFIfaces(cfg); !errors.Is(err, unix.EBUSY) {
 		t.Fatalf("expected injected EBUSY, got %v", err)
 	}
 	if err := restartHeartbeatAfterRebind(d.cluster); err != nil {
@@ -445,7 +445,7 @@ func TestReassertConvergencePersistsWithoutCommit12168(t *testing.T) {
 	d.routing = routing.NewManagerWithLinkOpsForTest(ops)
 	d.applySem = semaphore.NewWeighted(1)
 	_, _ = d.applyVRFReconcile(context.Background(), cfg)
-	bindErr := d.rebindManagementVRFIfaces()
+	bindErr := d.rebindManagementVRFIfaces(cfg)
 	if !errors.Is(bindErr, unix.EBUSY) {
 		t.Fatalf("expected injected EBUSY, got %v", bindErr)
 	}
@@ -489,7 +489,7 @@ func TestConvergingCommitRestartsHeartbeatWithoutStaleRetries12168(t *testing.T)
 		t.Fatalf("device reconcile: %v %v", ctxErr, vrfErr)
 	}
 	var networkdErr error
-	if err := d.rebindManagementVRFIfaces(); err != nil {
+	if err := d.rebindManagementVRFIfaces(cfg); err != nil {
 		networkdErr = errors.Join(networkdErr, err)
 	}
 	started := time.Now()
@@ -617,7 +617,7 @@ func TestStripRetryStep27RestartsEveryCommsSocket12168(t *testing.T) {
 	d, cfg := prepareStripRetryFixture12168(t)
 	installMgmtVRFReassertFixture12168(t, d)
 	before := warmVRFCommsGeneration12168(d)
-	if err := d.rebindManagementVRFIfaces(); err != nil {
+	if err := d.rebindManagementVRFIfaces(cfg); err != nil {
 		t.Fatalf("step 2.7 rebind: %v", err)
 	}
 	if err := restartHeartbeatAfterRebind(d.cluster); err != nil {
