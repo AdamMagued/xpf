@@ -44,6 +44,7 @@ mod link_local_scope_11650;
 #[cfg(test)]
 mod connected_ifindex_12063;
 
+pub(crate) use fib::neighbor_family_mismatch;
 pub(in crate::afxdp) use interfaces::{
     connected_route_tables, is_host_inbound_lifeline, pick_interface_v4, pick_interface_v6,
 };
