@@ -237,10 +237,13 @@ func mgmtStaticRoutesDesired(
 					Table:    mgmtVRFTableID,
 					Type:     unix.RTN_UNICAST,
 					Protocol: unix.RTPROT_STATIC,
-					Realm:    mgmtStaticRouteRealm,
 					Priority: priority,
 				}
 				if len(hops) == 1 {
+					// Kernel 7.2.8 rejects RTA_FLOW on multipath routes, so
+					// only single-path routes carry the xpf ownership realm
+					// (#12539).
+					route.Realm = mgmtStaticRouteRealm
 					route.LinkIndex = hops[0].LinkIndex
 					route.Gw = hops[0].Gw
 				} else {
