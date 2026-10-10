@@ -293,6 +293,13 @@ func TestGoodbyeDebtDroppedWhenInterfaceIsAdvertisedAgain6777(t *testing.T) {
 	g := installGoodbyeProbe(t, false)
 
 	m := New()
+	// #12535: the re-advertising Apply below leaves a live sender whose owner
+	// goroutine reads listenFn/ensureLinkLocalFn asynchronously in openConn
+	// (sender.go). Join it here — registered after installGoodbyeProbe's
+	// cleanup, so LIFO ordering drains the sender BEFORE the seams are
+	// restored. Without this, teardown writes the seam vars while the owner
+	// is still reading them and `go test -race` fires.
+	t.Cleanup(func() { _ = m.Clear() })
 	if err := m.Apply([]*config.RAInterfaceConfig{testCfg("lo")}); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
