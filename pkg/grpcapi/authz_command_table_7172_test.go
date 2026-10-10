@@ -131,17 +131,47 @@ func TestEveryPricedMethodIsMappedOrNamedAbsent7172(t *testing.T) {
 // not to the shared canonicalizer.
 func everyWordIsAKeyword(words []string) bool {
 	current := cmdtree.OperationalTree
-	for _, w := range words {
+	for i, w := range words {
 		node, ok := current[w]
 		if !ok {
 			return false
 		}
 		if node.Children == nil {
-			// A leaf: any further word would be an argument, which this table
-			// must not contain.
-			return true
+			// A leaf: any further word would be an argument or a second
+			// option, which this table must not contain (#12527). The old
+			// code returned true here unconditionally, so `show security
+			// flow session summary zone` passed: `summary` is a leaf and
+			// `zone` was never examined, while Canonicalize re-enters the
+			// Options map and also accepts it.
+			return i == len(words)-1
 		}
 		current = node.Children
 	}
 	return true
+}
+
+// #12527: option-suffixed mutants must be rejected by the keyword arm.
+func TestEveryWordIsAKeywordRejectsOptionSuffix12527(t *testing.T) {
+	for _, tc := range []struct {
+		cmd  string
+		want bool
+	}{
+		{"show security flow session summary zone", false}, // the #12096-row mutant
+		{"show security flow session summary brief", false},
+		{"show security flow session zone trust", false},   // option value after leaf
+		{"show version configuration", false},              // trailing sibling after leaf (#8289 shape)
+		{"show security flow session summary", true},       // #12096 charge stays valid
+		{"show security flow session", true},               // bare Options node
+		{"show security flow session sort-by bytes", true}, // nested option path (sessions-top)
+		{"show version", true},
+	} {
+		if got := everyWordIsAKeyword(strings.Fields(tc.cmd)); got != tc.want {
+			t.Errorf("everyWordIsAKeyword(%q) = %v, want %v", tc.cmd, got, tc.want)
+		}
+	}
+	// Mechanism pin: Canonicalize legitimately accepts the mutant (Options
+	// re-entry, #9505), so the keyword arm is what must reject it.
+	if _, res := cmdtree.Canonicalize(cmdtree.OperationalTree, strings.Fields("show security flow session summary zone")); res != cmdtree.CanonicalOK {
+		t.Errorf("precondition: Canonicalize must accept the multi-option line (got %v)", res)
+	}
 }
