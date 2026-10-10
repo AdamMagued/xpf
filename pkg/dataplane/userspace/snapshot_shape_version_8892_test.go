@@ -478,6 +478,21 @@ const (
 	// helper receives are already quarantined in Go. Measured delta vs the
 	// 51ace11d0 base is exactly that one `json:"-"` line; Rust has no consumer.
 	// No helper-visible wire change; ProtocolVersion stays at 45.
+	// v45 STANDS (#12509): the b579834b -> 6daa3234 base drift folded into the
+	// v45 golden above is eight added reflection-walk lines from two landing
+	// commits, all `json:"-"` compiler metadata invisible to every helper:
+	// `AddressBook.CollidingNames` and `ApplicationsConfig.CollidingNames`
+	// (#12049, b729ad2fa) record tolerant name-collision evidence the policy
+	// compiler must refuse to resolve, and `BGPNeighbor.UnsupportedInetSAFI` /
+	// `UnsupportedInet6SAFI` (#11815, 7fea9a427) record unsupported-SAFI
+	// evidence that gates FRR activation. ConfigSnapshot embeds Config, so the
+	// walk sees each field (the SAFI pair under Config, RoutingInstances, and
+	// QuarantinedRoutingInstances alike); none is serialized, Rust models
+	// `config` as opaque serde_json::Value with no consumer for these names,
+	// and bumping for them would spend the one signal that says the wire
+	// really changed. Proved by dumping the sorted walk at the b579834b pin
+	// (3975d29d2) and the pre-#12288 base (056616954): the 6daa3234 digest
+	// reproduces exactly, and the diff is exactly these eight lines.
 	// v44 -> v45 BUMPED (#11812): single-rate PolicerSnapshot adds optional
 	// marking-action and logical-interface-policer JSON fields. The keys are
 	// omitted by default and the current Rust runtime ignores them; warnings
