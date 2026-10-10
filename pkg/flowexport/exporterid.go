@@ -1,6 +1,9 @@
 package flowexport
 
-import "hash/fnv"
+import (
+	"hash"
+	"hash/fnv"
+)
 
 // stableExporterID maps an exporter group's config identity
 // (protocol, sampling-instance name, referenced template name, address family)
@@ -47,16 +50,39 @@ import "hash/fnv"
 // IPFIX ODID for each inet6 group after upgrade. This separates the v9
 // sequence streams; collectors or dashboards keyed by the former inet6 id
 // may need their filters updated. Templates are re-announced automatically.
+//
+// Pipe escaping (#12542): instance/template names may literally contain `|`
+// (quoted config strings pass through; no charset gate), so
+// `protocol|instance|template` + literal `|v6` is byte-ambiguous — inet
+// template `t|v6` hashed identically to inet6 template `t` (both
+// 3185142171). Each field is backslash-escaped (`\` → `\\`, `|` → `\|`)
+// before joining, making literal `|` bytes pure separators and the family
+// suffix unforgeable by name content. Names without `|`/`\` hash exactly
+// as before (#12148 inet pins unchanged; only previously-ambiguous names
+// get new ids).
+// writeEscapedField writes s with backslash-escaping so the `|` join
+// separator and the `|v6` family suffix cannot collide with field content
+// (#12542). Config-time path (exporter constructors), so per-byte writes
+// are fine and allocation-free.
+func writeEscapedField(h hash.Hash64, s string) {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c == '\\' || c == '|' {
+			_, _ = h.Write([]byte{'\\', c})
+		} else {
+			_, _ = h.Write([]byte{c})
+		}
+	}
+}
 func stableExporterID(protocol, instance, template string, isV6 bool) uint32 {
 	if instance == "" && template == "" && !isV6 {
 		return 1
 	}
 	h := fnv.New64a()
-	_, _ = h.Write([]byte(protocol))
+	writeEscapedField(h, protocol)
 	_, _ = h.Write([]byte{'|'})
-	_, _ = h.Write([]byte(instance))
+	writeEscapedField(h, instance)
 	_, _ = h.Write([]byte{'|'})
-	_, _ = h.Write([]byte(template))
+	writeEscapedField(h, template)
 	if isV6 {
 		_, _ = h.Write([]byte("|v6"))
 	}

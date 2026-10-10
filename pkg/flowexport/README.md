@@ -601,9 +601,11 @@ for consistent per-group identity.
 
 Each exporter derives a **stable, nonzero 32-bit id** via
 `stableExporterID(protocol, instance, template, isV6)` (`exporterid.go`):
-FNV-1a 64 over `"protocol|instance|template"` for inet and
-`"protocol|instance|template|v6"` for inet6, xor-folded to 32 bits and mapped
-into `[1, 0xFFFFFFFF]`. It mirrors `config.StableTunnelEndpointID` (#1873).
+FNV-1a 64 over backslash-escaped `"protocol|instance|template"` for inet and
+`"...|v6"` for inet6 (#12542: each field escapes `\` → `\\`, `|` → `\|`
+so a literal `|` in a name cannot forge a field boundary or the family
+suffix), xor-folded to 32 bits and mapped into `[1, 0xFFFFFFFF]`. It mirrors
+`config.StableTunnelEndpointID` (#1873).
 `NewExporter` stamps it as the v9 SourceID; `NewIPFIXExporter` as the IPFIX
 Observation Domain ID.
 
