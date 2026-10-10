@@ -1760,6 +1760,17 @@ type Daemon struct {
 	// every subsystem.
 	bootstrapMode atomic.Bool
 
+	// bootstrapLifelineMu protects the pre-takeover snapshot from an explicit
+	// commit-confirm resolving the first-commit window outside applySem.
+	bootstrapLifelineMu sync.Mutex
+	// bootstrapLifelineCaptured distinguishes "never existed" from a lost
+	// snapshot; bootstrapLifelinePresent distinguishes an absent pre-takeover
+	// file from an empty file. The first-commit rollback alone may restore it.
+	// Live-path only: the durable crash record is #12155's.
+	bootstrapLifelineCaptured bool
+	bootstrapLifelinePresent  bool
+	bootstrapLifelineNetwork  []byte
+
 	// emptyHANamingPending is the #4179 one-shot flag for the HA-guard
 	// EMPTY-config takeover. A node with /etc/xpf/node-id but no committed
 	// config resolves NOT-bootstrap (computeBootClass HA-node guard) and names
