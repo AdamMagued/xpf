@@ -303,7 +303,8 @@ func (m *Manager) syncUserspaceClassifierMapsLocked(snapshot *ConfigSnapshot) er
 	// #9646: preflight the local-address set against the shim maps' capacity
 	// BEFORE any classifier map is written, so a refusal leaves every map on
 	// the plan the helper is enforcing. See local_address_capacity_9646.go.
-	desiredV4, desiredV6, enumComplete := m.buildDesiredLocalAddressSets(snapshot)
+	excludedV4, excludedV6 := buildNATTranslatedLocalAddressExclusions(snapshot)
+	desiredV4, desiredV6, enumComplete := m.buildDesiredLocalAddressSetsWithExclusions(snapshot, excludedV4, excludedV6)
 	if err := checkLocalAddressCapacity(len(desiredV4), len(desiredV6)); err != nil {
 		return err
 	}
@@ -316,7 +317,7 @@ func (m *Manager) syncUserspaceClassifierMapsLocked(snapshot *ConfigSnapshot) er
 	if err := m.syncUserspaceWGZoneMapsLocked(snapshot); err != nil {
 		return err
 	}
-	return m.syncInterfaceNATAddressMapsLocked(snapshot)
+	return m.syncInterfaceNATAddressMapsWithExclusionsLocked(snapshot, excludedV4, excludedV6)
 }
 
 type userspaceCtrlLookupHook func(ctrlMapUpdater, uint32, *userspaceCtrlValue) error
@@ -1093,9 +1094,14 @@ func (m *Manager) addrListForLocalSync(link netlink.Link, family int) ([]netlink
 // existing map keys against them (#3924). Config-derived entries are
 // always present regardless of enumeration outcome.
 func (m *Manager) buildDesiredLocalAddressSets(snapshot *ConfigSnapshot) (desiredV4 map[uint32]struct{}, desiredV6 map[userspaceLocalV6Key]struct{}, enumComplete bool) {
+	excludedV4, excludedV6 := buildNATTranslatedLocalAddressExclusions(snapshot)
+	return m.buildDesiredLocalAddressSetsWithExclusions(snapshot, excludedV4, excludedV6)
+}
+
+func (m *Manager) buildDesiredLocalAddressSetsWithExclusions(snapshot *ConfigSnapshot, excludedV4 map[uint32]bool, excludedV6 map[[16]byte]bool) (desiredV4 map[uint32]struct{}, desiredV6 map[userspaceLocalV6Key]struct{}, enumComplete bool) {
 	desiredV4 = make(map[uint32]struct{})
 	desiredV6 = make(map[userspaceLocalV6Key]struct{})
-	for _, entry := range buildLocalAddressEntries(snapshot) {
+	for _, entry := range buildLocalAddressEntriesWithExclusions(snapshot, excludedV4, excludedV6) {
 		if entry.v4 {
 			desiredV4[entry.v4Key] = struct{}{}
 			continue
@@ -1137,6 +1143,11 @@ func (m *Manager) buildDesiredLocalAddressSets(snapshot *ConfigSnapshot) (desire
 }
 
 func (m *Manager) syncInterfaceNATAddressMapsLocked(snapshot *ConfigSnapshot) error {
+	excludedV4, excludedV6 := buildNATTranslatedLocalAddressExclusions(snapshot)
+	return m.syncInterfaceNATAddressMapsWithExclusionsLocked(snapshot, excludedV4, excludedV6)
+}
+
+func (m *Manager) syncInterfaceNATAddressMapsWithExclusionsLocked(snapshot *ConfigSnapshot, excludedV4 map[uint32]bool, excludedV6 map[[16]byte]bool) error {
 	natV4Map := m.bpfShim.Map(mapNameUserspaceInterfaceNATv4)
 	if natV4Map == nil {
 		return errors.New("userspace_interface_nat_v4 map not loaded")
@@ -1146,7 +1157,7 @@ func (m *Manager) syncInterfaceNATAddressMapsLocked(snapshot *ConfigSnapshot) er
 		return errors.New("userspace_interface_nat_v6 map not loaded")
 	}
 
-	desiredV4, desiredV6, rstV4, rstV6 := buildDesiredInterfaceNATAddressSets(snapshot)
+	desiredV4, desiredV6, rstV4, rstV6 := buildDesiredInterfaceNATAddressSetsWithExclusions(snapshot, excludedV4, excludedV6)
 	for key := range desiredV4 {
 		if err := natV4Map.Update(key, uint8(1), ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("update userspace_interface_nat_v4 %08x: %w", key, err)
@@ -1229,7 +1240,12 @@ func (m *Manager) syncInterfaceNATAddressMapsLocked(snapshot *ConfigSnapshot) er
 }
 
 func buildDesiredInterfaceNATAddressSets(snapshot *ConfigSnapshot) (map[uint32]struct{}, map[userspaceLocalV6Key]struct{}, []netip.Addr, []netip.Addr) {
-	entries := buildInterfaceNATAddressEntries(snapshot)
+	excludedV4, excludedV6 := buildNATTranslatedLocalAddressExclusions(snapshot)
+	return buildDesiredInterfaceNATAddressSetsWithExclusions(snapshot, excludedV4, excludedV6)
+}
+
+func buildDesiredInterfaceNATAddressSetsWithExclusions(snapshot *ConfigSnapshot, excludedV4 map[uint32]bool, excludedV6 map[[16]byte]bool) (map[uint32]struct{}, map[userspaceLocalV6Key]struct{}, []netip.Addr, []netip.Addr) {
+	entries := buildInterfaceNATAddressEntriesWithExclusions(snapshot, excludedV4, excludedV6)
 	v4Count := 0
 	for _, entry := range entries {
 		if entry.v4 {
@@ -1381,6 +1397,13 @@ func buildLocalAddressEntries(snapshot *ConfigSnapshot) []userspaceLocalAddressE
 		return nil
 	}
 	excludedV4, excludedV6 := buildNATTranslatedLocalAddressExclusions(snapshot)
+	return buildLocalAddressEntriesWithExclusions(snapshot, excludedV4, excludedV6)
+}
+
+func buildLocalAddressEntriesWithExclusions(snapshot *ConfigSnapshot, excludedV4 map[uint32]bool, excludedV6 map[[16]byte]bool) []userspaceLocalAddressEntry {
+	if snapshot == nil {
+		return nil
+	}
 	seenV4 := make(map[uint32]bool)
 	seenV6 := make(map[[16]byte]bool)
 	out := make([]userspaceLocalAddressEntry, 0)
@@ -1423,6 +1446,13 @@ func buildInterfaceNATAddressEntries(snapshot *ConfigSnapshot) []userspaceLocalA
 		return nil
 	}
 	excludedV4, excludedV6 := buildNATTranslatedLocalAddressExclusions(snapshot)
+	return buildInterfaceNATAddressEntriesWithExclusions(snapshot, excludedV4, excludedV6)
+}
+
+func buildInterfaceNATAddressEntriesWithExclusions(snapshot *ConfigSnapshot, excludedV4 map[uint32]bool, excludedV6 map[[16]byte]bool) []userspaceLocalAddressEntry {
+	if snapshot == nil {
+		return nil
+	}
 	seenV4 := make(map[uint32]bool)
 	seenV6 := make(map[[16]byte]bool)
 	out := make([]userspaceLocalAddressEntry, 0)
@@ -1856,33 +1886,104 @@ func encodeSteeredPortSet(selected []uint16) (uint32, [config.MaxSteeredWireGuar
 	return uint32(n), ports
 }
 
+// buildNATTranslatedLocalAddressExclusions collects addresses of eligible
+// egress interfaces selected by live interface-mode source-NAT rules. The
+// interface-NAT map takes precedence in is_local_destination; kernel addresses
+// may still appear in userspace_local_v4/v6 after netlink enumeration.
+//
+// Primary addresses are picked once per interface. Each interface is indexed
+// under its eight exact/wildcard to-scope tuples; each distinct rule scope then
+// resolves directly to its candidates, avoiding per-rule interface copies and
+// repeated address parsing.
 func buildNATTranslatedLocalAddressExclusions(snapshot *ConfigSnapshot) (map[uint32]bool, map[[16]byte]bool) {
 	excludedV4 := make(map[uint32]bool)
 	excludedV6 := make(map[[16]byte]bool)
 	if snapshot == nil || len(snapshot.SourceNAT) == 0 || len(snapshot.Interfaces) == 0 {
 		return excludedV4, excludedV6
 	}
-	toZones := make(map[string]bool)
-	for _, nat := range snapshot.SourceNAT {
-		if !nat.InterfaceMode || nat.Off || nat.ToZone == "" {
+
+	type registrationScope struct {
+		toInterface       string
+		toRoutingInstance string
+		toZone            string
+	}
+	type candidate struct {
+		v4    uint32
+		hasV4 bool
+		v6    [16]byte
+		hasV6 bool
+	}
+
+	candidates := make([]candidate, 0, len(snapshot.Interfaces))
+	byScope := make(map[registrationScope][]int, len(snapshot.Interfaces))
+	for i := range snapshot.Interfaces {
+		iface := &snapshot.Interfaces[i]
+		if !interfaceSnapshotCanBeSNATEgress(iface) {
 			continue
 		}
-		toZones[nat.ToZone] = true
-	}
-	if len(toZones) == 0 {
-		return excludedV4, excludedV6
-	}
-	for _, iface := range snapshot.Interfaces {
-		if iface.Zone == "" || !toZones[iface.Zone] {
+		var item candidate
+		if ip := pickInterfaceSnapshotV4(*iface); ip != nil {
+			item.v4 = binary.BigEndian.Uint32(ip.To4())
+			item.hasV4 = true
+		}
+		if ip := pickInterfaceSnapshotV6(*iface); ip != nil {
+			copy(item.v6[:], ip.To16())
+			item.hasV6 = true
+		}
+		if !item.hasV4 && !item.hasV6 {
 			continue
 		}
-		if ip := pickInterfaceSnapshotV4(iface); ip != nil {
-			excludedV4[binary.BigEndian.Uint32(ip.To4())] = true
+
+		index := len(candidates)
+		candidates = append(candidates, item)
+		for mask := range 8 {
+			scope := registrationScope{
+				toInterface:       iface.Name,
+				toRoutingInstance: iface.RoutingInstance,
+				toZone:            iface.EgressZone,
+			}
+			if mask&1 == 0 {
+				scope.toInterface = ""
+			} else if scope.toInterface == "" {
+				continue
+			}
+			if mask&2 == 0 {
+				scope.toRoutingInstance = ""
+			} else if scope.toRoutingInstance == "" {
+				continue
+			}
+			if mask&4 == 0 {
+				scope.toZone = ""
+			} else if scope.toZone == "" {
+				continue
+			}
+			byScope[scope] = append(byScope[scope], index)
 		}
-		if ip := pickInterfaceSnapshotV6(iface); ip != nil {
-			var key [16]byte
-			copy(key[:], ip.To16())
-			excludedV6[key] = true
+	}
+
+	seenScopes := make(map[registrationScope]struct{}, len(snapshot.SourceNAT))
+	for i := range snapshot.SourceNAT {
+		nat := &snapshot.SourceNAT[i]
+		if !nat.InterfaceMode || nat.Off {
+			continue
+		}
+		scope := registrationScope{
+			toInterface:       nat.ToInterface,
+			toRoutingInstance: nat.ToRoutingInstance,
+			toZone:            nat.ToZone,
+		}
+		if _, seen := seenScopes[scope]; seen {
+			continue
+		}
+		seenScopes[scope] = struct{}{}
+		for _, index := range byScope[scope] {
+			item := candidates[index]
+			if item.hasV4 {
+				excludedV4[item.v4] = true
+			}
+			if item.hasV6 {
+				excludedV6[item.v6] = true
+			}
 		}
 	}
 	return excludedV4, excludedV6

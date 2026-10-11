@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strings"
 	"sync/atomic"
+
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // #7717 — DETECTION ONLY.
@@ -122,7 +124,9 @@ func interfaceSNATEgressCandidatesFromSnapshot(snap *ConfigSnapshot) map[string]
 }
 
 // interfaceInSnapshotEgressScope applies the derivation matrix for ONE snapshot
-// interface against ONE interface-mode rule's to-side scope.
+// interface against ONE interface-mode rule's to-side scope. It is an
+// over-approximating detector for #7717 only; forwarding registration uses
+// interfaceSnapshotCanBeSNATEgress and exact logical-name matching.
 func interfaceInSnapshotEgressScope(rule SourceNATRuleSnapshot, ifc InterfaceSnapshot) bool {
 	if rule.ToInterface != "" && !snapshotInterfaceNameMatches(rule.ToInterface, ifc.Name) {
 		return false
@@ -136,9 +140,21 @@ func interfaceInSnapshotEgressScope(rule SourceNATRuleSnapshot, ifc InterfaceSna
 	return true
 }
 
-// snapshotInterfaceNameMatches accepts either the logical unit name ("ge-0/0/0.0")
-// or the bare physical name ("ge-0/0/0"), matching the config-time gate, which
-// compares a rule-set's ToInterface against BOTH forms.
+// interfaceSnapshotCanBeSNATEgress reports whether a snapshot row can be a
+// runtime interface-mode SNAT egress. The helper builds its forwarding maps
+// only for rows with ifindex>0. Management/HA/fabric/loopback lifelines are
+// excluded, but tunnel rows are retained because they can carry egress.
+// Unzoned rows stay local so the #5659 empty-zone sentinel remains armed.
+func interfaceSnapshotCanBeSNATEgress(ifc *InterfaceSnapshot) bool {
+	if ifc.Ifindex <= 0 || ifc.AdminDisabled || ifc.Zone == "" {
+		return false
+	}
+	base := config.LifelineBaseName(ifc.Name)
+	return !config.IsManagementIfName(base) && base != "lo0"
+}
+
+// snapshotInterfaceNameMatches intentionally accepts a bare unit base only
+// for the over-approximating #7717 detection matcher, never registration.
 func snapshotInterfaceNameMatches(want, have string) bool {
 	if want == have {
 		return true

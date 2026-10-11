@@ -119,16 +119,20 @@ func TestBuildLocalAddressEntriesIncludesInterfaceSNATAddressesForFallback(t *te
 	snapshot := &ConfigSnapshot{
 		Interfaces: []InterfaceSnapshot{
 			{
-				Name: "reth0.80",
-				Zone: "wan",
+				Name:       "reth0.80",
+				Zone:       "wan",
+				EgressZone: "wan",
+				Ifindex:    80,
 				Addresses: []InterfaceAddressSnapshot{
 					{Family: "inet", Address: "172.16.80.8/24"},
 					{Family: "inet6", Address: "2001:559:8585:80::8/64"},
 				},
 			},
 			{
-				Name: "reth1.0",
-				Zone: "lan",
+				Name:       "reth1.0",
+				Zone:       "lan",
+				EgressZone: "lan",
+				Ifindex:    81,
 				Addresses: []InterfaceAddressSnapshot{
 					{Family: "inet", Address: "10.0.61.1/24"},
 					{Family: "inet6", Address: "2001:559:8585:ef00::1/64"},
