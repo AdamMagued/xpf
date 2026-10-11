@@ -441,6 +441,60 @@ interfaces {
 	}
 }
 
+func TestInterfaceSamplingRepeatedSiblings12512(t *testing.T) {
+	tests := []struct {
+		name, family, address, first, second string
+	}{
+		{name: "inet input/output", family: "inet", address: "10.0.0.1/24", first: "input", second: "output"},
+		{name: "inet output/input", family: "inet", address: "10.0.0.1/24", first: "output", second: "input"},
+		{name: "inet6 input/output", family: "inet6", address: "2001:db8::1/64", first: "input", second: "output"},
+		{name: "inet6 output/input", family: "inet6", address: "2001:db8::1/64", first: "output", second: "input"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := `interfaces {
+    ge-0/0/0 {
+        unit 0 {
+            family FAM {
+                address ADDR;
+                sampling { FIRST; }
+                sampling { SECOND; }
+            }
+        }
+    }
+}
+`
+			input = strings.ReplaceAll(input, "FAM", tt.family)
+			input = strings.ReplaceAll(input, "ADDR", tt.address)
+			input = strings.ReplaceAll(input, "FIRST", tt.first)
+			input = strings.ReplaceAll(input, "SECOND", tt.second)
+			p := NewParser(input)
+			tree, errs := p.Parse()
+			if len(errs) > 0 {
+				t.Fatalf("parse errors: %v", errs)
+			}
+			cfg, err := CompileConfig(tree)
+			if err != nil {
+				t.Fatalf("CompileConfig: %v", err)
+			}
+			ifc := cfg.Interfaces.Interfaces["ge-0/0/0"]
+			if ifc == nil {
+				t.Fatal("ge-0/0/0 not found")
+			}
+			unit := ifc.Units[0]
+			if unit == nil {
+				t.Fatal("unit 0 not found")
+			}
+			if !unit.SamplingInput {
+				t.Errorf("%s: SamplingInput = false, want true", tt.name)
+			}
+			if !unit.SamplingOutput {
+				t.Errorf("%s: SamplingOutput = false, want true", tt.name)
+			}
+		})
+	}
+}
+
 func TestFlowFlagsAndPowerMode(t *testing.T) {
 	input := `security {
     flow {
