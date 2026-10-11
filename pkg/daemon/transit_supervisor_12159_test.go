@@ -76,6 +76,22 @@ func rgWeight12159(m *cluster.Manager, rgID int) int {
 	return -1
 }
 
+// pollRGWeight12159 polls an RG weight until it reaches want or the deadline
+// expires (F1: the gate loop applies knob writes and election debt in
+// separate passes, so a single immediate read races the debt application).
+func pollRGWeight12159(t *testing.T, m *cluster.Manager, rgID, want int, what string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if got := rgWeight12159(m, rgID); got == want {
+			return
+		} else if time.Now().After(deadline) {
+			t.Fatalf("%s = %d, want %d (deadline expired)", what, got, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // TestHelperCrashGateAndElectionDebt12159 is the bounded regression matrix
 // for the supervisor-death path. It exercises the daemon's wake observer,
 // reassertTransitGate, election debt, and actual cluster weight transition
@@ -143,12 +159,13 @@ func TestHelperCrashGateAndElectionDebt12159(t *testing.T) {
 
 			// Persistent crash loop: the restart backoff reached its cap.
 			// The full debt is necessary to demote a non-preempt incumbent.
+			// F1: the sysctl knobs flip before the election debt applies
+			// (knob write and SetMonitorWeight are separate passes), so
+			// poll the WEIGHT with a deadline instead of asserting once.
 			cm.SetRGReady(1, false, []string{"userspace helper crash loop"})
 			rt.setSupervisorState(false, true)
 			waitTransitKnobs9725(t, v4, v6, "0")
-			if got := rgWeight12159(cm, 1); got != 0 {
-				t.Fatalf("crash-loop RG weight = %d, want 0 to resign incumbent", got)
-			}
+			pollRGWeight12159(t, cm, 1, 0, "crash-loop RG weight")
 			if got := cm.GroupState(1).State; got != cluster.StateSecondary {
 				t.Fatalf("crash-loop incumbent state = %v, want secondary", got)
 			}

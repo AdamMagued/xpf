@@ -288,7 +288,22 @@ func (d *Daemon) markDataplaneArmed(stage string) {
 // Kernel/XDP-not-ready debt remains sub-total (weight 1) so standalone nodes
 // stay eligible; a helper crash loop uses full debt to resign even a
 // non-preempt incumbent. Both transitions share one RG snapshot per gate pass.
+// MAJOR-2: RG0 (config authority, no data VIP) is EXCLUDED from crash-loop
+// resignation. Full debt on every GroupState incl. RG0 → weight 0 →
+// secondary everywhere → ConfirmPendingOnDemotion + SetClusterReadOnly →
+// EnterConfigure read-only + pending commit-confirmed auto-confirm; on a
+// lone node that locks config with no owner anywhere (dual-crash-loop:
+// neither node owns anything). RG0 stays primary/writable so the operator
+// can always repair the loop in-band; data RGs still resign.
 func (d *Daemon) applyTransitElectionDebt(dataplaneReady, crashLooping bool) {
+	d.applyTransitElectionDebtKeepArm(dataplaneReady, crashLooping, false)
+}
+
+// applyTransitElectionDebtKeepArm is applyTransitElectionDebt with the arm-debt
+// bit preserved when keepArm is set (F2: a non-looping dead helper must leave
+// unrelated arm debt exactly as it is — neither install nor wipe). The
+// crash-loop bit always follows its input.
+func (d *Daemon) applyTransitElectionDebtKeepArm(dataplaneReady, crashLooping, keepArm bool) {
 	if d.cluster == nil {
 		return
 	}
@@ -302,14 +317,17 @@ func (d *Daemon) applyTransitElectionDebt(dataplaneReady, crashLooping bool) {
 				hasCrashLoopDebt = true
 			}
 		}
-		wantArmDebt := !dataplaneReady
-		if hasArmDebt != wantArmDebt {
-			d.cluster.SetMonitorWeight(rg.GroupID, cluster.DataplaneArmMonitorIface,
-				wantArmDebt, cluster.DataplaneArmMonitorCost)
+		if !keepArm {
+			wantArmDebt := !dataplaneReady
+			if hasArmDebt != wantArmDebt {
+				d.cluster.SetMonitorWeight(rg.GroupID, cluster.DataplaneArmMonitorIface,
+					wantArmDebt, cluster.DataplaneArmMonitorCost)
+			}
 		}
-		if hasCrashLoopDebt != crashLooping {
+		wantCrashLoopDebt := crashLooping && rg.GroupID != 0
+		if hasCrashLoopDebt != wantCrashLoopDebt {
 			d.cluster.SetMonitorWeight(rg.GroupID, cluster.HelperCrashLoopMonitorIface,
-				crashLooping, cluster.HelperCrashLoopMonitorCost)
+				wantCrashLoopDebt, cluster.HelperCrashLoopMonitorCost)
 		}
 	}
 }

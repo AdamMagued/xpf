@@ -191,3 +191,35 @@ func TestArmTrackIsSafeWithoutACluster7178(t *testing.T) {
 	d.markDataplaneArmFailed("test", "test", errors.New("boom"))
 	d.markDataplaneArmed("test")
 }
+
+// MAJOR-2 (#12159): a crash loop must resign data RGs but NEVER RG0 (config
+// authority). Full debt on RG0 → weight 0 → secondary everywhere → cluster
+// read-only + pending commit-confirmed auto-confirm; on a lone node that
+// locks config with no owner anywhere. RG0 stays primary/writable so the
+// operator can repair the loop in-band.
+func TestCrashLoopDebtExcludesRG012159(t *testing.T) {
+	m := cluster.NewManager(0, 1)
+	m.UpdateConfig(&config.ClusterConfig{
+		ControlInterface: "em0",
+		RedundancyGroups: []*config.RedundancyGroup{
+			{ID: 0, NodePriorities: map[int]int{0: 200}},
+			{ID: 1, NodePriorities: map[int]int{0: 200}},
+		},
+	})
+	d, _ := armTrackDaemon(t, m, 1)
+	d.applyTransitElectionDebt(true, true)
+	if w := rgWeight(t, m, 1); w != 0 {
+		t.Fatalf("data RG weight = %d with crash-loop debt, want 0 (resigned)", w)
+	}
+	if w := rgWeight(t, m, 0); w == 0 {
+		t.Fatalf("RG0 weight = 0 with crash-loop debt; RG0 must stay primary/writable")
+	}
+	// Clearing the loop clears data-RG debt; RG0 never carried any.
+	d.applyTransitElectionDebt(true, false)
+	if w := rgWeight(t, m, 1); w != 255 {
+		t.Fatalf("data RG weight = %d after recovery, want 255", w)
+	}
+	if w := rgWeight(t, m, 0); w != 255 {
+		t.Fatalf("RG0 weight = %d after recovery, want 255", w)
+	}
+}

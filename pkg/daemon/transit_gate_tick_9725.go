@@ -77,14 +77,6 @@ func (d *Daemon) transitKernelReady() bool {
 	return d != nil && d.dataplaneArmed.Load() && d.attachedXDPLinks() > 0
 }
 
-func (d *Daemon) transitOpen() bool {
-	if d == nil {
-		return false
-	}
-	helperRunning, _ := d.helperSupervisorState()
-	return d.transitKernelReady() && helperRunning
-}
-
 // writeTransitGateLocked drives both transit legs from the ready predicate
 // computed by the caller. The caller holds transitGateMu and derives open from
 // dataplaneArmed && AttachedXDPLinkCount > 0, additionally requiring a live
@@ -135,10 +127,20 @@ func (d *Daemon) reassertTransitGate(stage string) {
 	kernelReady := d.transitKernelReady()
 	helperRunning, crashLooping := d.helperSupervisorState()
 	opened := d.writeTransitGateLocked(stage, kernelReady && helperRunning)
-	// A short helper restart closes transit without installing the generic
-	// dataplane-arm debt. Persistent loops carry their own full election debt
-	// below; kernel/XDP readiness keeps its existing independent monitor.
-	d.applyTransitElectionDebt(kernelReady && (!helperRunning || opened), crashLooping)
+	// F2: a dead helper must neither INSTALL arm debt (a short restart is
+	// not a kernel failure — weight stays 255) nor WIPE unrelated arm debt
+	// (a fence/kernel failure predating the death must survive it: the old
+	// `(!helperRunning || opened)` disjunct reported dataplaneReady=true
+	// whenever the helper was down, flipping a fenced 1 → 255, fail-open).
+	// So when the helper is down and NOT looping, leave the arm-debt bit
+	// exactly as it is (pass through the current state); otherwise follow
+	// kernel readiness. Persistent loops carry their own full election debt
+	// via crashLooping regardless.
+	if !helperRunning && !crashLooping {
+		d.applyTransitElectionDebtKeepArm(false, false, true)
+	} else {
+		d.applyTransitElectionDebt(kernelReady && (!helperRunning || opened), crashLooping)
+	}
 }
 
 // closeTransitUntilAttached establishes the boot fence without changing the

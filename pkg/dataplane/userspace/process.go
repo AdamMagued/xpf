@@ -329,7 +329,33 @@ func (m *Manager) bootstrapNAPIQueuesAsyncForGenerationLocked(
 	return done
 }
 
-func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
+func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) (retErr error) {
+	pendingCrashRetry := m.helperCrash.LastExitWasCrash && m.proc == nil &&
+		m.procGen == m.helperCrash.restartGen
+	restartAttempt := m.restartAttemptInProgress
+	entryGen := m.procGen
+	defer func() {
+		if retErr != nil {
+			if pendingCrashRetry && m.proc == nil &&
+				(restartAttempt || m.procGen != m.helperCrash.restartGen) {
+				m.rearmHelperRestartLocked()
+			}
+			return
+		}
+		// A supervisor retry that lands proves a helper READY, not STABLE —
+		// the retry path does its own episode accounting below, and a
+		// ping-ready answer from a helper that crashes 300ms later must
+		// not wipe the streak it is part of (MAJOR-1). An ordinary Compile
+		// bring-up that ADVANCES the generation (operator commit, peer
+		// sync — a genuinely new helper proven ready) DOES end the prior
+		// episode (MAJOR-3b).
+		if restartAttempt {
+			return
+		}
+		if m.procGen != entryGen {
+			m.completeHelperCrashRecoveryLocked(time.Now())
+		}
+	}()
 	// First bring-up skips the restart preflight below, so refuse a
 	// reserved state-file here too, before the runtime-dir MkdirAll and
 	// the spawn: the helper must never start with a path whose save

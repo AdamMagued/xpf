@@ -215,6 +215,15 @@ var (
 	helperRestartBackoffMax  = 60 * time.Second
 )
 
+// helperCrashLoopAttempt is the first restart count whose backoff reaches the cap.
+func helperCrashLoopAttempt() int {
+	for attempt := 1; ; attempt++ {
+		if helperRestartDelay(attempt) >= helperRestartBackoffMax {
+			return attempt
+		}
+	}
+}
+
 // helperRestartDelay is the backoff for attempt n (1-based).
 func helperRestartDelay(attempt int) time.Duration {
 	if attempt < 1 {
@@ -297,6 +306,12 @@ func (m *Manager) superviseHelper(g *helperGeneration) {
 // dead XSK; every later step is about not lying to an operator or to the
 // cluster peer.
 func (m *Manager) handleUnexpectedHelperExitLocked(g *helperGeneration) {
+	now := time.Now()
+	if m.helperCrashLastAt.IsZero() || now.Sub(m.helperCrashLastAt) > 2*helperRestartBackoffMax {
+		m.helperCrashStreak = 0
+	}
+	m.helperCrashStreak++
+	m.helperCrashLastAt = now
 	detail := g.describeExit()
 	pid := 0
 	if g.cmd.Process != nil {
@@ -339,7 +354,7 @@ func (m *Manager) handleUnexpectedHelperExitLocked(g *helperGeneration) {
 		ExitCode:         exitCode,
 		Signal:           signal,
 		PID:              pid,
-		At:               time.Now(),
+		At:               now,
 		Restarts:         m.helperCrash.Restarts,
 		// #7250: the generation this retry is fenced on, so
 		// HelperCrashState() can tell an armed restart from an orphaned one.
@@ -364,6 +379,35 @@ func (m *Manager) scheduleHelperRestartLocked(gen uint64) {
 	m.scheduleRestartTimer(delay, func() { m.restartHelperAfterCrash(gen) })
 }
 
+// rearmHelperRestartLocked preserves an already-counted crash attempt while
+// fencing its replacement timer on the current process generation. It is used
+// when Compile bring-up retires the generation carrying an armed retry.
+func (m *Manager) rearmHelperRestartLocked() {
+	if !m.helperCrash.LastExitWasCrash || m.proc != nil {
+		return
+	}
+	gen := m.procGen
+	m.helperCrash.restartGen = gen
+	delay := helperRestartDelay(m.helperCrash.Restarts)
+	m.helperCrash.NextRestart = time.Now().Add(delay)
+	slog.Warn("userspace dataplane helper crash retry re-armed after bring-up failure",
+		"attempt", m.helperCrash.Restarts, "delay", delay, "generation", gen)
+	m.scheduleRestartTimer(delay, func() { m.restartHelperAfterCrash(gen) })
+	m.notifyHelperSupervisorLocked()
+}
+
+// completeHelperCrashRecoveryLocked ends the current episode after ordinary
+// Compile bring-up proves a helper ready. Supervisor retries preserve the
+// crash window and perform their own episode accounting instead.
+func (m *Manager) completeHelperCrashRecoveryLocked(at time.Time) {
+	if m.helperCrash.LastExitWasCrash {
+		m.recordRecoveredCrashEpisodeLocked(at)
+		m.helperCrash = HelperCrashRecord{}
+	}
+	m.helperCrashStreak = 0
+	m.helperCrashLastAt = time.Time{}
+}
+
 // restartHelperAfterCrash re-runs the ORDINARY bring-up for the current desired
 // config.
 //
@@ -381,26 +425,28 @@ func (m *Manager) restartHelperAfterCrash(gen uint64) {
 	if m.procGen != gen || m.proc != nil || !m.helperCrash.LastExitWasCrash {
 		return
 	}
-	// #7967: record the ATTEMPT, before its outcome is known. On failure the
-	// record survives and carries it; on success the whole record is cleared,
-	// which is the episode-scoped contract every field here shares.
+	// #7967: record the ATTEMPT, before its outcome is known.
 	m.helperCrash.LastRestartAttempt = time.Now()
-	if err := m.ensureProcessLocked(m.cfg); err != nil {
+	attempts := m.helperCrash.Restarts
+	m.restartAttemptInProgress = true
+	err := m.ensureProcessLocked(m.cfg)
+	m.restartAttemptInProgress = false
+	if err != nil {
 		slog.Error("userspace dataplane helper restart failed; will retry",
-			"attempt", m.helperCrash.Restarts, "err", err)
-		// ensureProcessLocked may have advanced procGen on a spawn that then
-		// failed readiness; re-fence the retry on whatever is current so the
-		// timer chain cannot fork.
-		m.scheduleHelperRestartLocked(m.procGen)
-		m.notifyHelperSupervisorLocked()
+			"attempt", attempts, "err", err)
+		// ensureProcessLocked re-arms the consumed retry on the generation
+		// left after a failed readiness attempt.
 		return
 	}
 	slog.Info("userspace dataplane helper restarted after unexpected exit",
-		"attempts", m.helperCrash.Restarts)
-	// #8397: this is the ONE moment an episode is known to have ended in
-	// recovery, and the next line destroys the only record of it. Append
+		"attempts", attempts)
+	// MAJOR-1: a landed retry proves the helper READY, not STABLE — the
+	// crash record (attempt count, backoff, restart fence) is the retry
+	// debt the NEXT crash in this episode depends on. Wiping here made
+	// every post-ready crash look like attempt #1. Preserve the record;
+	// the streak window or an ordinary Compile bring-up ends the episode.
+	// The #8397 recovered-episode journal entry is still appended.
 	m.recordRecoveredCrashEpisodeLocked(time.Now())
-	m.helperCrash = HelperCrashRecord{}
 	m.notifyHelperSupervisorLocked()
 	// The crash tore the 1 Hz reconcile loop down with the generation it was
 	// polling; the replacement needs its own.
@@ -436,9 +482,18 @@ func (m *Manager) HelperSupervisorState() (running, crashLooping bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	running = m.proc != nil && m.proc.Process != nil
-	crashLooping = !running &&
-		m.procGen == m.helperCrash.restartGen &&
-		m.helperCrash.CrashLooping()
+	if running {
+		return running, false
+	}
+	// The count arm stays fenced to the armed retry: an intentional stop
+	// orphans the timer and must not report a loop. The streak arm is
+	// INTENTIONALLY unfenced: the streak counts unexpected exits across
+	// ping-ready restarts (which advance procGen by design), so fencing
+	// it to the last-armed generation would never trip. Both arms share
+	// the !running gate — a live helper is never "looping".
+	crashLooping = (m.procGen == m.helperCrash.restartGen && m.helperCrash.CrashLooping()) ||
+		(m.helperCrashStreak >= helperCrashLoopAttempt() &&
+			!m.helperCrashLastAt.IsZero() && time.Since(m.helperCrashLastAt) <= 2*helperRestartBackoffMax)
 	return running, crashLooping
 }
 

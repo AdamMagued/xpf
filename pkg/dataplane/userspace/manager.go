@@ -157,6 +157,14 @@ type Manager struct {
 	// helperCrash records the last UNEXPECTED helper exit for the operator and
 	// drives the restart backoff. Zero value means "no crash on record".
 	helperCrash HelperCrashRecord
+	// helperCrashStreak counts unexpected exits across ping-ready restarts. It
+	// is reset only after a quiet crash window or a successful ordinary Compile
+	// bring-up; ping-ready alone is not evidence that the helper is stable.
+	helperCrashStreak int
+	helperCrashLastAt time.Time
+	// restartAttemptInProgress distinguishes a supervisor retry from ordinary
+	// Compile bring-up, which is allowed to end a prior crash episode.
+	restartAttemptInProgress bool
 	// helperSupervisorObserver is a wake-only callback notified when the
 	// supervised helper changes between running and stopped. It is called
 	// under m.mu and MUST NOT call back into Manager; the daemon observer only
