@@ -32,6 +32,13 @@ Run iperf3 traffic through the firewall cluster while cycling redundancy-group f
 
 ALWAYS build and deploy before running tests. Stale binaries are the #1 source of false failures.
 
+The default `cluster-setup.sh deploy all` is a dogfood/dev deploy: its
+`make deb` does not set `XPF_RELEASE`, so a missing archive key produces a
+loud warning and an unpublishable placeholder package. Release packaging
+must separately provide the real key and set `XPF_RELEASE=1` (and
+`XPF_SIGN_SECKEY` for a signed bake); this failover test is not release-key
+validation.
+
 ```bash
 # Build Go daemon + Rust helper + XDP shim
 make build

@@ -65,7 +65,12 @@ class FactorySSHDPasswordAuthTests(unittest.TestCase):
                     capture_output=True,
                     text=True,
                 )
-                return dict(line.split(maxsplit=1) for line in result.stdout.splitlines() if " " in line)
+                return {
+                    key.lower(): value
+                    for line in result.stdout.splitlines()
+                    if " " in line
+                    for key, value in [line.split(maxsplit=1)]
+                }
 
             # Bind the fixture to the Canonical drop-in being the setting owner
             # without xpf's earlier-sorting factory pin.

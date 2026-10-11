@@ -15,6 +15,16 @@ Mechanism for a signed, hosted appliance distribution. Spec:
 | `xpf-image.pub.placeholder` | PLACEHOLDER minisign public key (see below) |
 | `xpf-archive-keyring.asc.placeholder` | PLACEHOLDER OpenPGP apt archive key (see below) |
 
+Image publication reads `/usr/share/keyrings/xpf-archive-keyring.asc` from
+each qcow offline and rejects missing, placeholder, or unparseable guest keys
+(#12188). By default, `make deb` warns loudly and installs the placeholder
+when the real key is absent so dev builds and dogfood deploys can proceed.
+`XPF_RELEASE=1 make deb` instead fails without the real drop-in; use
+`XPF_RELEASE=1 XPF_SIGN_SECKEY=<path> make image` for a signed release bake.
+`XPF_ALLOW_PLACEHOLDER_KEYRING=1` explicitly marks a dev-only package build.
+Unsigned dev bakes skip the bake-time keyring refusal but are not publishable;
+publish independently rejects placeholder-key packages and images.
+
 ## The two operator inputs (OPEN QUESTIONS — not wired to real values here)
 
 This tooling is complete as a MECHANISM. Going live needs two operator

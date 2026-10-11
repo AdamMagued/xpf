@@ -276,7 +276,11 @@ class MainValidationGateTests(unittest.TestCase):
                 if argv[0] == "virt-filesystems":
                     return "/dev/sda1 1 ext4 2\n"
                 if argv[0] == "virt-cat":
-                    return "unused by mocked inventory parser"
+                    if argv[-1] == bake.image_inventory.INVENTORY_GUEST_PATH:
+                        return "unused by mocked inventory parser"
+                    return ("-----BEGIN PGP PUBLIC KEY BLOCK-----\n"
+                            "test key\n"
+                            "-----END PGP PUBLIC KEY BLOCK-----\n")
                 if argv[0] == "git":
                     if argv[3] == "rev-list":
                         return "1\n"
@@ -289,6 +293,8 @@ class MainValidationGateTests(unittest.TestCase):
 
             def subprocess_run(argv, **kwargs):
                 subprocess_calls.append(argv)
+                if argv[:3] == ["go", "env", "GOFLAGS"]:
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
                 return SimpleNamespace(
                     returncode=1, stdout=b"", stderr=b"")
 
@@ -372,7 +378,11 @@ class MainValidationGateTests(unittest.TestCase):
                 if argv[0] == "virt-filesystems":
                     return "/dev/sda1 1 ext4 2\n"
                 if argv[0] == "virt-cat":
-                    return "unused by mocked inventory parser"
+                    if argv[-1] == bake.image_inventory.INVENTORY_GUEST_PATH:
+                        return "unused by mocked inventory parser"
+                    return ("-----BEGIN PGP PUBLIC KEY BLOCK-----\n"
+                            "test key\n"
+                            "-----END PGP PUBLIC KEY BLOCK-----\n")
                 if argv[0] == "git":
                     if argv[3] == "rev-list":
                         return "1\n"

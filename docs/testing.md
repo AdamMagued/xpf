@@ -141,7 +141,7 @@ no leg passes `-v`. So:
 | `make ignored-cell-census` | every Rust `#[ignore]`, including the third crate outside both workspaces |
 | `make test-cold-path-flooder` | 44 `#[test]`s in `test/incus/cold-path-flooder`, which was reached by nothing |
 | `make harness-census` | every runnable shell harness under `test/incus/` |
-| `make selftest` | the self-test layer: every hermetic self-test, plus the censuses (go-skip, harness, ignored-cell, go-buildtag, miri, interpreter, selftest) and the ledger legs |
+| `make selftest` | all self-tests, including image/distribution legs requiring libguestfs (~13 min), plus the censuses (go-skip, harness, ignored-cell, go-buildtag, miri, interpreter, selftest) and the ledger legs |
 
 ### The go-skip census, and the thing it found
 

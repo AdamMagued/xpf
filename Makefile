@@ -624,15 +624,17 @@ docs-check:
 # but were reachable from NO target — a regression re-introducing
 # sign-before-validate (#4017) or breaking the grow-root stamp discipline
 # (#2047) merged green because nothing ran them. `make selftest` discovers and
-# runs them all in one fast (<a few seconds), hermetic pass (no incus, no
-# cluster, no network; most legs need no root, but the #6923 BPF leg uses
-# `sudo -n` whenever passwordless sudo exists and SKIPs otherwise). A leg whose
-# external tool is missing SKIPs rather than fails. Standalone by design —
-# test-deploy-lib (this repo has no CI; every gate is developer-invoked). It is
-# the one command to run before touching image/day-0/dist/deploy tooling, and
-# the single hook a future CI would call. The incus/QEMU image boot matrix
-# (scripts/image/validate.py) and the loss-cluster smokes are NOT included —
-# they need a hypervisor and have their own entry points.
+# runs them all in one aggregate pass. It needs no live Incus cluster or
+# network, but it is not hermetic or a few-second gate: image/distribution
+# legs use host tools such as minisign, GPG, and libguestfs. The 60-check
+# signed-qcow roundtrip took about 51 seconds on the maintainer host; the full
+# aggregate can take longer. Missing tools produce a named SKIP (including
+# how many distribution checks were skipped), not a false PASS. The #6923 BPF
+# probe uses `sudo -n` when passwordless sudo exists and SKIPs otherwise.
+# Standalone by design (this repo has no CI); it is the one command to run
+# before touching image/day-0/dist/deploy tooling, and the single hook a future
+# CI would call. The Incus/QEMU image boot matrix (scripts/image/validate.py)
+# and loss-cluster smokes are NOT included; they need a hypervisor.
 .PHONY: selftest
 selftest: close-keyword-lint
 	sh scripts/run-selftests.sh
@@ -984,11 +986,10 @@ test-host-inbound-lib:
 # — it rebuilds the shim once per mutant across ~20 rows, so it is entirely at
 # the mercy of available CPU. If it seems to have hung, check for a running
 # rustc before killing it. It is
-# therefore in NO aggregate, deliberately. Folding it into `make selftest`
-# (billed "fast hermetic") or a pre-push target would technically satisfy
-# #7766 and practically undo it — a 40-minute leg does not get run, it gets the
-# whole target avoided, costing everything else that target catches. Run it
-# when ipv6_ext_walk.rs or the parity guards change.
+# therefore in NO aggregate, deliberately. Folding it into `make selftest` or
+# a pre-push target would technically satisfy #7766 but practically undo it: a
+# 40-minute leg discourages running the whole target and loses all its coverage.
+# Run it when ipv6_ext_walk.rs or the parity guards change.
 test-shim-ext-parity-lib:
 	bash ./test/mutation/shim-ext-parity-acceptance.sh
 

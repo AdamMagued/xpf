@@ -9,16 +9,18 @@
 # run by hand. A regression re-introducing sign-before-validate (#4017) or
 # breaking the grow-root stamp discipline (#2047) merged green.
 #
-# This runner DISCOVERS and runs every hermetic self-test with one command
-# (`make selftest`). It is fast (<a few seconds), needs no incus, no cluster,
-# and no network. The #6923 BPF probe uses `sudo -n` whenever passwordless
-# sudo exists, and SKIPs otherwise. A leg whose external tool is missing SKIPs
-# (exit 77 from a shell leg, or unittest skips) instead of failing, so the
-# runner is green on a minimal host and only goes RED on a genuine regression.
+# This runner DISCOVERS and runs every registered self-test with one command
+# (`make selftest`). It needs no live Incus cluster or network, but it is not
+# hermetic or a few-second gate: image/distribution legs use host tools such as
+# minisign, GPG, and libguestfs. The 60-check signed-qcow roundtrip took about
+# 51 seconds on the maintainer host; the full aggregate can take longer.
+# Missing tools produce a named SKIP (including how many distribution checks
+# were skipped), not a false PASS. The #6923 BPF probe uses `sudo -n` when
+# passwordless sudo exists, and SKIPs otherwise.
 #
-# Scope: the pure/hermetic self-tests only. The incus/QEMU image boot matrix
-# (scripts/image/validate.py) and the loss-cluster smoke targets need a
-# hypervisor and are NOT run here — they have their own entry points.
+# Scope: all registered self-tests except the Incus/QEMU image boot matrix
+# (scripts/image/validate.py) and loss-cluster smokes, which need a hypervisor
+# and have their own entry points.
 set -u
 
 # shellcheck disable=SC1007  # `CDPATH= cd` clears CDPATH for this command only
@@ -378,10 +380,10 @@ run_shell test/mutation/selftest-bpf-exist-cannot-create_6923.sh --selftest
 # BPF_ANY positive control so an ENOENT cannot come from a broken fixture.
 # The probe runs via `sudo -n` when available. SKIPs without cc, passwordless
 # sudo, or CAP_BPF; it never prompts for a password.
-# #10771 coord-selftest-sudo: `make selftest` is documented hermetic (no
-# root), so the privileged probe is opt-in: without
-# XPF_SELFTEST_ALLOW_SUDO=1 the leg SKIPs (the --selftest contract leg above
-# still pins the privilege boundary with fake tools on every run).
+# #10771 coord-selftest-sudo: the aggregate runner does not require root by
+# default; this privileged probe remains opt-in.
+# Without XPF_SELFTEST_ALLOW_SUDO=1 it SKIPs; the --selftest contract leg
+# above pins the boundary with fake tools on every run.
 if [ "${XPF_SELFTEST_ALLOW_SUDO:-}" = "1" ]; then
 	run_shell test/mutation/selftest-bpf-exist-cannot-create_6923.sh
 else

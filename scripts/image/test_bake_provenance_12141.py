@@ -105,7 +105,9 @@ class BuildProvenanceTests(unittest.TestCase):
                        check=True, capture_output=True)
         return deb
 
-    def run_bake_main(self, argv, *, mutate_on_build=False):
+    def run_bake_main(self, argv, *, mutate_on_build=False, keyring_text=None,
+                      keyring_error=False, signing=False,
+                      allow_placeholder=False):
         root = self.root
         here = root / "scripts/image"
         copied = []
@@ -132,10 +134,20 @@ class BuildProvenanceTests(unittest.TestCase):
                 raise AssertionError(f"unexpected bake command: {command}")
             return subprocess.CompletedProcess(command, 0)
 
+        if keyring_text is None:
+            keyring_text = ("-----BEGIN PGP PUBLIC KEY BLOCK-----\n"
+                            "fixture archive key\n"
+                            "-----END PGP PUBLIC KEY BLOCK-----\n")
+
         def fake_out_text(command):
             if command[0] == "virt-filesystems":
                 return "/dev/sda1 1 ext4\n"
             if command[0] == "virt-cat":
+                if command[-1] == bake.sign.ARCHIVE_KEYRING_GUEST_PATH:
+                    if keyring_error:
+                        raise subprocess.CalledProcessError(
+                            1, command, stderr="keyring file is missing")
+                    return keyring_text
                 return ("# xpf appliance image inventory\n"
                         "guest_kernel: 6.18.0-fixture\npackages:\n"
                         + "".join(f"p{i}=1\n" for i in range(60)))
@@ -146,7 +158,9 @@ class BuildProvenanceTests(unittest.TestCase):
         environment = self.probe_env()
         environment.update({
             "XDG_CACHE_HOME": str(cache),
-            "XPF_SIGN_SECKEY": "",
+            "XPF_SIGN_SECKEY": "/tmp/fixture.seckey" if signing else "",
+            "XPF_ALLOW_PLACEHOLDER_KEYRING": (
+                "1" if allow_placeholder else ""),
         })
         with (
             mock.patch.object(bake, "ROOT", str(root)),
@@ -551,6 +565,53 @@ class BuildProvenanceTests(unittest.TestCase):
         manifest = out / f"xpf-{package_version}.manifest"
         self.assertIn(f"version: {package_version}\n", manifest.read_text())
         self.assertIn("source_dirty: true\n", manifest.read_text())
+
+    def test_unsigned_override_placeholder_bake_exports_image(self):
+        with mock.patch.dict(os.environ, self.probe_env(), clear=True):
+            version = bake.deb_version_for_head(str(self.root))
+        self.make_test_deb(version)
+        out = self.root / "dev-bake"
+        placeholder = (
+            "-----BEGIN PGP PUBLIC KEY BLOCK-----\n"
+            "PLACEHOLDER-xpf-archive-keyring-not-yet-issued\n"
+            "-----END PGP PUBLIC KEY BLOCK-----\n")
+        result, _ = self.run_bake_main([
+            "bake.py", "--skip-build", "--skip-validate",
+            "--version", version, "--out", str(out)],
+            keyring_text=placeholder, allow_placeholder=True)
+        self.assertEqual(result, 0)
+        self.assertTrue((out / f"xpf-{version}.qcow2").is_file())
+
+    def test_signed_bake_main_refuses_placeholder_archive_keyring(self):
+        with mock.patch.dict(os.environ, self.probe_env(), clear=True):
+            version = bake.deb_version_for_head(str(self.root))
+        self.make_test_deb(version)
+        out = self.root / "signed-placeholder"
+        placeholder = (
+            "-----BEGIN PGP PUBLIC KEY BLOCK-----\n"
+            "PLACEHOLDER-xpf-archive-keyring-not-yet-issued\n"
+            "-----END PGP PUBLIC KEY BLOCK-----\n")
+        with self.assertRaises(SystemExit) as caught:
+            self.run_bake_main([
+                "bake.py", "--skip-build", "--skip-validate",
+                "--version", version, "--out", str(out)],
+                keyring_text=placeholder, signing=True)
+        self.assertIn("refusing to sign this image", str(caught.exception))
+        self.assertFalse((out / f"xpf-{version}.qcow2").exists())
+
+    def test_signed_bake_main_refuses_missing_archive_keyring(self):
+        with mock.patch.dict(os.environ, self.probe_env(), clear=True):
+            version = bake.deb_version_for_head(str(self.root))
+        self.make_test_deb(version)
+        out = self.root / "signed-missing"
+        with self.assertRaises(SystemExit) as caught:
+            self.run_bake_main([
+                "bake.py", "--skip-build", "--skip-validate",
+                "--version", version, "--out", str(out)],
+                keyring_error=True, signing=True)
+        self.assertIn("cannot read the baked image archive keyring",
+                      str(caught.exception))
+        self.assertFalse((out / f"xpf-{version}.qcow2").exists())
 
     def test_exported_deb_version_cannot_hide_post_build_source_drift(self):
         with mock.patch.dict(os.environ, self.probe_env(), clear=True):
