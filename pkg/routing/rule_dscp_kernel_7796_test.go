@@ -28,8 +28,11 @@ import (
 //   unshare -rn go test ./pkg/routing/ -run 7796
 
 // enterPrivateNetns7796 locks the goroutine to its OS thread and moves it into a
-// fresh network namespace, restoring the original on cleanup.
-func enterPrivateNetns7796(t *testing.T) {
+// fresh network namespace, restoring the original on cleanup. It returns the
+// private namespace handle so subtests — which run on fresh, unlocked
+// threads — can join it via joinPrivateNetns7796; without that join their
+// netlink sockets open in the caller's namespace (#12518).
+func enterPrivateNetns7796(t *testing.T) netns.NsHandle {
 	t.Helper()
 	runtime.LockOSThread()
 	orig, err := netns.Get()
@@ -49,6 +52,7 @@ func enterPrivateNetns7796(t *testing.T) {
 		orig.Close()
 		runtime.UnlockOSThread()
 	})
+	return ns
 }
 
 // liveDSCPOps returns the PRODUCTION ops bound to a real netlink handle in the
@@ -64,6 +68,56 @@ func liveDSCPOps(t *testing.T) dscpRuleOps {
 	return dscpRuleOps{h}
 }
 
+// joinPrivateNetns7796 moves the calling subtest onto a thread joined to the
+// private namespace created by enterPrivateNetns7796, restoring its previous
+// namespace on cleanup.
+//
+// t.Run executes each subtest on a FRESH goroutine, and a network namespace
+// is per-THREAD state: the parent's LockOSThread + setns does not extend to
+// subtests. Without this join, RuleAddDSCP — which opens its own netlink
+// socket in the calling thread's namespace — installs rules in the CALLER's
+// namespace: 14 prio 29000+N leaks under `unshare -rn`, and EEXIST
+// false-reds on repeated -cpu runs (#12518).
+func joinPrivateNetns7796(t *testing.T, ns netns.NsHandle) {
+	t.Helper()
+	runtime.LockOSThread()
+	orig, err := netns.Get()
+	if err != nil {
+		runtime.UnlockOSThread()
+		t.Fatalf("cannot read subtest netns: %v", err)
+	}
+	if err := netns.Set(ns); err != nil {
+		orig.Close()
+		runtime.UnlockOSThread()
+		t.Fatalf("cannot join private netns: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := netns.Set(orig); err != nil {
+			t.Errorf("subtest: restore original netns: %v", err)
+		}
+		orig.Close()
+		runtime.UnlockOSThread()
+	})
+}
+
+// delRuleDSCP7796 removes a rule previously installed through ops. Every
+// installing test defers this per rule; strict deletes make any RuleDel
+// error, including ENOENT, fail the test. An ENOENT from an install/delete
+// namespace split is not accepted as successful cleanup and exposes a join
+// regression rather than hiding its leaked rule.
+func delRuleDSCP7796(t *testing.T, ops dscpRuleOps, rule *netlink.Rule) {
+	t.Helper()
+	del := *rule
+	if del.Type == 0 {
+		// Both encoders default a zero action to unicast on the wire
+		// (RuleAddDSCP mirrors the library), so mirror it for the delete.
+		del.Type = unix.RTN_UNICAST
+	}
+	if err := ops.RuleDel(&del); err != nil {
+		t.Errorf("cleanup: delete rule at priority %d: %v", rule.Priority, err)
+	}
+}
+
 // TestRuleAddDSCPAcceptedByKernel7796 is the regression guard. Every DSCP the
 // config layer can name must install.
 //
@@ -71,13 +125,14 @@ func liveDSCPOps(t *testing.T) dscpRuleOps {
 // library's RuleAdd) and every row from cs1 (8) up returns
 // "invalid argument" — which is exactly what took the FBF commit down.
 func TestRuleAddDSCPAcceptedByKernel7796(t *testing.T) {
-	enterPrivateNetns7796(t)
+	ns := enterPrivateNetns7796(t)
 	ops := liveDSCPOps(t)
 
 	// The full set of values dscpValue can produce, including the boundary the
 	// legacy tos selector could still represent (7) and the ones it could not.
 	for _, dscp := range []uint8{0, 1, 7, 8, 10, 16, 24, 26, 32, 40, 46, 48, 56, 63} {
 		t.Run(fmt.Sprintf("dscp-%d", dscp), func(t *testing.T) {
+			joinPrivateNetns7796(t, ns)
 			rule := netlink.NewRule()
 			rule.Family = unix.AF_INET
 			rule.Table = 236616 // a real FBF table id: > 255, so FRA_TABLE carries it
@@ -89,6 +144,7 @@ func TestRuleAddDSCPAcceptedByKernel7796(t *testing.T) {
 					"IPTOS_TOS_MASK (0x1E), so DSCP<<2 overflows it from dscp 8 up "+
 					"and the commit fails. The rule must carry FRA_DSCP.", dscp, err)
 			}
+			t.Cleanup(func() { delRuleDSCP7796(t, ops, rule) })
 		})
 	}
 }
@@ -121,6 +177,7 @@ func TestRuleDSCPRoundTripsThroughKernel7796(t *testing.T) {
 		if err := ops.RuleAddDSCP(rule, dscp); err != nil {
 			t.Fatalf("install dscp %d at prio %d: %v", dscp, prio, err)
 		}
+		t.Cleanup(func() { delRuleDSCP7796(t, ops, rule) })
 		want[prio] = dscp
 	}
 
@@ -161,6 +218,7 @@ func TestRuleDSCPRoundTripsThroughKernel7796(t *testing.T) {
 	if err := ops.RuleAddDSCP(unreachable, 46); err != nil {
 		t.Fatalf("install DSCP-qualified unreachable action: %v", err)
 	}
+	t.Cleanup(func() { delRuleDSCP7796(t, ops, unreachable) })
 	out, err = exec.Command(ip, "rule", "list").CombinedOutput()
 	if err != nil {
 		t.Fatalf("ip rule list after unreachable action: %v (%s)", err, out)
@@ -284,6 +342,7 @@ func TestDSCPZeroIsDistinctFromNoDSCP7796(t *testing.T) {
 	if err := ops.RuleAddDSCP(zeroRule, 0); err != nil {
 		t.Fatalf("install dscp-0 rule: %v", err)
 	}
+	t.Cleanup(func() { delRuleDSCP7796(t, ops, zeroRule) })
 
 	// The contrast: the SAME rule shape with no DSCP, installed the ordinary way.
 	noneRule := netlink.NewRule()
@@ -293,6 +352,7 @@ func TestDSCPZeroIsDistinctFromNoDSCP7796(t *testing.T) {
 	if err := ops.RuleAdd(noneRule); err != nil {
 		t.Fatalf("install dscp-less rule: %v", err)
 	}
+	t.Cleanup(func() { delRuleDSCP7796(t, ops, noneRule) })
 
 	out, err := exec.Command(ip, "rule", "list").CombinedOutput()
 	if err != nil {
