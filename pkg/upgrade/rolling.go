@@ -156,7 +156,10 @@ func runRollingRollbackWith(r *Runner, cl RollingCluster, rc RollingConfig, targ
 	r.resetCommittedCut()
 	rc.withDefaults()
 
-	// All rollback refusal checks happen before ForceSecondary. This includes
+	// The pre-demote refusal gates run here, before ForceSecondary: the
+	// rollback plan gate plus the peer/sync/compat/readiness gates below.
+	// (RollbackTo re-runs the plan/envelope gate after the drain; fresh-plan
+	// refusals there fail back via the sentinel — see the post-drain call.)
 	plan, _, err := r.rollbackInvocationPlan(target)
 	if err != nil {
 		return fmt.Errorf("rolling rollback: %w", err)
@@ -215,10 +218,20 @@ func runRollingRollbackWith(r *Runner, cl RollingCluster, rc RollingConfig, targ
 	}
 	r.logf("rolling: rollback drain complete (peer owns RGs, local backup, rg_active=false, sync clean)")
 
+	// RollbackTo re-runs the envelope gate AFTER the drain above (the target
+	// binary's --capability-check executes inside validateRollbackPlan), so
+	// a transient exec failure refuses here on a healthy drained daemon.
+	// Fail FRESH-PLAN refusals back (sentinel); anything else — a STOP was
+	// attempted, or the journal is a ROLLINGBACK resume the forward driver
+	// would equally keep passive — stays passive for inspection (MINOR-3).
 	if err := r.RollbackTo(plan.toVersion, RollbackOptions{
 		ClusterCoordinated: true,
 		LockAlreadyHeld:    true,
 	}); err != nil {
+		if errors.Is(err, errRollbackRefusedBeforeStop) {
+			r.logf("rolling rollback: refused before STOP; resetting failover and aborting")
+			return failbackAfterRollbackRefusal(cl, err)
+		}
 		return fmt.Errorf("rolling rollback: single-node rollback failed (inspect the drained node): %w", err)
 	}
 
@@ -234,6 +247,42 @@ func runRollingRollbackWith(r *Runner, cl RollingCluster, rc RollingConfig, targ
 	}
 	r.logf("rolling: local node rejoined election, confirmed for every configured RG; rollback complete for this node")
 	return nil
+}
+
+// failbackAfterPreStopRefusal releases the rolling drain when Runner.Run
+// rejects a cut before attempting STOP. ResetFailover is only an
+// acknowledgement; read the per-RG rejoin predicate back before reporting
+// the node recovered. Errors after STOP deliberately do not use this path:
+// those leave the node secondary for operator inspection.
+func failbackAfterPreStopRefusal(cl RollingCluster, cause error) error {
+	return failbackAfterRefusal(cl, cause, "single-node cut")
+}
+
+// failbackAfterRollbackRefusal is the twin of failbackAfterPreStopRefusal
+// with rollback wording: the shared helper says "cut", which mislabels a
+// rollback refusal in the operator text.
+func failbackAfterRollbackRefusal(cl RollingCluster, cause error) error {
+	return failbackAfterRefusal(cl, cause, "single-node rollback")
+}
+
+func failbackAfterRefusal(cl RollingCluster, cause error, what string) error {
+	if resetErr := cl.ResetFailover(); resetErr != nil {
+		return fmt.Errorf("rolling: %s refused before STOP AND "+
+			"failback (ResetFailover) FAILED — node may remain held secondary: %w",
+			what, errors.Join(cause, resetErr))
+	}
+	rejoined, readbackErr := cl.LocalRejoinComplete()
+	if readbackErr != nil || !rejoined {
+		joined := cause
+		if readbackErr != nil {
+			joined = errors.Join(cause, readbackErr)
+		}
+		return fmt.Errorf("rolling: %s refused before STOP; failback "+
+			"acknowledged but local rejoin is not confirmed (local-rejoined=%v "+
+			"readback-error=%v): %w", what, rejoined, readbackErr, joined)
+	}
+	return fmt.Errorf("rolling: %s refused before STOP; failback "+
+		"confirmed by per-RG readback: %w", what, cause)
 }
 
 // runRollingWith is the testable core (cluster + timing injected). It does
@@ -380,9 +429,14 @@ func runRollingWith(r *Runner, cl RollingCluster, rc RollingConfig) (err error) 
 	//    3-4 above), so the per-node cut is sanctioned even on a clustered
 	//    node — it bypasses the #5284 pre-STOP cluster gate that refuses a
 	//    BARE standalone cut on a member with /etc/xpf/node-id present.
-	if err := r.Run(Options{SkipStartHealthRollback: true, LockAlreadyHeld: true, ClusterCoordinated: true}); err != nil {
+	if cutErr := r.Run(Options{SkipStartHealthRollback: true, LockAlreadyHeld: true, ClusterCoordinated: true}); cutErr != nil {
+		var beforeStop *cutBeforeStopError
+		if errors.As(cutErr, &beforeStop) {
+			logf("rolling: single-node cut refused before STOP; resetting failover and aborting")
+			return failbackAfterPreStopRefusal(cl, cutErr)
+		}
 		return fmt.Errorf("rolling: single-node cut failed (HA rollback is "+
-			"operator-driven — inspect the node): %w", err)
+			"operator-driven — inspect the node): %w", cutErr)
 	}
 
 	// 6. Wait for sync to re-establish on the upgraded node. The cut just

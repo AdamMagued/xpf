@@ -302,9 +302,14 @@ peer liveness, session-sync established, HA-protocol compatibility,
 session-sync-wire compatibility, and peer takeover readiness; then it
 drains the node, performs the stop → snapshot restore → re-flip → start
 sequence, then waits for sync and confirms every redundancy group has
-rejoined before reporting `rolling rollback complete`. A standalone success
-prints `rollback complete`; failures are reported on stderr with the
-`upgrade --rollback...:` prefix.
+rejoined before reporting `rolling rollback complete`. The envelope gate
+is re-evaluated after the drain (the target binary probe executes
+inside the rollback plan validation): a FRESH-plan refusal there fails
+back (`ResetFailover` + per-RG rejoin readback) like the forward
+driver; a failure after a STOP attempt, or a refusal while resuming a
+ROLLINGBACK journal, keeps the node passive for inspection (#12175). A
+standalone success prints `rollback complete`; failures are reported on
+stderr with the `upgrade --rollback...:` prefix.
 
 Rollback uses a **refuse-with-guidance** envelope-major policy. Before
 `StopUnit`, it parses the snapshot's `v=` and `min-reader=` fields and invokes
@@ -685,7 +690,13 @@ state machines are untouched.
    secondary not undone, peer takeover unproven → possible both-nodes-secondary
    outage) so an operator investigates — it must NOT keep claiming "still
    forwarding" (#5845, mirroring the kernel-roll drain path `kernel_drain.go`).
-5. single-node cut (auto-rollback disabled).
+5. single-node cut (auto-rollback disabled). A cut that REFUSES before STOP
+   (verifier REJECT, envelope refusal, no restorable target) fails back:
+   `ResetFailover` runs and the per-RG rejoin is read back before the
+   refusal is returned, so the node resumes forwarding. Any failure at or
+   after a STOP attempt leaves the node secondary for operator inspection —
+   including any failure while resuming a ROLLINGBACK journal, which counts
+   as stop-attempted even when this run has not STOPped yet (#12175).
 6. wait for session sync to re-establish, bounded by `RejoinDeadline`
    (60s default). The cut just restarted xpfd, so the local gRPC socket
    refuses connections for the first few seconds — that `connection

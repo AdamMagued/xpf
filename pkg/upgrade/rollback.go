@@ -1,6 +1,7 @@
 package upgrade
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,13 @@ import (
 
 	"github.com/psaab/xpf/pkg/configstore"
 )
+
+// errRollbackRefusedBeforeStop marks a RollbackTo FRESH-plan refusal raised
+// before the unit was stopped (StateInit-branch plan/envelope gates). The
+// rolling driver fails those back; ROLLINGBACK-journal refusals and
+// anything past this point stay passive for inspection. It must wrap
+// with %w (never %v) so errors.Is survives the "upgrade --rollback" prefix.
+var errRollbackRefusedBeforeStop = errors.New("refused before STOP")
 
 // RollbackOptions controls a single operator rollback. ClusterCoordinated is
 // set only by the rolling driver after it has drained this node to its peer;
@@ -62,6 +70,15 @@ func (r *Runner) RollbackTo(target string, opts RollbackOptions) error {
 
 	plan, j, err := r.rollbackInvocationPlan(target)
 	if err != nil {
+		// Fresh-plan (StateInit) refusals fire before any STOP: mark them
+		// so the rolling driver can fail back instead of stranding the
+		// drain. Refusals on a ROLLINGBACK journal resume keep the hold —
+		// the forward driver treats ROLLINGBACK as stop-attempted
+		// (cutover.go classifier), and the twin must match it, not
+		// invert it: a prior attempt may have STOPped already.
+		if lj, lerr := r.loadJournal(); lerr == nil && lj.State == StateInit {
+			return fmt.Errorf("upgrade --rollback: %w: %w", errRollbackRefusedBeforeStop, err)
+		}
 		return fmt.Errorf("upgrade --rollback: %w", err)
 	}
 	if j.State == StateRollingBack {
