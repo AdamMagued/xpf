@@ -128,7 +128,11 @@ fn from_wan(
     flags: u8,
 ) -> DebugPollCounters {
     let frame = build_txn_tcp_syn_frame_v4(CLIENT, dst, CLIENT_PORT, dport, flags, crate::afxdp::tests_support::TEST_WAN_MAC);
-    let meta = txn_meta_v4(WAN_IFINDEX as u32, flags, frame.len() as u16);
+    // #11297: VID 80 selects tagged-only reth0.80; poll head rejects VID 0.
+    // Keep presence=0: this untagged frame has L3 offset 14, and
+    // parse_l2 sets vlan_present only for a physical tag; it selects L3 offset.
+    let mut meta = txn_meta_v4(WAN_IFINDEX as u32, flags, frame.len() as u16);
+    meta.ingress_vlan_id = 80;
     let mut b = BindingWorker::new_for_mirror_test(0, 0, WAN_IFINDEX, 0);
     b.interface = Arc::<str>::from("reth0.80");
     let ha_state = txn_ha_state();
@@ -328,5 +332,39 @@ fn an_established_dnat_to_self_session_meets_the_service_gate_on_the_translated_
         "the established flow reaches sshd on tcp/22, which wan admits. A deny here means the \
          session-hit gate judged the WIRE port 2222 and tore down a flow its own SYN was \
          admitted for (#9529)"
+    );
+    // #12474 F3: the established-session service-gate check must be live, not
+    // vacuously green because route revalidation discarded the ACK upstream.
+    // Install an any-service DNAT session, then tighten the gate to SSH only;
+    // the established packet translated to tcp/8080 must hit and be denied.
+    let install = forwarding(Fixture {
+        dnat: Some((2223, 8080)),
+        permit_wan_to_local: true,
+        ..PLAIN
+    });
+    let mut sessions = SessionTable::new();
+    let syn = from_wan(&install, &mut sessions, VIP, 2223, TCP_FLAG_SYN);
+    assert!(
+        delivered(&syn) && syn.session_create == 1,
+        "control: installed"
+    );
+    let restricted = forwarding(Fixture {
+        dnat: Some((2223, 8080)),
+        wan_services: Some(&["ssh"]),
+        permit_wan_to_local: true,
+        ..PLAIN
+    });
+    let ack = from_wan(&restricted, &mut sessions, VIP, 2223, TCP_ACK);
+    assert_eq!(
+        ack.session_hit, 1,
+        "the service-gate ACK must hit its session"
+    );
+    assert_eq!(
+        ack.filter_revoked_sessions, 0,
+        "route revalidation must not discard the ACK before the service gate"
+    );
+    assert_eq!(
+        ack.host_inbound_deny, 1,
+        "the live established-session service gate must deny the translated tcp/8080"
     );
 }
