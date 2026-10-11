@@ -671,7 +671,8 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig, opts compileOpts, w
 								}
 							}
 						}
-						if sampNode := afNode.FindChild("sampling"); sampNode != nil {
+						// Union presence flags; input/output accumulate across siblings.
+						for _, sampNode := range afNode.FindChildren("sampling") {
 							if sampNode.FindChild("input") != nil {
 								unit.SamplingInput = true
 							}
@@ -739,7 +740,8 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig, opts compileOpts, w
 								}
 							}
 						}
-						if sampNode := afNode.FindChild("sampling"); sampNode != nil {
+						// Union presence flags; input/output accumulate across siblings.
+						for _, sampNode := range afNode.FindChildren("sampling") {
 							if sampNode.FindChild("input") != nil {
 								unit.SamplingInput = true
 							}
