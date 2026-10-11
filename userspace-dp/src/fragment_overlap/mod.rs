@@ -109,6 +109,7 @@ pub(crate) static FRAG_OVERLAP_POST_NAT_DROPPED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FRAG_OVERLAP_MAX_LIFETIME_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) const OVERLAP_SHARDS: usize = 16;
+const _: () = assert!(OVERLAP_SHARDS >= 2 && OVERLAP_SHARDS.is_power_of_two());
 pub(crate) const OVERLAP_CAP_PER_SHARD: usize = 64;
 /// Max entries one sender holds per shard (#10658).
 pub(crate) const OVERLAP_CAP_PER_SENDER_PER_SHARD: usize = 8;
