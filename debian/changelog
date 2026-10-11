@@ -1,5 +1,12 @@
 xpf (0.0.0) unstable; urgency=medium
 
+  * Repeated interface filter bindings now resolve last-wins across all
+    `filter` siblings (was: first sibling, first leaf only). Persisted
+    configs with repeats or split siblings may activate, change, or
+    silently remove filters on upgrade, including lo0 host-bound input.
+    Consolidate each unit/family into one `filter { input; output; }`
+    block before upgrading, on every HA peer (#12093, #12511).
+
   * Keep generated qualified-next-hop route-maps metric-free in shared FRR
     config. After successful loads, reconcile legacy metric-bearing sequences
     across all 17 route-map-recipient daemons and verify reachable copies,
