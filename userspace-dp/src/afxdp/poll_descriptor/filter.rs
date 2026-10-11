@@ -1002,6 +1002,20 @@ pub(super) fn revalidate_static_pbr_route_on_session_hit(
                 table.as_deref(),
             )
         });
+    // #12056 follow-up: this resolution re-runs ONLY the interface-NAT and
+    // FIB arms, never the ordered ingress-local arm (that arm, with its
+    // interface-NAT fallback, was already checked above via
+    // local_arm_unchanged). Keep the established session only when this
+    // fresh resolution exactly matches the stored one AND its route identity
+    // is unchanged. That also keeps a stored interface-NAT/FIB-local decision
+    // when ingress-local now selects a different local (duplicate address),
+    // bounded by the same dual equality. A missing/retargeted address or
+    // PBR table therefore still returns the route transition and fails closed.
+    if resolution == decision.resolution
+        && desired_identity == (decision.install_table_domain, decision.install_table_check)
+    {
+        return None;
+    }
     Some(SessionHitPbrRouteRevalidation {
         revoked_key: (!no_local_entry && !is_reverse).then_some(canonical_key.clone()),
         canonical_key,

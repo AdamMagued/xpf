@@ -3198,3 +3198,65 @@ fn removing_static_pbr_revalidates_local_session_under_native_ri_12056() {
     );
     assert_eq!(route.resolution.disposition, crate::afxdp::ForwardingDisposition::NoRoute);
 }
+
+/// #12056: a firewall-local address on a DIFFERENT interface is reached
+/// through the FIB local route, not either ingress-local miss arm. An
+/// established session must keep that unchanged local resolution when the
+/// route identity still matches; treating every non-ingress local address as
+/// stale discards the first ACK before host-bound gates run.
+#[test]
+fn unchanged_non_ingress_fib_local_session_is_not_revoked_12056() {
+    let mut snapshot = policy_deny_snapshot();
+    // Belt-and-braces only: policy_deny_snapshot has no SNAT rules, so clear()
+    // is a no-op. The address stays in local_v4; the FIB lookup then selects
+    // LocalDelivery, exercising the non-ingress FIB-local arm.
+    snapshot.source_nat_rules.clear();
+    let forwarding = build_forwarding_state(&snapshot);
+    let mut flow = local_flow_12056(false, PROTO_TCP, false);
+    flow.dst_ip = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8));
+    flow.forward_key.dst_ip = flow.dst_ip;
+    flow.forward_key.routing_domain = 0;
+    let neighbors = std::sync::Arc::new(ShardedNeighborMap::new());
+    let resolution =
+        crate::afxdp::forwarding::lookup_forwarding_resolution_in_table_with_dynamic(
+            &forwarding,
+            &neighbors,
+            flow.dst_ip,
+            None,
+        );
+    assert_eq!(
+        resolution.disposition,
+        crate::afxdp::ForwardingDisposition::LocalDelivery,
+        "the WAN interface address must resolve through the FIB local arm"
+    );
+    assert_ne!(resolution.local_ifindex, LAN_IFINDEX);
+    let stored = local_decision_12056(resolution, (0, 0));
+    let mut sessions = SessionTable::new();
+    sessions.set_filter_revalidation_gen(7);
+    assert!(sessions.install_with_protocol_with_origin(
+        flow.forward_key.clone(),
+        stored,
+        metadata(),
+        SessionOrigin::ForwardFlow,
+        1_000,
+        PROTO_TCP,
+        0,
+    ));
+
+    let route = revalidate_static_pbr_route_on_session_hit(
+        &forwarding,
+        &neighbors,
+        &sessions,
+        &flow.forward_key,
+        &flow,
+        &frame(),
+        meta(LAN_IFINDEX as u32, 0, false),
+        Some(TEST_LAN_ZONE_ID),
+        stored,
+        false,
+    );
+    assert!(
+        route.is_none(),
+        "unchanged FIB-local resolution with the same route identity must not revoke: {route:?}"
+    );
+}
