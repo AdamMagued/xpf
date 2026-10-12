@@ -153,10 +153,12 @@ func collectPolicyContentRejections(policies []PolicyRuleSnapshot) []string {
 //   - APP-CATALOG BUILD (buildAppCatalogSnapshot): pkg/appid BuildCatalog walks
 //     EVERY configured application-set and errors on the first it cannot expand,
 //     which fails the whole snapshot closed REGARDLESS of a leading `any` token
-//     in the referencing policy (the per-rule scan short-circuits on `any`, so a
-//     `match application [ any bad-set ]` policy is missed there but still fails
-//     closed here). It is consulted only when the per-rule scan is empty, so a
-//     bad set already named with a scoped per-rule reason is not double-reported.
+//     in the referencing policy. A referenced bad set is already named by the
+//     per-rule scan in either list order (#12223); this arm remains the
+//     order-insensitive backstop for any configured set it cannot expand,
+//     including unreferenced ones, and is consulted only when the per-rule scan
+//     is empty, so a bad set already named with a scoped per-rule reason is not
+//     double-reported.
 //   - WRONG-FAMILY ADDRESS-BOOK PREFIXES: the helper enforces that each
 //     address-book row's prefixes_v4 / prefixes_v6 array agrees with Rust's
 //     literal-family parser. Go's To4 folding can file an IPv4-mapped IPv6
