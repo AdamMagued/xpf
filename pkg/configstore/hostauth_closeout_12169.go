@@ -38,8 +38,9 @@ func (db *DB) WriteFirstCommitHostAuthCloseout(generation uint64) error {
 }
 
 // ReadFirstCommitHostAuthCloseout returns the outstanding retirement
-// obligation, or nil when there is none. Corrupt/degenerate records fail
-// visibly so startup never silently treats an unreadable obligation as done.
+// obligation, or nil when there is none. Corrupt/degenerate records return an
+// error; the daemon clears a record without parsing only after a newer
+// committed config has superseded its obligation.
 func (db *DB) ReadFirstCommitHostAuthCloseout() (*FirstCommitHostAuthCloseout, error) {
 	data, err := rbReadBoundedFile(db.firstCommitHostAuthCloseoutPath(), 1024)
 	if err != nil {

@@ -127,6 +127,67 @@ func TestFirstCommitRollbackCrashMidCloseoutReplaysOnRestart12169(t *testing.T) 
 	t.Log("fresh-store bootstrap replay retired the remaining root key, sudoers and sshd state with zero ordinary applies")
 }
 
+func TestFirstCommitCloseoutCorruptionIsSupersededOnlyAfterCommit12169(t *testing.T) {
+	t.Run("committed", func(t *testing.T) {
+		isolateFirstCommitRollbackHostAuth12169(t)
+		root := t.TempDir()
+		s, err := configstore.New(filepath.Join(root, "xpf.conf"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.EnterConfigure(); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.LoadOverride("system { host-name committed; }"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		recordPath := filepath.Join(root, ".configdb", "first-commit-hostauth-closeout.json")
+		if err := os.WriteFile(recordPath, []byte("{trunc"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		restarted, err := configstore.New(s.ConfigPath())
+		if err != nil {
+			t.Fatal(err)
+		}
+		d := &Daemon{store: restarted, applySem: semaphore.NewWeighted(1),
+			opts: Options{ConfigFile: s.ConfigPath(), NoDataplane: true}}
+		oldNodeID := hasNodeIDFileFn
+		hasNodeIDFileFn = func() bool { return false }
+		t.Cleanup(func() { hasNodeIDFileFn = oldNodeID })
+		if failClosed, err := d.loadAndBootstrapConfig(); err != nil || failClosed {
+			t.Fatalf("committed startup load: failClosed=%v err=%v", failClosed, err)
+		}
+		d.ensureEarlyInputBootstrapGuard()
+		if err := d.setupDataplaneAndInitialConfig(); err != nil {
+			t.Fatalf("committed startup with superseded corrupt record: %v", err)
+		}
+		if record, err := restarted.PendingFirstCommitHostAuthCloseout(); err != nil || record != nil {
+			t.Fatalf("superseded closeout record remains: record=%v err=%v", record, err)
+		}
+	})
+
+	t.Run("never-committed", func(t *testing.T) {
+		isolateFirstCommitRollbackHostAuth12169(t)
+		root := t.TempDir()
+		s, err := configstore.New(filepath.Join(root, "xpf.conf"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		recordPath := filepath.Join(root, ".configdb", "first-commit-hostauth-closeout.json")
+		if err := os.WriteFile(recordPath, []byte("{trunc"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		d := &Daemon{store: s, applySem: semaphore.NewWeighted(1),
+			opts: Options{ConfigFile: s.ConfigPath(), NoDataplane: true}}
+		if err := d.setupDataplaneAndInitialConfig(); err == nil {
+			t.Fatal("never-committed startup accepted a corrupt closeout record")
+		}
+	})
+}
+
 func setFirstCommitCloseoutCrashPaths12169(root string) {
 	shadowPath = filepath.Join(root, "shadow")
 	passwdPath = filepath.Join(root, "passwd")

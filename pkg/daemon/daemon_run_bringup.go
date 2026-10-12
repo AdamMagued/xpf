@@ -535,19 +535,12 @@ func (d *Daemon) loadAndBootstrapConfig() (bool, error) {
 // (dp.HA) during teardown, so a startup signal aborts at the phase boundary
 // rather than tearing the runtime out from under the teardown (#5807).
 // replayFirstCommitHostAuthCloseout12169 resumes a first-commit rollback's
-// durable host-auth retirement obligation after a process crash. The store
-// writes that obligation before PromoteRollback; replay retires every owner
-// and re-drives sshd reload before discharging it, since the record does not
-// encode which closeout step had completed before the crash.
+// durable host-auth retirement obligation after a process crash. A pending
+// confirm remains authoritative. Otherwise, an ever-committed active config
+// supersedes the obligation and clears it before record parsing; only a
+// never-committed bootstrap parses and replays the first-commit record.
 func (d *Daemon) replayFirstCommitHostAuthCloseout12169() error {
 	if d.store == nil {
-		return nil
-	}
-	record, err := d.store.PendingFirstCommitHostAuthCloseout()
-	if err != nil {
-		return err
-	}
-	if record == nil {
 		return nil
 	}
 	if d.store.IsConfirmPending() {
@@ -556,9 +549,17 @@ func (d *Daemon) replayFirstCommitHostAuthCloseout12169() error {
 		return nil
 	}
 	if d.store.EverCommitted() {
-		if err := d.store.ClearSupersededFirstCommitHostAuthCloseout(); err != nil {
-			return err
-		}
+		// No first-commit rollback can be pending on a committed box. Clear
+		// the superseded record without parsing it: its generation is no
+		// longer relevant, and corruption must not block committed startup.
+		return d.store.ClearSupersededFirstCommitHostAuthCloseout()
+	}
+
+	record, err := d.store.PendingFirstCommitHostAuthCloseout()
+	if err != nil {
+		return err
+	}
+	if record == nil {
 		return nil
 	}
 
