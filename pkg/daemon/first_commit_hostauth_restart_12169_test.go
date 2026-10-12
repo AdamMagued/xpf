@@ -86,19 +86,51 @@ func TestFirstCommitRollbackCrashMidCloseoutReplaysOnRestart12169(t *testing.T) 
 		t.Fatalf("root key unexpectedly retired before injected crash: %v", err)
 	}
 
+	failedRestart, err := configstore.New(s.ConfigPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	failedDaemon := &Daemon{store: failedRestart, applySem: semaphore.NewWeighted(1),
+		opts: Options{ConfigFile: s.ConfigPath(), NoDataplane: true}}
+	failedReloads := 0
+	reloadErr := errors.New("sshd reload unavailable")
+	sshdReloadCmd = func() ([]byte, error) {
+		failedReloads++
+		return []byte("reload failed"), reloadErr
+	}
+	oldNodeID := hasNodeIDFileFn
+	hasNodeIDFileFn = func() bool { return false }
+	t.Cleanup(func() { hasNodeIDFileFn = oldNodeID })
+	if failClosed, err := failedDaemon.loadAndBootstrapConfig(); err != nil || failClosed {
+		t.Fatalf("failed-reload restart load: failClosed=%v err=%v", failClosed, err)
+	}
+	failedDaemon.ensureEarlyInputBootstrapGuard()
+	failedApplies := 0
+	failedDaemon.applyBodyForTest = func(*config.Config) { failedApplies++ }
+	if err := failedDaemon.setupDataplaneAndInitialConfig(); err != nil {
+		t.Fatal(err)
+	}
+	if failedReloads != 1 {
+		t.Fatalf("failed bootstrap replay sshd reloads=%d, want exactly one", failedReloads)
+	}
+	if failedApplies != 0 {
+		t.Fatalf("failed-reload replay unexpectedly invoked ordinary config apply %d times", failedApplies)
+	}
+	if record, err := failedRestart.PendingFirstCommitHostAuthCloseout(); err != nil || record == nil {
+		t.Fatalf("failed sshd reload did not retain the replay obligation: record=%v err=%v", record, err)
+	}
+
 	restarted, err := configstore.New(s.ConfigPath())
 	if err != nil {
 		t.Fatal(err)
 	}
-	d := &Daemon{store: restarted, applySem: semaphore.NewWeighted(1), opts: Options{ConfigFile: s.ConfigPath(), NoDataplane: true}}
+	d := &Daemon{store: restarted, applySem: semaphore.NewWeighted(1),
+		opts: Options{ConfigFile: s.ConfigPath(), NoDataplane: true}}
 	sshdReloads := 0
 	sshdReloadCmd = func() ([]byte, error) { sshdReloads++; return nil, nil }
-	oldNodeID := hasNodeIDFileFn
-	hasNodeIDFileFn = func() bool { return false }
-	t.Cleanup(func() { hasNodeIDFileFn = oldNodeID })
 	restarted.SetRollbackExecutor(d.executeConfirmedRollback)
 	if failClosed, err := d.loadAndBootstrapConfig(); err != nil || failClosed {
-		t.Fatalf("restart load: failClosed=%v err=%v", failClosed, err)
+		t.Fatalf("successful retry load: failClosed=%v err=%v", failClosed, err)
 	}
 	d.ensureEarlyInputBootstrapGuard()
 	applies := 0
@@ -124,7 +156,7 @@ func TestFirstCommitRollbackCrashMidCloseoutReplaysOnRestart12169(t *testing.T) 
 	if record, err := restarted.PendingFirstCommitHostAuthCloseout(); err != nil || record != nil {
 		t.Fatalf("completed replay obligation remains: record=%v err=%v", record, err)
 	}
-	t.Log("fresh-store bootstrap replay retired the remaining root key, sudoers and sshd state with zero ordinary applies")
+	t.Log("failed reload retained the durable obligation; the next bootstrap replay retired the remaining root key, sudoers and sshd state and cleared it with zero ordinary applies")
 }
 
 func TestFirstCommitCloseoutCorruptionIsSupersededOnlyAfterCommit12169(t *testing.T) {
