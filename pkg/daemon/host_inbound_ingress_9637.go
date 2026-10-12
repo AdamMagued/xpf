@@ -280,10 +280,10 @@ func hostInboundVRFIngressPrefix(master string, slaves []string) string {
 }
 
 // hostInboundIngressDestinations returns, per family, every firewall-local
-// address the host-inbound chain must judge: each view's addresses, then the
+// address the host-inbound chain must judge: each view's addresses — including
+// withheld lifeline-shared ingress-deny values (#12229) — then the
 // addressed-but-unzoned ones (#4420), first-seen order, no duplicates. It is
-// used by unzoned and ambiguous ingress guards; ordinary zone-ingress rules
-// intentionally use only zone-owned destinations.
+// used by unzoned, ambiguous, and per-zone ingress guards.
 func hostInboundIngressDestinations(views []dpuserspace.ZoneHostInboundView, unzonedV4, unzonedV6 []string) (v4, v6 []string) {
 	seen4, seen6 := map[string]bool{}, map[string]bool{}
 	add := func(out *[]string, seen map[string]bool, addrs []string) {
@@ -297,6 +297,8 @@ func hostInboundIngressDestinations(views []dpuserspace.ZoneHostInboundView, unz
 	for _, v := range views {
 		add(&v4, seen4, v.V4Addrs)
 		add(&v6, seen6, v.V6Addrs)
+		add(&v4, seen4, v.IngressDenyV4)
+		add(&v6, seen6, v.IngressDenyV6)
 	}
 	add(&v4, seen4, unzonedV4)
 	add(&v6, seen6, unzonedV6)
@@ -337,10 +339,10 @@ func hostInboundEmitsUnzonedIngressDrop(netdevs, dests []string) bool {
 
 // emitHostInboundZoneIngress emits the #9637 ingress-zone rules for one view
 // and family. Normal rules use the view's service and protocol matches, its
-// per-zone deny counter, and every zone-owned local address. Unzoned
-// destinations are denied later by their catch-all rather than admitted by an
-// unrelated ingress zone. Ambiguous netdevs are handled separately after their
-// address-owner service admits.
+// per-zone deny counter, and every judged local address (including withheld
+// lifeline-shared values). Unzoned destinations are denied later by their
+// catch-all rather than admitted by an unrelated ingress zone. Ambiguous
+// netdevs are handled separately after their address-owner service admits.
 //
 // Junos admits host-inbound traffic by the zone of the interface it arrives on.
 // The destination-address rules alone judged a packet by the zone that owns the

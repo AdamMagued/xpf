@@ -43,6 +43,8 @@ type HostInboundZoneView struct {
 	MulticastRules       []config.HostInboundMulticastRule
 	V4Addrs              []string
 	V6Addrs              []string
+	IngressDenyV4        []string // withheld lifeline values in all ingress judgement sets
+	IngressDenyV6        []string
 	ICMPFloodThreshold   uint32
 	UDPFloodThreshold    uint32
 	SYNFloodThreshold    uint32
