@@ -21,22 +21,23 @@ import (
 
 // sessionFilter holds parsed filter criteria for session display.
 type sessionFilter struct {
-	zoneID   uint16 // 0 = any
-	zoneName string // zone filter as typed (for peer forwarding)
-	proto    uint8  // parsed protocol value
-	hasProto bool   // protocol filter is present, including protocol 0
-	srcNet   *net.IPNet
-	dstNet   *net.IPNet
-	srcPort  uint16         // 0 = any (host byte order; keys are network order)
-	dstPort  uint16         // 0 = any (host byte order; keys are network order)
-	natOnly  bool           // show only NAT sessions
-	iface    string         // ingress/egress interface name filter
-	summary  bool           // only show count
-	brief    bool           // compact tabular view
-	appName  string         // application name filter
-	sortBy   string         // "bytes" or "packets" for top-talkers
-	cfg      *config.Config // for application resolution
-	appNames map[uint16]string
+	zoneID      uint16 // 0 = any
+	zoneName    string // zone filter as typed (for peer forwarding)
+	proto       uint8  // parsed protocol value
+	hasProto    bool   // protocol filter is present, including protocol 0
+	srcNet      *net.IPNet
+	dstNet      *net.IPNet
+	srcPort     uint16         // 0 = any (host byte order; keys are network order)
+	dstPort     uint16         // 0 = any (host byte order; keys are network order)
+	natOnly     bool           // show only NAT sessions
+	iface       string         // ingress/egress interface name filter
+	summary     bool           // only show count
+	brief       bool           // compact tabular view
+	appName     string         // application name filter
+	sortBy      string         // "bytes" or "packets" for top-talkers
+	cfg         *config.Config // for application resolution
+	appNames    map[uint16]string
+	appFallback *appid.FallbackIndex
 
 	// parseErr records an operator-input error detected while
 	// parsing filter tokens (unknown protocol, missing value,
@@ -104,6 +105,9 @@ func (c *CLI) parseSessionFilterMode(args []string, clearMode bool) sessionFilte
 	cr := c.applyResult()
 	if cr != nil {
 		f.appNames = cr.AppNames
+	}
+	if f.cfg != nil {
+		f.appFallback = appid.NewFallbackIndex(f.cfg)
 	}
 	// takeValue consumes the value token for a valued keyword. A
 	// trailing keyword without a value is a parse error — historically
@@ -287,7 +291,7 @@ func (f *sessionFilter) matchesV4(key dataplane.SessionKey, val dataplane.Sessio
 		}
 	}
 	if f.appName != "" {
-		if !appid.SessionMatches(f.appName, f.appNames, f.cfg,
+		if !appid.SessionMatchesWithIndex(f.appName, f.appNames, f.cfg, f.appFallback,
 			key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID) {
 			return false
 		}
@@ -332,7 +336,7 @@ func (f *sessionFilter) matchesV6(key dataplane.SessionKeyV6, val dataplane.Sess
 		}
 	}
 	if f.appName != "" {
-		if !appid.SessionMatches(f.appName, f.appNames, f.cfg,
+		if !appid.SessionMatchesWithIndex(f.appName, f.appNames, f.cfg, f.appFallback,
 			key.Protocol, ntohs(key.SrcPort), ntohs(key.DstPort), val.AppID) {
 			return false
 		}

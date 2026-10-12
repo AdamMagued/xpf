@@ -294,9 +294,9 @@ func TestSessionsTopEnrichesOnlySurvivors(t *testing.T) {
 
 	var calls int
 	orig := resolveSessionName
-	resolveSessionName = func(appNames map[uint16]string, cfg *config.Config, proto uint8, srcPort, dstPort uint16, appID uint16) string {
+	resolveSessionName = func(appNames map[uint16]string, cfg *config.Config, fallback *appid.FallbackIndex, proto uint8, srcPort, dstPort uint16, appID uint16) string {
 		calls++
-		return appid.ResolveSessionName(appNames, cfg, proto, srcPort, dstPort, appID)
+		return appid.ResolveSessionNameWithIndex(appNames, cfg, fallback, proto, srcPort, dstPort, appID)
 	}
 	defer func() { resolveSessionName = orig }()
 

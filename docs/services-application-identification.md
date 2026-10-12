@@ -105,20 +105,23 @@ upfront what they're getting and not getting.
    winner is the more SPECIFIC one — a port-constrained entry
    (destination and/or source port set) beats a bare protocol-only
    entry — with ties broken by the lowest `app_id` within a tier.
-   Since #5296 `app_id` is a stable name-hash (`config.StableAppID`),
-   NOT the sorted-name position, so "lowest `app_id`" no longer means
-   "alphabetically-first name" — it means lowest `StableAppID`. The
-   AppID-DISABLED Go fallback (`resolveTupleFallback`, #2578) was
-   re-keyed to break same-tier ties on the SAME `StableAppID` (rather
-   than alphabetically) so the two paths still agree. This is the SAME
-   binary-specificity rule on both, so the same 5-tuple is labeled
-   identically whether AppID is on or off; the shared fixture
-   `userspace-dp/tests/fixtures/appid_precedence_v1.json` pins the
-   two paths together (Go `TestAppIDPrecedenceParityFixture` + Rust
-   `app_catalog_precedence_parity_fixture`). Before #3612 the enabled
-   path tie-broke on lowest `app_id` regardless of specificity, so a
-   broad protocol-only app could shadow a specific port-based app on
-   the enabled path only.
+   Since #5296, an assigned `app_id` is derived from `config.StableAppID`
+   unless a hash collision displaces that name. "Lowest assigned `app_id"`
+   therefore means the value from the active catalog's assignment, including
+   collision-displaced IDs — not simply the lowest natural hash. The
+   AppID-disabled Go fallback (`resolveTupleFallback`, #2578) uses its
+   AppID-off catalog's assigned IDs for same-tier ties by default. If a tie
+   has a natural-ID collision and at least one tied candidate is absent from
+   that catalog, it ranks against the full predefined-plus-user assignment
+   so an unreferenced collision partner can be accounted for (#12225). If all
+   tied candidates are catalogued, the fallback keeps the off-catalog IDs so
+   an unstamped session retains the label of an already-stamped AppID-off
+   session. The binary-specificity rule is shared across modes; the fixture
+   `userspace-dp/tests/fixtures/appid_precedence_v1.json` pins its baseline
+   cases (Go `TestAppIDPrecedenceParityFixture` + Rust
+   `app_catalog_precedence_parity_fixture`). Before #3612 the enabled path
+   tie-broke on lowest `app_id` regardless of specificity, so a broad
+   protocol-only app could shadow a specific port-based app.
 
    The omitted-protocol Junos default is TCP+UDP in both modes: the enabled
    catalog fans out to those rows, and the disabled tuple fallback applies the
@@ -126,22 +129,23 @@ upfront what they're getting and not getting.
    `TestOmittedProtocolLabelsParityAcrossAppIDKnob11816` pins TCP/UDP agreement
    and rejects other protocols.
 
-   > **Behavior change (#5296):** for a session that matches MULTIPLE
-   > overlapping same-tier catalog applications, the displayed
-   > application-name label winner changes from "alphabetically-first
-   > name" to "lowest `StableAppID`". It is deterministic and stable
-   > across reloads, and it is applied identically on the AppID-enabled
-   > (Rust) and AppID-disabled (Go) paths, so the two agree. This is a
-   > DISPLAY/log-label change only — it does NOT affect policy matching
-   > or forwarding (the policy `application` set is evaluated separately
-   > by `CompiledApplications`). To keep the enabled-path exact-port
-   > tiebreak (`AppCatalog::exact_dst` first-writer-wins) aligned with
-   > "lowest id", `BuildCatalog` now emits catalog entries in ascending
-   > `app_id` order. A zero-delta alternative that would preserve the
-   > exact alphabetical tiebreak — a classify-time `rank` field on the
-   > Go→Rust catalog snapshot (never stamped/persisted) that Rust ties
-   > on — decouples identity from precedence but is a cross-language
-   > change, tracked as a possible follow-up beyond this bounded fix.
+   > **Behavior change (#5296/#12225):** overlapping same-tier catalog
+   > applications are ranked by lowest assigned `app_id`, including
+   > collision-displaced IDs, rather than alphabetically-first name or
+   > natural hash. The AppID-disabled fallback uses the active AppID-off
+   > catalog's IDs when every tied candidate is catalogued; if a natural-ID
+   > collision and an uncatalogued tied candidate require reassignment, it
+   > uses the full predefined-plus-user catalog's IDs. This is deterministic
+   > and is a DISPLAY/log-label choice only — it does NOT affect policy
+   > matching or forwarding (the policy `application` set is evaluated
+   > separately by `CompiledApplications`). To keep the enabled-path
+   > exact-port tiebreak (`AppCatalog::exact_dst` first-writer-wins) aligned
+   > with "lowest assigned id", `BuildCatalog` emits catalog entries in
+   > ascending `app_id` order. A zero-delta alternative that would preserve
+   > the exact alphabetical tiebreak — a classify-time `rank` field on the
+   > Go→Rust catalog snapshot (never stamped/persisted) that Rust ties on —
+   > decouples identity from precedence but is a cross-language change,
+   > tracked as a possible follow-up beyond this bounded fix.
 
    **Stale-permit refresh (#12191):** an eligible local session hit that
    passes live zone-policy revalidation re-resolves the flow against the
