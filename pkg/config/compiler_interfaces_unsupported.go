@@ -405,8 +405,9 @@ func isInterfaceFilterConsumerPath12090(ancestors []*Node) bool {
 }
 
 // isInterfaceDirectFilterConsumerPath12090 limits the direct-name exemption
-// beneath a braced unit identity to the braced filter-child spelling. The
-// compiler populates hooks for `filter { input f; }`, not packed `filter input f;`.
+// beneath a braced unit identity to braced filter-child spellings. The
+// compiler also consumes #12093 scalar block values such as `input { f; }`,
+// but not packed `filter input f;`.
 func isInterfaceDirectFilterConsumerPath12090(ancestors []*Node, filter *Node) bool {
 	if !isInterfaceFilterConsumerPath12090(ancestors) {
 		return false
@@ -415,31 +416,32 @@ func isInterfaceDirectFilterConsumerPath12090(ancestors []*Node, filter *Node) b
 	return ok && (familyIndex != 3 || isInterfaceBracedFilterConsumer12090(filter))
 }
 
-// isInterfaceBracedFilterConsumer12090 accepts only filter-child shapes that
-// compileInterfaces reads. The braced unit-identity path bypasses the #10293
-// family-level list check, so every child must be one valued input/output
-// leaf, with no duplicate direction or ignored child.
+// isInterfaceBracedFilterConsumer12090 accepts the filter-child shapes that
+// compileInterfaces reads. Master #12093 defines `input { f; }` as a scalar
+// block value, and compileInterfaces iterates repeated directions in order,
+// making the last binding effective.
 func isInterfaceBracedFilterConsumer12090(filter *Node) bool {
 	if filter == nil || len(filter.Keys) != 1 || len(filter.Children) == 0 {
 		return false
 	}
-	seenInput, seenOutput := false, false
 	for _, child := range filter.Children {
-		if child == nil || len(child.Keys) != 2 || child.Keys[1] == "" ||
-			len(child.Children) != 0 || !child.IsLeaf {
+		if child == nil {
 			return false
 		}
 		switch child.Name() {
-		case "input":
-			if seenInput {
+		case "input", "output":
+		default:
+			return false
+		}
+		switch len(child.Keys) {
+		case 1:
+			if _, ok := singleBlockValue(child); !ok {
 				return false
 			}
-			seenInput = true
-		case "output":
-			if seenOutput {
+		case 2:
+			if child.Keys[1] == "" || len(child.Children) != 0 || !child.IsLeaf {
 				return false
 			}
-			seenOutput = true
 		default:
 			return false
 		}

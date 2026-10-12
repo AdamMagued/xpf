@@ -539,6 +539,69 @@ func TestForwardingOptionsFilterLenientWarns12090(t *testing.T) {
 		})
 	}
 }
+
+func TestDeepPackedFilterPositionsRemainRejected12090(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		text string
+	}{
+		{
+			name: "B04-family-mtu-deep-filter",
+			text: "interfaces { ge-0/0/0 { unit 0 { family inet mtu 1400 filter input f; } } }",
+		},
+		{
+			name: "Y01-sampling-unknown-child-filter",
+			text: "forwarding-options { sampling { instance s { bogus { filter { input f; } } } } }",
+		},
+		{
+			name: "Y03-relay-identity-named-interface-filter-child",
+			text: "forwarding-options { dhcp-relay { server-group sg { 10.0.0.1; } group { interface { active-server-group sg; interface ge-0/0/0.0; filter { input f; } } } } }",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := CompileConfig(hierTree(t, tc.text))
+			if err == nil || !strings.Contains(err.Error(), "#12090") ||
+				!strings.Contains(err.Error(), "filter input") {
+				t.Fatalf("%s must be rejected by #12090, got %v", tc.name, err)
+			}
+		})
+	}
+}
+
+func TestBracedFilterConsumerPredicateRejectsNonConsumerAST12090(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		filter *Node
+	}{
+		{
+			name: "M1-extra-value-key",
+			filter: &Node{Keys: []string{"filter"}, Children: []*Node{
+				{Keys: []string{"input", "f", "g"}, IsLeaf: true},
+			}},
+		},
+		{
+			name: "M2-variant-unknown-direction",
+			filter: &Node{Keys: []string{"filter"}, Children: []*Node{
+				{Keys: []string{"bogus", "f"}, IsLeaf: true},
+			}},
+		},
+		{
+			name: "M5-nested-valued-child",
+			filter: &Node{Keys: []string{"filter"}, Children: []*Node{
+				{Keys: []string{"input", "f"}, Children: []*Node{
+					{Keys: []string{"x"}, IsLeaf: true},
+				}},
+			}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if isInterfaceBracedFilterConsumer12090(tc.filter) {
+				t.Fatalf("%s AST has no interface filter consumer but was accepted", tc.name)
+			}
+		})
+	}
+}
+
 func TestPhysicalFamilyFilterInterfaceRangeShapes12090(t *testing.T) {
 	shapes := []struct {
 		name string

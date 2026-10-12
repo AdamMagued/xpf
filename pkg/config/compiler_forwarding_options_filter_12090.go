@@ -29,8 +29,7 @@ func validateUnsupportedForwardingOptionsFiltersAST(nodes []*Node, lenient bool)
 		if isApplyStatementKeyword(n.Name()) {
 			return nil
 		}
-		instanceName := isIdentity || isDHCPRelayInstanceName12090(n, ancestors)
-		if !instanceName && (n.Name() == "filter" || n.Name() == "simple-filter") {
+		if !isIdentity && (n.Name() == "filter" || n.Name() == "simple-filter") {
 			if err := emit(filterKeywordLabel12090(n)); err != nil {
 				return err
 			}
@@ -65,22 +64,4 @@ func validateUnsupportedForwardingOptionsFiltersAST(nodes []*Node, lenient bool)
 		}
 	}
 	return warnings, nil
-}
-
-func isDHCPRelayInstanceName12090(n *Node, ancestors []*Node) bool {
-	if n == nil || (n.Name() != "filter" && n.Name() != "simple-filter") ||
-		len(ancestors) < 3 {
-		return false
-	}
-	parent := ancestors[len(ancestors)-1]
-	if (parent.Name() != "server-group" && parent.Name() != "group") ||
-		len(parent.Keys) != 1 {
-		return false
-	}
-	for i := len(ancestors) - 2; i >= 0; i-- {
-		if ancestors[i].Name() == "dhcp-relay" {
-			return true
-		}
-	}
-	return false
 }

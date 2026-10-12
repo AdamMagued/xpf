@@ -12,58 +12,73 @@ func TestBracedFilterSchemaSlotsReject12090(t *testing.T) {
 	cases := []struct {
 		name string
 		text string
+		// wantGate selects the rejection gate. "#12090" pins the #12090
+		// silent-drop gate; "" accepts any gate, requiring only that the
+		// config is rejected and no filter hook is consumed. The two
+		// arity-violating cells use "" because master #12093 made the
+		// inet/inet6 `filter input|output` leaves scalar+blockValue, so
+		// validateScalarValueLeaf rejects them before the #12090 prewalk
+		// gate runs. Both spellings still fail closed either way.
+		wantGate string
 	}{
 		{
-			name: "interface-unit-identity",
-			text: "interfaces { ge-0/0/0 { unit { 0 filter input f; } } }",
+			name:     "interface-unit-identity",
+			text:     "interfaces { ge-0/0/0 { unit { 0 filter input f; } } }",
+			wantGate: "#12090",
 		},
 		{
-			name: "sampling-instance-identity",
-			text: "forwarding-options { sampling { instance { s filter input f; } } }",
+			name:     "sampling-instance-identity",
+			text:     "forwarding-options { sampling { instance { s filter input f; } } }",
+			wantGate: "#12090",
 		},
 		{
-			name: "relay-group-identity",
-			text: "forwarding-options { dhcp-relay { server-group sg { 10.0.0.1; } group { lan filter input f; lan { active-server-group sg; interface ge-0/0/0.0; } } } }",
+			name:     "relay-group-identity",
+			text:     "forwarding-options { dhcp-relay { server-group sg { 10.0.0.1; } group { lan filter input f; lan { active-server-group sg; interface ge-0/0/0.0; } } } }",
+			wantGate: "#12090",
 		},
 		{
-			name: "relay-group-filter-named-packed-filter",
-			text: "forwarding-options { dhcp-relay { server-group sg { 10.0.0.1; } group { filter filter input f; filter { active-server-group sg; interface ge-0/0/0.0; } } } }",
+			name:     "relay-group-filter-named-packed-filter",
+			text:     "forwarding-options { dhcp-relay { server-group sg { 10.0.0.1; } group { filter filter input f; filter { active-server-group sg; interface ge-0/0/0.0; } } } }",
+			wantGate: "#12090",
 		},
 		{
-			name: "relay-group-simple-filter-named-packed-simple-filter",
-			text: "forwarding-options { dhcp-relay { server-group sg { 10.0.0.1; } group { simple-filter simple-filter input f; simple-filter { active-server-group sg; interface ge-0/0/0.0; } } } }",
+			name:     "relay-group-simple-filter-named-packed-simple-filter",
+			text:     "forwarding-options { dhcp-relay { server-group sg { 10.0.0.1; } group { simple-filter simple-filter input f; simple-filter { active-server-group sg; interface ge-0/0/0.0; } } } }",
+			wantGate: "#12090",
 		},
 		{
-			name: "flat-unit-control",
-			text: "interfaces { ge-0/0/0 { unit 0 filter input f; } }",
+			name:     "flat-unit-control",
+			text:     "interfaces { ge-0/0/0 { unit 0 filter input f; } }",
+			wantGate: "#12090",
 		},
 		{
-			name: "fully-braced-unit-control",
-			text: "interfaces { ge-0/0/0 { unit { 0 { filter input f; } } } }",
+			name:     "fully-braced-unit-control",
+			text:     "interfaces { ge-0/0/0 { unit { 0 { filter input f; } } } }",
+			wantGate: "#12090",
 		},
 		{
-			name: "flat-instance-control",
-			text: "forwarding-options { sampling { instance s filter input f; } }",
+			name:     "flat-instance-control",
+			text:     "forwarding-options { sampling { instance s filter input f; } }",
+			wantGate: "#12090",
 		},
 		{
-			name: "fully-braced-instance-control",
-			text: "forwarding-options { sampling { instance { s { filter input f; } } } }",
+			name:     "fully-braced-instance-control",
+			text:     "forwarding-options { sampling { instance { s { filter input f; } } } }",
+			wantGate: "#12090",
 		},
 		{
-			name: "relay-filter-child-control",
-			text: "forwarding-options { dhcp-relay { server-group sg { 10.0.0.1; } group lan { active-server-group sg; interface ge-0/0/0.0; filter { input f; } } } }",
+			name:     "relay-filter-child-control",
+			text:     "forwarding-options { dhcp-relay { server-group sg { 10.0.0.1; } group lan { active-server-group sg; interface ge-0/0/0.0; filter { input f; } } } }",
+			wantGate: "#12090",
 		},
 		{
 			name: "braced-unit-filter-input-list-value",
 			text: "interfaces { ge-0/0/0 { unit { 0 { family inet { filter { input [ f g ]; } } } } } }",
 		},
 		{
-			name: "braced-unit-filter-duplicate-input",
-			text: "interfaces { ge-0/0/0 { unit { 0 { family inet { filter { input f; input g; } } } } } }",
-		},
-		{
-			name: "braced-unit-empty-filter",
-			text: "interfaces { ge-0/0/0 { unit { 0 { family inet { filter; } } } } }",
+			name:     "braced-unit-filter-empty-m2-variant",
+			text:     "interfaces { ge-0/0/0 { unit { 0 { family inet { filter; } } } } }",
+			wantGate: "#12090",
 		},
 		{
 			name: "braced-unit-filter-valued-input-child",
@@ -73,8 +88,15 @@ func TestBracedFilterSchemaSlotsReject12090(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := CheckText(tc.text, -1); err == nil || !strings.Contains(err.Error(), "#12090") {
-				t.Fatalf("CheckText error = %v; want #12090 rejection", err)
+			cfg, err := CheckText(tc.text, -1)
+			if err == nil {
+				t.Fatal("CheckText accepted unsupported or malformed filter")
+			}
+			if cfg != nil {
+				t.Fatalf("CheckText returned compiled config after rejection: %#v", cfg)
+			}
+			if tc.wantGate != "" && !strings.Contains(err.Error(), tc.wantGate) {
+				t.Fatalf("CheckText error = %v; want %q rejection", err, tc.wantGate)
 			}
 
 			tree, parseErrors := config.NewParser(tc.text).Parse()
@@ -104,8 +126,8 @@ func TestBracedFilterSchemaSlotsReject12090(t *testing.T) {
 			if err := store.LoadOverride(tc.text); err != nil {
 				t.Fatalf("LoadOverride: %v", err)
 			}
-			if _, err := store.Commit(); err == nil || !strings.Contains(err.Error(), "#12090") {
-				t.Fatalf("Store Commit error = %v; want #12090 rejection", err)
+			if _, err := store.Commit(); err == nil {
+				t.Fatal("Store Commit accepted unsupported or malformed filter")
 			}
 		})
 	}
@@ -149,6 +171,87 @@ func TestBracedUnitIdentityFilterConsumersRetainHooks12090(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+func TestBracedUnitIdentityBlockValueAndRepeatedFilterConsumers12090(t *testing.T) {
+	firewall := "firewall { family inet { filter f { term t { then accept; } } " +
+		"filter g { term t { then accept; } } } " +
+		"family inet6 { filter f { term t { then accept; } } " +
+		"filter f6 { term t { then accept; } } } } "
+	cases := []struct {
+		name, family, direction, binding, want string
+	}{
+		{
+			name:      "block-value-input",
+			family:    "inet",
+			direction: "input",
+			binding:   "family inet { filter { input { f; } } }",
+			want:      "f",
+		},
+		{
+			name:      "repeated-input-last-wins",
+			family:    "inet",
+			direction: "input",
+			binding:   "family inet { filter { input f; input g; } }",
+			want:      "g",
+		},
+		{
+			name:      "repeated-inet6-output-last-wins",
+			family:    "inet6",
+			direction: "output",
+			binding:   "family inet6 { filter { output f; output f6; } }",
+			want:      "f6",
+		},
+		{
+			name:      "split-family-repeated-input-last-wins",
+			family:    "inet",
+			direction: "input",
+			binding:   "family { inet { filter { input f; input g; } } }",
+			want:      "g",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			text := firewall + "interfaces { ge-0/0/0 { unit { 0 { " +
+				tc.binding + " } } } }"
+			compiled, err := CheckText(text, -1)
+			if err != nil {
+				t.Fatalf("CheckText rejected consumed %s filter: %v", tc.name, err)
+			}
+			unit := compiled.Interfaces.Interfaces["ge-0/0/0"].Units[0]
+			var got string
+			switch {
+			case tc.family == "inet" && tc.direction == "input":
+				got = unit.FilterInputV4
+			case tc.family == "inet" && tc.direction == "output":
+				got = unit.FilterOutputV4
+			case tc.family == "inet6" && tc.direction == "input":
+				got = unit.FilterInputV6
+			case tc.family == "inet6" && tc.direction == "output":
+				got = unit.FilterOutputV6
+			}
+			if got != tc.want {
+				t.Fatalf("%s hook = %q, want last consumed value %q", tc.name, got, tc.want)
+			}
+			for _, warning := range compiled.Warnings {
+				if strings.Contains(warning, "#12090") {
+					t.Fatalf("consumed filter emitted #12090 warning: %q", warning)
+				}
+			}
+
+			store := newTestStoreAt(t, filepath.Join(t.TempDir(), "xpf.conf"))
+			if err := store.EnterConfigure(); err != nil {
+				t.Fatalf("EnterConfigure: %v", err)
+			}
+			defer store.ExitConfigure()
+			if err := store.LoadOverride(text); err != nil {
+				t.Fatalf("LoadOverride: %v", err)
+			}
+			if _, err := store.Commit(); err != nil {
+				t.Fatalf("Store Commit rejected consumed %s filter: %v", tc.name, err)
+			}
+		})
 	}
 }
 
