@@ -3,6 +3,7 @@ package upgrade
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -509,10 +510,12 @@ func (r *Runner) Run(opts Options) (err error) {
 		// before persisting STAGED. Otherwise a clean envelope refusal would
 		// leave an in-flight journal that blocks operator rollback.
 		if err := r.validateForwardEnvelopeCompatibility(stagedVer, stagedXpfd); err != nil {
+			refusal := &forwardEnvelopeGateRefusal{phase: "PREFLIGHT", err: err}
 			if cerr := r.clearJournal(); cerr != nil {
 				r.logf("upgrade: WARN clear stale journal on envelope refuse: %v", cerr)
+				return fmt.Errorf("%w; failed to clear stale journal: %v", refusal, cerr)
 			}
-			return fmt.Errorf("refuse-before-PREFLIGHT: %w", err)
+			return refusal
 		}
 		j.TargetVersion = stagedVer
 		// Record the RESTORABLE current, not the raw basename: a dangling /
@@ -563,9 +566,10 @@ func (r *Runner) Run(opts Options) (err error) {
 	// ---- PREFLIGHT (pure) ----
 	if !j.State.atLeast(StatePreflight) {
 		if err := r.preflight(j); err != nil {
-			if _, ok := err.(*forwardEnvelopeGateRefusal); ok {
+			if isForwardEnvelopeGateRefusal(err) {
 				if cerr := r.clearJournal(); cerr != nil {
 					r.logf("upgrade: WARN clear journal on resumed envelope refuse: %v", cerr)
+					return fmt.Errorf("preflight: %w; failed to clear refusal journal: %v", err, cerr)
 				}
 			}
 			return fmt.Errorf("preflight: %w", err)
@@ -726,7 +730,12 @@ func (r *Runner) Run(opts Options) (err error) {
 	if !j.State.atLeast(StateStopped) {
 		if err := r.validateForwardEnvelopeCompatibility(j.TargetVersion,
 			filepath.Join(r.versionDir(j.TargetVersion), "xpfd")); err != nil {
-			return fmt.Errorf("refuse-before-STOP: %w", err)
+			refusal := &forwardEnvelopeGateRefusal{phase: "STOP", err: err}
+			if cerr := r.clearJournal(); cerr != nil {
+				r.logf("upgrade: WARN clear journal on pre-STOP envelope refuse: %v", cerr)
+				return fmt.Errorf("%w; failed to clear refusal journal: %v", refusal, cerr)
+			}
+			return refusal
 		}
 		// A committed predecessor reused as the staged target remains a
 		// rollback candidate until the final live-DB gate passes.
@@ -933,14 +942,22 @@ func firstNonNil(errs ...error) error {
 var statConfigDBDir = os.Stat
 
 type forwardEnvelopeGateRefusal struct {
-	err error
+	phase string
+	err   error
 }
 
 func (e *forwardEnvelopeGateRefusal) Error() string {
-	return "refuse-before-PREFLIGHT: " + e.err.Error()
+	return fmt.Sprintf("refuse-before-%s: %v; the unit was not stopped; re-stage an "+
+		"envelope-compatible target or run `xpfd upgrade --rollback "+
+		"[--target <compatible-version>]` after this refusal journal is cleared", e.phase, e.err)
 }
 
 func (e *forwardEnvelopeGateRefusal) Unwrap() error { return e.err }
+
+func isForwardEnvelopeGateRefusal(err error) bool {
+	var refusal *forwardEnvelopeGateRefusal
+	return errors.As(err, &refusal)
+}
 
 // preflight checks disk space (incl. the rollback DB snapshot), GCs
 // eligible versions if short, and takes the pre-upgrade DB snapshot. Pure:
@@ -948,7 +965,7 @@ func (e *forwardEnvelopeGateRefusal) Unwrap() error { return e.err }
 func (r *Runner) preflight(j *Journal) error {
 	if err := r.validateForwardEnvelopeCompatibility(j.TargetVersion,
 		filepath.Join(r.sourceDir(j), "xpfd")); err != nil {
-		return &forwardEnvelopeGateRefusal{err: err}
+		return &forwardEnvelopeGateRefusal{phase: "PREFLIGHT", err: err}
 	}
 	if err := fsatomic.MkdirAllDurable(r.cfg.VersionsDir, 0755); err != nil {
 		return fmt.Errorf("create versions dir: %w", err)
@@ -1197,6 +1214,19 @@ func (r *Runner) copyStaged(j *Journal) error {
 		// Stale non-live: reuse the proven guarded delete, then recopy.
 		r.logf("upgrade: replacing stale version dir %s (source generation %q -> %q)",
 			dst, existingGen, j.SourceGeneration)
+		if preservedPredecessorStamp != nil {
+			mismatch, merr := r.mismatchedManagedBinary(ver, srcDir)
+			if merr != nil {
+				return fmt.Errorf("verify committed predecessor %s before replace: %w", ver, merr)
+			}
+			if mismatch != "" {
+				if err := r.stampInFlightVersion(ver); err != nil {
+					return fmt.Errorf("mark changed predecessor %s non-committed before replace: %w",
+						ver, err)
+				}
+				preservedPredecessorStamp = nil
+			}
+		}
 		if rerr := r.removeStaleVersionDir(ver); rerr != nil {
 			return rerr
 		}
@@ -1263,26 +1293,36 @@ func (r *Runner) copyStaged(j *Journal) error {
 // its bytes survived; every managed binary (including the non-lockstep
 // cli/day0-config the flip repoints) is hash-compared staged-vs-versioned.
 func (r *Runner) verifyVersionDirMatchesStaged(ver, srcDir string) error {
+	mismatch, err := r.mismatchedManagedBinary(ver, srcDir)
+	if err != nil {
+		return err
+	}
+	if mismatch != "" {
+		return fmt.Errorf("REFUSE: version dir %s binary %s differs from pinned staged source %s "+
+			"(bitrot, tamper, or same-stamp restage); re-stage under a DISTINCT version tag",
+			r.versionDir(ver), mismatch, srcDir)
+	}
+	return nil
+}
+
+// mismatchedManagedBinary compares each managed binary across a version dir
+// and its pinned source, returning the first name with different bytes.
+func (r *Runner) mismatchedManagedBinary(ver, srcDir string) (string, error) {
 	dst := r.versionDir(ver)
-	// Both trees carry the binaries FLAT by Name (the staged dir is what the
-	// deb installed; manifest StagedSrc is the repo-relative build path, not
-	// the staged layout).
 	for _, name := range manifest.Names() {
 		want, err := fileSHA256Hex(filepath.Join(srcDir, name))
 		if err != nil {
-			return fmt.Errorf("hash staged %s: %w", name, err)
+			return "", fmt.Errorf("hash staged %s: %w", name, err)
 		}
 		got, err := fileSHA256Hex(filepath.Join(dst, name))
 		if err != nil {
-			return fmt.Errorf("hash version-dir %s: %w", name, err)
+			return "", fmt.Errorf("hash version-dir %s: %w", name, err)
 		}
 		if want != got {
-			return fmt.Errorf("REFUSE: version dir %s binary %s differs from pinned staged source %s "+
-				"(bitrot, tamper, or same-stamp restage); re-stage under a DISTINCT version tag",
-				dst, name, srcDir)
+			return name, nil
 		}
 	}
-	return nil
+	return "", nil
 }
 
 func fileSHA256Hex(path string) (string, error) {

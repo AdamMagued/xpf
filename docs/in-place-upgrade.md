@@ -316,6 +316,16 @@ roll forward or re-stage an envelope-compatible target. The daemon's existing
 fail-closed envelope check remains the backstop for hand-driven flips and
 stale journals; rollback never migrates or discards envelope fields.
 
+Forward cuts also refuse an incompatible envelope before `STOP`: the staged
+reader is checked at INIT and rechecked after VERIFY. A refusal leaves the
+daemon running and clears the cut journal before returning; a journal-clear
+failure is surfaced in the error. After a successful clear, a rerun or
+`xpfd upgrade --rollback [--target <version>]` is not blocked by stale cut
+state; rollback still requires a compatible snapshot and target. When a
+same-tag cut replaces the committed predecessor, its committed stamp is
+preserved only if all managed binaries match the pinned source; changed bytes
+are marked non-committed before the replacement.
+
 Booting from a text config such as `/etc/xpf/xpf.conf` after removing the
 config DB is **not** a rollback success: it does not restore the committed DB
 or prove forwarding. Restore the compatible snapshot and complete the guarded
