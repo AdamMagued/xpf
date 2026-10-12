@@ -263,3 +263,174 @@ func TestFirstCommitRetryPublishesSentinelBeforeActiveMarker12382(t *testing.T) 
 		t.Fatalf("failed sentinel attempt: intent retained=%v degraded=%v, want both true", intentRetained, degraded)
 	}
 }
+
+// TestFirstCommitPlainCommitSupersedesOwedIntent12382 (F1/N1): a durable plain
+// `commit` after BOOTSTRAP supersedes the owed FIRST-rollback intent. A later
+// post-rename commit plus the degraded retry must not resurrect the stale
+// record, and a later boot must keep the committed config. Pins the
+// clearConfirmResolutionPendingLocked intent clear, the only path that
+// discards the intent for plain commits.
+func TestFirstCommitPlainCommitSupersedesOwedIntent12382(t *testing.T) {
+	for _, tc := range []struct{ name, host string }{
+		{"DifferentContent", "PlainB"},
+		{"SameContent", "FirstWindow"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path, recovered, now, heal := bootWithFailedFirstSentinel12382(t, time.Hour)
+			heal()
+			*now = now.Add(time.Minute)
+			recovered.mu.Lock()
+			intent := recovered.firstCommitRecoveryIntent
+			recovered.mu.Unlock()
+			if intent == nil {
+				t.Fatal("PREMISE: no FIRST-rollback intent owed after failed sentinel boot")
+			}
+			if err := recovered.EnterConfigure(); err != nil {
+				t.Fatal(err)
+			}
+			if err := recovered.SetFromInput("system host-name " + tc.host); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := recovered.Commit(); err != nil {
+				t.Fatalf("Commit: %v", err)
+			}
+			recovered.mu.Lock()
+			sameHash := guardedConfigHash(recovered.active) == intent.GuardedHash
+			intentSurvived := recovered.firstCommitRecoveryIntent != nil
+			recovered.mu.Unlock()
+			if tc.name == "SameContent" && !sameHash {
+				t.Fatal("PREMISE: same-content commit did not restore the abandoned FIRST config")
+			}
+			if tc.name == "DifferentContent" && sameHash {
+				t.Fatal("PREMISE: different-content commit unexpectedly matches the abandoned guard")
+			}
+			if intentSurvived {
+				t.Error("owed FIRST intent survived a durable plain commit")
+			}
+			if rec, err := recovered.db.ReadConfirm(); err != nil || rec != nil {
+				t.Fatalf("record after durable plain commit: %+v err=%v", rec, err)
+			}
+			// A later commit hits a post-rename dir-fsync failure; the retry
+			// heal must converge the active write without replaying the intent.
+			recovered.SetWriteActiveForTesting(postRenameFailingWriteActive(recovered))
+			if _, err := recovered.Commit(); err != nil {
+				t.Fatalf("later Commit: %v", err)
+			}
+			if !recovered.ConfigPersistDegraded() {
+				t.Fatal("PREMISE: later Commit did not hit the post-rename failure")
+			}
+			recovered.ExitConfigure()
+			recovered.SetWriteActiveForTesting(nil)
+			recovered.mu.Lock()
+			recovered.retryActiveConfigPersistLocked(time.Hour)
+			recovered.mu.Unlock()
+			if recovered.ConfigPersistDegraded() {
+				t.Fatal("retry step did not heal")
+			}
+			if rec, err := recovered.db.ReadConfirm(); err != nil || rec != nil {
+				t.Fatalf("stale record resurrected by retry: %+v err=%v", rec, err)
+			}
+			if _, err := os.Stat(recovered.db.confirmPath()); !os.IsNotExist(err) {
+				t.Fatalf("confirm.json present after retry heal: %v", err)
+			}
+
+			*now = time.Date(2030, 6, 1, 0, 0, 0, 0, time.UTC) // weeks later, clock correct
+			later := newTestStoreAt(t, path)
+			later.SetPersistRetryBackoffForTesting(time.Hour, time.Hour)
+			if err := later.Load(); err != nil {
+				t.Fatalf("later Load: %v", err)
+			}
+			t.Cleanup(later.CancelConfirmTimerForTesting)
+			host := ""
+			if cfg := later.ActiveConfig(); cfg != nil {
+				host = cfg.System.HostName
+			}
+			if host != tc.host || later.IsConfirmPending() {
+				t.Errorf("reboot host=%q pending=%v, want %q standing with no window", host, later.IsConfirmPending(), tc.host)
+			}
+		})
+	}
+}
+
+// TestFirstCommitSyncSupersedesOwedIntent12382 (F1/N1): a durable HA SyncApply
+// after BOOTSTRAP supersedes the owed FIRST-rollback intent, including a
+// same-content re-apply of the abandoned config. A later post-rename sync
+// plus the degraded retry must not resurrect the stale record, and a later
+// boot must keep the synced config. Pins the
+// clearConfirmResolutionPendingLocked intent clear, the only path that
+// discards the intent for syncs.
+func TestFirstCommitSyncSupersedesOwedIntent12382(t *testing.T) {
+	for _, tc := range []struct{ name, host string }{
+		{"DifferentContent", "SyncS"},
+		{"SameContent", "FirstWindow"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path, recovered, now, heal := bootWithFailedFirstSentinel12382(t, time.Hour)
+			heal()
+			*now = now.Add(time.Minute)
+			recovered.mu.Lock()
+			intent := recovered.firstCommitRecoveryIntent
+			recovered.mu.Unlock()
+			if intent == nil {
+				t.Fatal("PREMISE: no FIRST-rollback intent owed after failed sentinel boot")
+			}
+			content := "system {\n    host-name " + tc.host + ";\n}\n"
+			if _, err := recovered.SyncApply(content, nil); err != nil {
+				t.Fatalf("SyncApply: %v", err)
+			}
+			recovered.mu.Lock()
+			sameHash := guardedConfigHash(recovered.active) == intent.GuardedHash
+			intentSurvived := recovered.firstCommitRecoveryIntent != nil
+			recovered.mu.Unlock()
+			if tc.name == "SameContent" && !sameHash {
+				t.Fatal("PREMISE: same-content sync did not restore the abandoned FIRST config")
+			}
+			if tc.name == "DifferentContent" && sameHash {
+				t.Fatal("PREMISE: different-content sync unexpectedly matches the abandoned guard")
+			}
+			if intentSurvived {
+				t.Error("owed FIRST intent survived a durable sync")
+			}
+			if rec, err := recovered.db.ReadConfirm(); err != nil || rec != nil {
+				t.Fatalf("record after durable sync: %+v err=%v", rec, err)
+			}
+			// A later sync hits a post-rename dir-fsync failure; the retry
+			// heal must converge the active write without replaying the intent.
+			recovered.SetWriteActiveForTesting(postRenameFailingWriteActive(recovered))
+			if _, err := recovered.SyncApply(content, nil); err != nil {
+				t.Fatalf("later SyncApply: %v", err)
+			}
+			if !recovered.ConfigPersistDegraded() {
+				t.Fatal("PREMISE: later SyncApply did not hit the post-rename failure")
+			}
+			recovered.SetWriteActiveForTesting(nil)
+			recovered.mu.Lock()
+			recovered.retryActiveConfigPersistLocked(time.Hour)
+			recovered.mu.Unlock()
+			if recovered.ConfigPersistDegraded() {
+				t.Fatal("retry step did not heal")
+			}
+			if rec, err := recovered.db.ReadConfirm(); err != nil || rec != nil {
+				t.Fatalf("stale record resurrected by retry: %+v err=%v", rec, err)
+			}
+			if _, err := os.Stat(recovered.db.confirmPath()); !os.IsNotExist(err) {
+				t.Fatalf("confirm.json present after retry heal: %v", err)
+			}
+
+			*now = time.Date(2030, 6, 1, 0, 0, 0, 0, time.UTC) // weeks later, clock correct
+			later := newTestStoreAt(t, path)
+			later.SetPersistRetryBackoffForTesting(time.Hour, time.Hour)
+			if err := later.Load(); err != nil {
+				t.Fatalf("later Load: %v", err)
+			}
+			t.Cleanup(later.CancelConfirmTimerForTesting)
+			host := ""
+			if cfg := later.ActiveConfig(); cfg != nil {
+				host = cfg.System.HostName
+			}
+			if host != tc.host || later.IsConfirmPending() {
+				t.Errorf("reboot host=%q pending=%v, want %q standing with no window", host, later.IsConfirmPending(), tc.host)
+			}
+		})
+	}
+}

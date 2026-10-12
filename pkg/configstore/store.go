@@ -1199,7 +1199,7 @@ func (s *Store) SyncApply(content string, chassisPreserve func(*config.ConfigTre
 			// convergence — so consume any stale defer without a second
 			// attempt (and second confirm_remove_error journal) for it.
 			s.confirmResolvePendingPersist = false
-			// The synced replacement is durable; discard the older FIRST intent.
+			// The synced replacement is durable; clear the older FIRST intent as defense in depth.
 			s.firstCommitRecoveryIntent = nil
 		} else {
 			// Finalize any removal deferred by an EARLIER failed resolution

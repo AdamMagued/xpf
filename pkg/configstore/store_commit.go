@@ -1320,7 +1320,7 @@ func (s *Store) PromoteRollback(gen uint64) (prevCfg *config.Config, ok bool) {
 		// now-no-op rollback to the already-persisted target).
 		s.persistDegraded = false
 		s.confirmResolvePendingPersist = false
-		// The durable target also supersedes any older FIRST-rollback sentinel.
+		// Defense in depth; clearConfirmResolutionPendingLocked is the primary clear.
 		s.firstCommitRecoveryIntent = nil
 		// #5835: removal is durable-or-retry — a failed DeleteConfirm retains
 		// retry debt + degraded health rather than being swallowed, so a crash
