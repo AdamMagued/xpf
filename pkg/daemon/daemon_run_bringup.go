@@ -524,9 +524,10 @@ func (d *Daemon) loadAndBootstrapConfig() (bool, error) {
 // sensitive dataplane-arming path. The resolver injection in initManagers
 // (called before this) precedes the dataplane Start here, and the dataplane is
 // loaded before the first applyConfig; order is preserved by calling this in
-// the same Run() slot right after initManagers. Returns a non-nil error only
-// on a fatal dataplane-create failure (the block's sole early return), which
-// Run propagates unchanged.
+// the same Run() slot right after initManagers. It has two early returns,
+// both propagated unchanged by Run: a fatal dataplane-create failure, and a
+// first-commit host-auth replay failure (a corrupt never-committed record, or
+// a delete/fsync failure clearing a superseded record on a committed box).
 // setupDataplaneAndInitialConfig loads the dataplane and runs the boot config
 // apply. The dataplane runtime (dp.Start) binds to d.daemonCtx — the RAW,
 // signal-uncancelled daemon-lifetime parent (mirroring the bootstrap-exit
@@ -534,62 +535,6 @@ func (d *Daemon) loadAndBootstrapConfig() (bool, error) {
 // the runtime live for logFinalStats (dp.Telemetry) and the HA rg_active clear
 // (dp.HA) during teardown, so a startup signal aborts at the phase boundary
 // rather than tearing the runtime out from under the teardown (#5807).
-// replayFirstCommitHostAuthCloseout12169 resumes a first-commit rollback's
-// durable host-auth retirement obligation after a process crash. A pending
-// confirm remains authoritative. Otherwise, an ever-committed active config
-// supersedes the obligation and clears it before record parsing; only a
-// never-committed bootstrap parses and replays the first-commit record.
-func (d *Daemon) replayFirstCommitHostAuthCloseout12169() error {
-	if d.store == nil {
-		return nil
-	}
-	if d.store.IsConfirmPending() {
-		// A crash before PromoteRollback leaves the durable confirm window
-		// authoritative; its timer will execute the rollback transaction.
-		return nil
-	}
-	if d.store.EverCommitted() {
-		// No first-commit rollback can be pending on a committed box. Clear
-		// the superseded record without parsing it: its generation is no
-		// longer relevant, and corruption must not block committed startup.
-		return d.store.ClearSupersededFirstCommitHostAuthCloseout()
-	}
-
-	record, err := d.store.PendingFirstCommitHostAuthCloseout()
-	if err != nil {
-		return err
-	}
-	if record == nil {
-		return nil
-	}
-
-	if err := d.applyBootstrapHostAuthorizationCloseout(nil); err != nil {
-		// Keep the record for the next boot: a closeout owner or guard did
-		// not converge, so deleting the only crash-recovery intent would
-		// turn visible degradation into permanent credential residue.
-		slog.Error("bootstrap replay of first-commit host-auth closeout is DEGRADED; retirement will retry on next boot",
-			"generation", record.Generation, "err", err)
-		return nil
-	}
-	// The record has no per-owner progress marker. A crash can happen after the
-	// drop-in unlink but before sshd reload, so every successful replay must
-	// reload sshd before it can clear the only durable obligation. Repeated
-	// reloads are idempotent and cover the unlink/reload crash boundary.
-	out, reloadErr := sshdReloadCmd()
-	d.noteSSHDReloadResult(reloadErr)
-	if reloadErr != nil {
-		slog.Error("bootstrap replay could not reload sshd; retirement will retry on next boot",
-			"generation", record.Generation, "err", reloadErr,
-			"output", strings.TrimSpace(string(out)))
-		return nil
-	}
-	if err := d.store.CompleteFirstCommitHostAuthCloseout(record.Generation); err != nil {
-		slog.Error("first-commit host-auth closeout replay converged but its durable obligation could not be cleared",
-			"generation", record.Generation, "err", err)
-	}
-	return nil
-}
-
 func (d *Daemon) setupDataplaneAndInitialConfig() error {
 	if err := d.replayFirstCommitHostAuthCloseout12169(); err != nil {
 		return fmt.Errorf("replay first-commit host-auth closeout: %w", err)
@@ -734,6 +679,62 @@ func (d *Daemon) setupDataplaneAndInitialConfig() error {
 	// cluster comms start (which may inject new ones).
 	if d.cluster != nil {
 		d.reconcileBlackholeRoutes()
+	}
+	return nil
+}
+
+// replayFirstCommitHostAuthCloseout12169 resumes a first-commit rollback's
+// durable host-auth retirement obligation after a process crash. A pending
+// confirm remains authoritative. Otherwise, an ever-committed active config
+// supersedes the obligation and clears it before record parsing; only a
+// never-committed bootstrap parses and replays the first-commit record.
+func (d *Daemon) replayFirstCommitHostAuthCloseout12169() error {
+	if d.store == nil {
+		return nil
+	}
+	if d.store.IsConfirmPending() {
+		// A crash before PromoteRollback leaves the durable confirm window
+		// authoritative; its timer will execute the rollback transaction.
+		return nil
+	}
+	if d.store.EverCommitted() {
+		// No first-commit rollback can be pending on a committed box. Clear
+		// the superseded record without parsing it: its generation is no
+		// longer relevant, and corruption must not block committed startup.
+		return d.store.ClearSupersededFirstCommitHostAuthCloseout()
+	}
+
+	record, err := d.store.PendingFirstCommitHostAuthCloseout()
+	if err != nil {
+		return err
+	}
+	if record == nil {
+		return nil
+	}
+
+	if err := d.applyBootstrapHostAuthorizationCloseout(nil); err != nil {
+		// Keep the record for the next boot: a closeout owner or guard did
+		// not converge, so deleting the only crash-recovery intent would
+		// turn visible degradation into permanent credential residue.
+		slog.Error("bootstrap replay of first-commit host-auth closeout is DEGRADED; retirement will retry on next boot",
+			"generation", record.Generation, "err", err)
+		return nil
+	}
+	// The record has no per-owner progress marker. A crash can happen after the
+	// drop-in unlink but before sshd reload, so every successful replay must
+	// reload sshd before it can clear the only durable obligation. Repeated
+	// reloads are idempotent and cover the unlink/reload crash boundary.
+	out, reloadErr := sshdReloadCmd()
+	d.noteSSHDReloadResult(reloadErr)
+	if reloadErr != nil {
+		slog.Error("bootstrap replay could not reload sshd; retirement will retry on next boot",
+			"generation", record.Generation, "err", reloadErr,
+			"output", strings.TrimSpace(string(out)))
+		return nil
+	}
+	if err := d.store.CompleteFirstCommitHostAuthCloseout(record.Generation); err != nil {
+		slog.Error("first-commit host-auth closeout replay converged but its durable obligation could not be cleared",
+			"generation", record.Generation, "err", err)
 	}
 	return nil
 }
