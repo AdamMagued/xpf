@@ -9,8 +9,9 @@
 // MaxInt32 overflow boundaries; TestNATSessionCountsAre64Bit_5250 pins the
 // int64 accumulators that prevent wrapping before the clamp can run.
 //
-// Scope note (honest): the FILTERED count path (setSessionsTotal's iterator
-// scan) and countNATSessions' per-rule-set map are only reachable past
+// Scope note (honest): the count path (setSessionsTotal's iterator scan,
+// which now serves both filtered and unfiltered cases) and
+// countNATSessions' per-rule-set map are only reachable past
 // MaxInt32 by iterating >2^31 sessions, which no unit test can drive. Those
 // two sites share the clamp helper asserted here and the 64-bit accumulator
 // asserted below; neither is independently drivable in a unit test.

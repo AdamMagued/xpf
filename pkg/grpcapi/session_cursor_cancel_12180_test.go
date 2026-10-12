@@ -143,8 +143,8 @@ func TestGetSessionsCursorCancelsDuringV4Walk12180(t *testing.T) {
 
 	_, err := s.GetSessions(ctx, &pb.GetSessionsRequest{Protocol: "udp", PageSize: 1})
 
-	if dp.cursorV4Visited >= dp.nV4 {
-		t.Errorf("selective cursor visited %d of %d v4 rows after cancellation; want sampled early stop", dp.cursorV4Visited, dp.nV4)
+	if dp.cursorV4Visited > sessionWalkCancelInterval9060 {
+		t.Errorf("selective cursor visited %d of %d v4 rows after cancellation, want at most %d", dp.cursorV4Visited, dp.nV4, sessionWalkCancelInterval9060)
 	}
 	if dp.cursorV6Calls != 0 {
 		t.Errorf("v6 cursor started %d times after v4 cancellation, want 0", dp.cursorV6Calls)
@@ -169,8 +169,8 @@ func TestGetSessionsCursorCancelsDuringV6Walk12180(t *testing.T) {
 		Protocol: "udp", PageSize: 1, PageToken: encodePageTokenV6Start(),
 	})
 
-	if dp.cursorV6Visited >= dp.nV6 {
-		t.Errorf("selective cursor visited %d of %d v6 rows after cancellation; want sampled early stop", dp.cursorV6Visited, dp.nV6)
+	if dp.cursorV6Visited > sessionWalkCancelInterval9060 {
+		t.Errorf("selective cursor visited %d of %d v6 rows after cancellation, want at most %d", dp.cursorV6Visited, dp.nV6, sessionWalkCancelInterval9060)
 	}
 	if dp.countV4Calls != 0 || dp.countV6Calls != 0 {
 		t.Errorf("filtered total ran after page-walk cancellation: v4 calls=%d, v6 walks=%d", dp.countV4Calls, dp.countV6Calls)
