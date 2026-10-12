@@ -35,6 +35,11 @@ func TestWatchdogAliasSkipsAWrappingChildIfindex12307(t *testing.T) {
 			t.Errorf("child=%d: watchdog alias would repair idx=%d, want skip", child, idx)
 		}
 	}
+	// Child 0 is outside the helper's shared bindingIfindexInRange bound;
+	// the watchdog alias decision must agree with apply.
+	if idx, ok := watchdogAliasBindingIndex(0, 8, liveBinding12307(8, 3), nil); ok {
+		t.Errorf("child=0: watchdog alias would repair idx=%d, want skip like apply", idx)
+	}
 	// Ordinary child still yields its own index.
 	want := uint32(9)*bindingQueuesPerIface + 3
 	if idx, ok := watchdogAliasBindingIndex(9, 8, liveBinding12307(8, 3), nil); !ok || idx != want {
