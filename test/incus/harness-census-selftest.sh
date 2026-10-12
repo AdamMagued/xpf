@@ -538,9 +538,10 @@ EXPECTED_CENSUS_JOB_EOF
 # key or any extra top-level key changes them while a key-name grep
 # misses colon-less explicit keys. The `on:` block must be exactly
 # `pull_request:`: retargeting the trigger would silently stop the check
-# from running on PRs. And there must be exactly one `census:` job: a
-# copy of the literal inside a block scalar would otherwise satisfy the
-# slice while the real job fails open.
+# from running on PRs. There must be exactly one `  census:` line, and
+# every jobs-level line must be a plain two-space job key: a copy of
+# the literal inside a block or quoted scalar would otherwise satisfy
+# the slice while the real job fails open.
 TOP_LEVEL_LINES="$(grep -vE '^([[:space:]]|#|$)' "$CI_WORKFLOW" 2>/dev/null)"
 EXPECTED_TOP_LEVEL_LINES="$(cat <<'EXPECTED_TOP_LEVEL_LINES_EOF'
 name: CI tests
@@ -556,11 +557,23 @@ on:
 EXPECTED_ON_BLOCK_EOF
 )"
 CENSUS_JOB_COUNT="$(grep -c '^  census:' "$CI_WORKFLOW" 2>/dev/null || true)"
+# Every jobs-level line must be a plain two-space job key; deeper lines are
+# job bodies. A re-indented or flow-style jobs map can otherwise hide the
+# real census job behind a quoted-scalar copy of the literal.
+JOB_KEY_SHAPE="$(awk '
+	/^jobs:$/ { in_jobs = 1; first = 1; next }
+	!in_jobs { next }
+	/^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+	/^    / && !first { next }
+	!/^  [A-Za-z_][A-Za-z0-9_-]*:$/ { bad = 1 }
+	{ first = 0 }
+	END { print ((in_jobs && !bad) ? "ok" : "bad") }' "$CI_WORKFLOW" 2>/dev/null)"
 CENSUS_WIRING_OK=0
 if [[ "$CENSUS_JOB" == "$EXPECTED_CENSUS_JOB" &&
 	"$TOP_LEVEL_LINES" == "$EXPECTED_TOP_LEVEL_LINES" &&
 	"$ON_BLOCK" == "$EXPECTED_ON_BLOCK" &&
-	"$CENSUS_JOB_COUNT" -eq 1 ]]; then
+	"$CENSUS_JOB_COUNT" -eq 1 &&
+	"$JOB_KEY_SHAPE" == ok ]]; then
 	CENSUS_WIRING_OK=1
 fi
 if [[ $CENSUS_WIRING_OK -eq 1 ]]; then
