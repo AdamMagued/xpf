@@ -2,6 +2,7 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -741,15 +742,22 @@ func (d *Daemon) deprovisionLoginUser(name string) (retErr error) {
 
 				// chpasswd may have changed shadow before returning an error,
 				// or may have been blocked across a later promotion. Repair the
-				// live password on every exit before marker cleanup or return.
+				// live password, then re-acquire applySem and converge again
+				// against the latest active config before marker cleanup.
 				if current, stillDesired := d.liveDesiredLoginUser12169(name); stillDesired &&
 					current.EncryptedPassword.Reveal() != "" {
 					staleRevocationSuperseded12169("repair-password", name)
-					if err := d.reconcileUserPassword(&current); err != nil {
-						fail(err)
+					repairErr := d.reconcileUserPassword(&current)
+					latest, liveNow, release, fenceErr := d.settleStaleLoginPassword12169(name, curUID)
+					if release != nil {
+						defer release()
+					}
+					fail(repairErr)
+					fail(fenceErr)
+					liveUser, liveDesired = latest, liveNow
+					if repairErr != nil || fenceErr != nil {
 						return
 					}
-					liveUser, liveDesired = current, true
 				}
 				if lockErr != nil {
 					return // retain markers; the attempted revocation failed
@@ -822,4 +830,41 @@ func (d *Daemon) deprovisionLoginUser(name string) (retErr error) {
 	slog.Info("deprovisioned removed login user",
 		"user", name, "password_locked", ownsPassword, "keys_removed", ownsKey)
 	return retErr
+}
+func (d *Daemon) settleStaleLoginPassword12169(name string, uid int) (config.LoginUser, bool, func(), error) {
+	var release func()
+	if d != nil && d.applySem != nil {
+		if err := d.applySem.Acquire(context.Background(), 1); err != nil {
+			return config.LoginUser{}, false, nil, err
+		}
+		release = func() { d.applySem.Release(1) }
+	}
+
+	live, desired := d.liveDesiredLoginUser12169(name)
+	if desired {
+		return live, true, release, d.reconcileUserPassword(&live)
+	}
+
+	hash, ok := currentShadowHash(name)
+	if !ok {
+		markerErr := errors.Join(markProvisioned(name, uid), markPasswordProvisioned(name, uid))
+		return live, false, release, errors.Join(
+			fmt.Errorf("read shadow for removed user %s after stale password repair", name),
+			markerErr)
+	}
+	if isLockedShadow(hash) {
+		return live, false, release, nil
+	}
+
+	out, err := runCommandStdinTimeout(strings.NewReader(name+":!\n"), "chpasswd", "-e")
+	if err != nil {
+		markerErr := errors.Join(markProvisioned(name, uid), markPasswordProvisioned(name, uid))
+		slog.Warn("failed to re-lock removed login user after stale password repair",
+			"user", name, "err", err, "output", strings.TrimSpace(string(out)))
+		return live, false, release, errors.Join(
+			fmt.Errorf("re-lock password for removed user %s after stale repair: %w", name, err),
+			markerErr)
+	}
+	slog.Info("re-locked removed login user after stale password repair", "user", name)
+	return live, false, release, nil
 }

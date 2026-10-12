@@ -25,10 +25,10 @@ import (
 //     applier owns convergence; the stale owner merely must not destroy it.
 //   - POST-mutation (blocking mutations only — `chpasswd`, sshd reload): the
 //     process may have been spawned pre-promotion and resumed
-//     post-promotion. Re-read live; if live desires what was just revoked,
-//     synchronously re-converge to live BEFORE dropping markers or
-//     returning. No completion signal (marker drop, nil return) ever
-//     accompanies standing damage.
+//     post-promotion. Re-read live and synchronously converge before dropping
+//     markers or returning. A password repair that races a removal re-acquires
+//     applySem, revalidates live intent, and re-locks the removed account
+//     before its provenance can be discarded.
 //
 // Under applySem the passed config IS the live config, so every check below
 // is a no-op on the healthy path (one RLock + slice scan); the fence only
