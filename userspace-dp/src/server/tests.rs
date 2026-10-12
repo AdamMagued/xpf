@@ -3644,8 +3644,9 @@ fn apply_snapshot_refuses_reused_generation_without_a_digest_9520() {
 /// a same-generation replay. The identical retry before a partial update is the
 /// positive control: it is ACKed, so the later refusal is the update's doing.
 ///
-/// RED-on-revert: drop any of the three `content_digest.clear()` calls and
-/// that arm's retry is ACKed (fabrics, neighbor-replace, neighbor-additive).
+/// RED-on-revert: drop any of the four `content_digest.clear()` paths and the
+/// affected same-generation retry is ACKed (fabrics, replace, additive, or
+/// the mismatch clear when the filtered set is unchanged).
 #[test]
 fn a_partial_update_stops_the_installed_digest_vouching_for_a_retry_9520() {
     use crate::{
@@ -5412,6 +5413,7 @@ fn update_fabrics_unchanged_set_does_not_rewrite_state_file() {
     );
     let _ = std::fs::remove_file(&state_file);
 }
+
 /// #12195: an `update_neighbors` that CHANGES the accepted neighbor set must fold
 /// the accepted NeighborSnapshots into the STORED snapshot AND persist — exactly
 /// like `update_fabrics` (#3773 L4). Before #12195 the neighbors arm cleared the
@@ -5646,6 +5648,114 @@ fn update_neighbors_replace_skips_family_mismatch_and_clears_digest_3771_9520() 
     assert!(rebind.ok, "rebind failed: {}", rebind.error);
 }
 
+/// #3771 (M11) + #9520: the steady-state Go refresh while a mapped ND row
+/// exists — stored `[valid]` with `digest-a`, replace `[valid, mapped]`.
+/// The filtered set is unchanged, so only the mismatch-branch clear (an
+/// applied replace that changed the live manager table while M11 excluded
+/// its rows from the stored snapshot) stops the installed digest vouching
+/// for a same-generation retry — and that clear must persist.
+/// fail-on-revert: deleting the mismatch clear keeps `digest-a`, so the
+/// replay is ACKed (RED); dropping its `persist_state` leaves no state
+/// file (RED).
+#[test]
+fn update_neighbors_unchanged_filtered_set_clears_digest_and_persists_3771_9520() {
+    use crate::{
+        ConfigSnapshot, NeighborSnapshot, CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+        SNAPSHOT_CONTENT_CONFLICT_PREFIX,
+    };
+
+    let valid = NeighborSnapshot {
+        interface: "ge-0-0-1".to_string(),
+        ifindex: 7,
+        family: "inet".to_string(),
+        ip: "10.0.0.1".to_string(),
+        mac: "02:00:00:00:00:01".to_string(),
+        state: "reachable".to_string(),
+        ..NeighborSnapshot::default()
+    };
+    let state = new_state(ProcessStatus {
+        forwarding_armed: true,
+        last_snapshot_generation: 1,
+        last_fib_generation: 1,
+        capabilities: forwarding_caps(),
+        ..ProcessStatus::default()
+    });
+    state.lock().expect("state").snapshot = Some(ConfigSnapshot {
+        version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+        generation: 1,
+        fib_generation: 1,
+        generated_at: chrono::Utc::now(),
+        content_digest: "digest-a".to_string(),
+        map_pins: ok_map_pins(),
+        neighbors: vec![valid.clone()],
+        ..ConfigSnapshot::default()
+    });
+    // #10694 test seam: keep this reconcile proof independent of monitor privileges.
+    state.lock().expect("state").afxdp.force_ipsec_sa_ready = true;
+
+    let state_file = unique_state_file("neighbor-mismatch-clear");
+    let _ = std::fs::remove_file(&state_file);
+    let mut replace = req("update_neighbors");
+    replace.neighbor_replace = true;
+    replace.neighbor_generation = 1;
+    replace.neighbors = Some(vec![
+        valid.clone(),
+        NeighborSnapshot {
+            interface: "ge-0-0-1".to_string(),
+            ifindex: 7,
+            family: "inet6".to_string(),
+            ip: "192.0.2.1".to_string(),
+            mac: "02:00:00:00:00:01".to_string(),
+            state: "permanent".to_string(),
+            ..NeighborSnapshot::default()
+        },
+    ]);
+    let response = run_request_on_file(state.clone(), replace, &state_file);
+    assert!(response.ok, "replace failed: {}", response.error);
+
+    {
+        let guard = state.lock().expect("state");
+        let stored = guard.snapshot.as_ref().expect("stored snapshot");
+        assert_eq!(
+            stored.neighbors,
+            vec![valid],
+            "the mismatched row must not enter the stored reconcile snapshot"
+        );
+        assert!(
+            stored.content_digest.is_empty(),
+            "an applied replace with filtered rows must not retain the stale digest"
+        );
+    }
+    assert!(
+        std::path::Path::new(&state_file).exists(),
+        "clearing the digest for an applied mismatched replace must persist state"
+    );
+
+    let mut replay = req("apply_snapshot");
+    replay.snapshot = Some(ConfigSnapshot {
+        version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+        generation: 1,
+        fib_generation: 1,
+        generated_at: chrono::Utc::now(),
+        content_digest: "digest-a".to_string(),
+        map_pins: ok_map_pins(),
+        ..ConfigSnapshot::default()
+    });
+    let replay = run_request(state.clone(), replay);
+    assert!(
+        !replay.ok && replay.error.starts_with(SNAPSHOT_CONTENT_CONFLICT_PREFIX),
+        "the cleared digest must refuse a same-generation full-apply replay: ok={} error={}",
+        replay.ok,
+        replay.error
+    );
+
+    // The stored snapshot is the input to rebind. It must still reconcile
+    // successfully after the mismatched row was observed.
+    let rebind = run_request(state, req("rebind"));
+    assert!(rebind.ok, "rebind failed: {}", rebind.error);
+    let _ = std::fs::remove_file(&state_file);
+}
+
 /// #3771 (M11): a mapped-only replace with an empty digest and an empty stored
 /// neighbor set changes neither the reconcile input nor the digest, so it must
 /// not cause a state-file write.
@@ -5692,6 +5802,7 @@ fn update_neighbors_mismatched_replace_with_empty_digest_does_not_write_12195() 
     let _ = std::fs::remove_file(&state_file);
 }
 
+/// #9803: an `update_fabrics` carrying a new fabric parent ifindex, followed by
 /// a full apply with the same rows, must end with the fabric bindings replanned.
 /// The helper's `update_fabrics` arm stores the rows in its retained snapshot
 /// without replanning, so the next full apply compares same-plan (stored and
