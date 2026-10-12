@@ -2459,7 +2459,7 @@ reads zone names at all (#9740); the NAT / tunnel / neighbor
 builders range config SLICES (already ordered), so they were never affected.
 
 **The same hash is the apply_snapshot content identity (#9520).**
-`requestApplySnapshotLocked` stamps `snapshotContentHash` onto every
+`requestApplySnapshotPreparedLocked` stamps `snapshotContentHash` onto every
 `apply_snapshot` as `ConfigSnapshot.ContentDigest`, and the helper refuses an
 apply that reuses its installed generation with a different or empty digest. A
 republish retried after a timeout-but-landed apply rebuilds its content, and new

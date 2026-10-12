@@ -28,7 +28,7 @@ import (
 //     generation whose digest differs from the installed snapshot's, before any
 //     mutation (userspace-dp/src/server/handlers/snapshot.rs);
 //   - that refusal, and only that refusal, proves the helper HOLDS the
-//     generation, so requestApplySnapshotLocked consumes it and republishes once
+//     generation, so requestApplySnapshotPreparedLocked consumes it and republishes once
 //     on the next one. Without this half the refusal is a non-converging loop:
 //     every retry re-sends the same generation and is refused again.
 

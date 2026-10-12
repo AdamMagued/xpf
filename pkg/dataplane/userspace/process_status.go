@@ -242,6 +242,7 @@ func (m *Manager) syncSnapshotLocked() error {
 	// (syncUserspaceClassifierMapsFailClosedLocked(snap)) with ctrl still
 	// enabled. Besides the deferral above, the retry-debt adopt arm in
 	// publishPreparedSnapshotFailClosedLocked (#9642) is the only other producer of an
+	// unpublished lastSnapshot — and on both arms the maps are likewise already
 	// at the attempted plan (mutated in place on the same-plan arm, freshly
 	// programmed on the bootstrap arm), so the conclusion below stands for
 	// debt retries too: every other publish site (Compile normal path,

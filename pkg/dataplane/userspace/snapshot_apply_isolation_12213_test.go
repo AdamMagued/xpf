@@ -343,3 +343,31 @@ func TestWorkerArmAckRetainsSentRows12213(t *testing.T) {
 	t.Logf("worker-arm err=%v", err)
 	assertRetainedMatchesSent12213(t, m, *sent)
 }
+
+func TestCaptureAuthorityRepublishSendsRevalidatedRows12213(t *testing.T) {
+	m, sent := ackManager12213(t) // retained ifindex 23, live sample 99
+	m.captureEpochProvider = func(uint64, uint32) (
+		uint64,
+		[]QueueEpochSnapshot,
+		uint64,
+		[]IpsecTunnelRowSnapshot,
+	) {
+		return 19, nil, 4, nil
+	}
+	retainedBefore := m.lastSnapshot
+	published, err := m.RepublishCurrentCaptureAuthority()
+	t.Logf("published=%v err=%v", published, err)
+	if !published || err != nil {
+		t.Fatalf("capture-authority republish: published=%v err=%v", published, err)
+	}
+	if *sent == nil {
+		t.Fatal("premise: capture-authority republish sent nothing")
+	}
+	if got := (*sent).Interfaces[0].Ifindex; got != 99 {
+		t.Errorf("capture-authority republish sent stale row ifindex %d, want revalidated 99", got)
+	}
+	if retainedBefore.Interfaces[0].Ifindex != 23 {
+		t.Errorf("republish mutated the prior retained snapshot's rows: %+v", retainedBefore.Interfaces)
+	}
+	assertRetainedMatchesSent12213(t, m, *sent)
+}

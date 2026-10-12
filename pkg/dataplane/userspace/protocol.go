@@ -949,7 +949,7 @@ type ConfigSnapshot struct {
 	// ContentDigest (#9520) is hex SHA-256 over this snapshot's content, from
 	// snapshotContentHash: Generation, FIBGeneration, GeneratedAt, Config and
 	// ContentDigest itself are excluded, and neighbours count only if
-	// publishable. requestApplySnapshotLocked stamps it immediately before
+	// publishable. requestApplySnapshotPreparedLocked stamps it immediately before
 	// every apply_snapshot. The helper refuses an apply that reuses its
 	// installed generation with a different digest: a retried republish
 	// rebuilds its content, and installing new content under a generation

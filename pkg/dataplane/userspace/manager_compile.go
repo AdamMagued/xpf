@@ -843,7 +843,6 @@ func (m *Manager) applyCompiledSnapshot(
 // When mapsMutatedInPlace is false the caller took the full bootstrap path,
 // which already programmed ctrl.Enabled=0 before this publish, so a publish
 // error is already fail-closed and the error is returned unchanged.
-
 func (m *Manager) publishPreparedSnapshotFailClosedLocked(
 	publishSnap *ConfigSnapshot,
 	status *ProcessStatus,
