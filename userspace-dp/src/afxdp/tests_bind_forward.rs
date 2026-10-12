@@ -1770,7 +1770,7 @@ fn resolution_target_uses_rewritten_destination_for_reverse_dnat() {
 
 
 #[test]
-fn session_resolution_falls_back_to_cached_neighbor_on_miss() {
+fn session_resolution_absent_neighbor_is_stale_live_binding_reuses_cache_12255() {
     let mut state = build_forwarding_state(&nat_snapshot());
     state.neighbors.clear();
     let flow = SessionFlow {
@@ -1800,12 +1800,24 @@ fn session_resolution_falls_back_to_cached_neighbor_on_miss() {
         route_mtu: 0,
         transport_route_mtu: 0,
     }, nat: NatDecision::default(), install_table_domain: 0, install_table_check: 0 };
-    let resolved = lookup_forwarding_resolution_for_session(
+    // #11315: an absent live binding is stale -> re-resolve (no cached MAC).
+    let absent = lookup_forwarding_resolution_for_session(
         &state,
         &Arc::new(ShardedNeighborMap::new()),
         &flow,
         decision,
     );
+    assert_eq!(absent.disposition, ForwardingDisposition::MissingNeighbor);
+    assert_eq!(absent.neighbor_mac, None);
+    // A matching live binding keeps the cached ForwardCandidate fast path.
+    let live = Arc::new(ShardedNeighborMap::new());
+    live.insert(
+        (12, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
+        NeighborEntry {
+            mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
+        },
+    );
+    let resolved = lookup_forwarding_resolution_for_session(&state, &live, &flow, decision);
     let expected_src = state
         .egress
         .get(&12)

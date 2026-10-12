@@ -17443,6 +17443,137 @@ fn session_hit_reresolves_on_live_neighbor_mac_change_v6_11315() {
         "cached_session_resolution must reject a live-contradicted MAC (v6)"
     );
 }
+
+/// #12255: the Go neighbor manager's authoritative replace (#1197) can remove
+/// a snapshot-seeded neighbor without a forwarding-generation bump or a shard
+/// epoch bump (the row was never in the dynamic map). An established local
+/// ForwardFlow hit must still treat the absent binding as stale (#11315) and
+/// re-resolve through the production resolver instead of serving the removed
+/// MAC from its stored decision.
+#[test]
+fn session_hit_reresolves_after_manager_replace_removes_snapshot_neighbor_12255() {
+    let mut coordinator = crate::afxdp::coordinator::Coordinator::new();
+    coordinator
+        .refresh_runtime_snapshot(&crate::afxdp::test_fixtures::nat_snapshot())
+        .expect("snapshot refresh");
+    let next_hop = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 1));
+    let key = (12, next_hop);
+    let snapshot_mac = coordinator
+        .forwarding
+        .neighbors
+        .get(&key)
+        .expect("snapshot-seeded neighbor")
+        .mac;
+    let dynamic = coordinator.dynamic_neighbors_ref().clone();
+    assert!(
+        dynamic.get(&key).is_none(),
+        "snapshot-seeded row is not in the dynamic map"
+    );
+    let generation = (
+        coordinator.validation.config_generation,
+        coordinator.validation.fib_generation,
+    );
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100));
+    let flow = SessionFlow {
+        src_ip: src,
+        dst_ip: next_hop,
+        forward_key: SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: src,
+            dst_ip: next_hop,
+            src_port: 40000,
+            dst_port: 443,
+            discriminator: Default::default(),
+            routing_domain: 0,
+        },
+    };
+    let live = lookup_forwarding_resolution_with_dynamic_for_flow(
+        &coordinator.forwarding,
+        &dynamic,
+        next_hop,
+        &flow.forward_key,
+    );
+    assert_eq!(live.disposition, ForwardingDisposition::ForwardCandidate);
+    assert_eq!(live.neighbor_mac, Some(snapshot_mac));
+    let mut sessions = SessionTable::new();
+    sessions.set_forwarding_revalidation_gen(generation.0, generation.1);
+    assert!(sessions.install_with_protocol_with_origin(
+        flow.forward_key.clone(),
+        SessionDecision {
+            resolution: live,
+            nat: NatDecision::default(),
+            install_table_domain: 0,
+            install_table_check: 0,
+        },
+        test_metadata(),
+        SessionOrigin::ForwardFlow,
+        1_000_000,
+        PROTO_TCP,
+        TCP_FLAG_ACK,
+    ));
+
+    assert!(coordinator.apply_manager_neighbors(true, 0, &[]));
+    assert!(
+        crate::afxdp::lookup_neighbor_entry(&coordinator.forwarding, Some(&dynamic), 12, next_hop)
+            .is_none(),
+        "binding removed by the manager replace"
+    );
+    assert_eq!(
+        (
+            coordinator.validation.config_generation,
+            coordinator.validation.fib_generation,
+        ),
+        generation,
+        "manager replace republishes without a forwarding-generation bump"
+    );
+    assert_eq!(
+        dynamic.mac_change_epoch_for(&key),
+        0,
+        "no shard-epoch bump for a snapshot-seeded row"
+    );
+
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+    let peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = Vec::new();
+    let mut ha_state = BTreeMap::new();
+    ha_state.insert(1, active_ha_runtime(1));
+    let resolved = resolve_flow_session_decision(
+        &mut sessions,
+        SteeringMap::unshared_for_test(-1),
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        &shared_owner_rg_indexes,
+        &peer_worker_commands,
+        &coordinator.forwarding,
+        &ha_state,
+        &dynamic,
+        &flow,
+        2_000_000,
+        1,
+        PROTO_TCP,
+        TCP_FLAG_ACK,
+        24,
+        0,
+        false,
+        0,
+        0,
+    )
+    .expect("established local ForwardFlow hit");
+    assert_eq!(
+        resolved.decision.resolution.disposition,
+        ForwardingDisposition::MissingNeighbor,
+        "#11315: an absent binding must re-resolve, not reuse the cached decision"
+    );
+    assert_eq!(
+        resolved.decision.resolution.neighbor_mac, None,
+        "#11315: the removed binding's MAC must not be served"
+    );
+}
+
 #[test]
 fn established_session_re_resolves_after_fib_generation_changes_11373() {
     let mut snapshot = crate::afxdp::test_fixtures::forwarding_snapshot(true);
