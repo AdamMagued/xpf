@@ -185,6 +185,9 @@ test/incus/test-fbf-steering.sh
 test/incus/newflow-ceiling-lib.sh
 test/incus/newflow-ceiling-selftest.sh
 test/incus/newflow-ceiling-harness.sh
+test/incus/stress-failover-lib.sh
+test/incus/test-stress-failover.sh
+test/incus/stress-failover-selftest.sh
 test/incus/mouse-elephant-lib.sh
 test/incus/mouse-elephant-selftest.sh
 scripts/harness-census.sh
@@ -416,6 +419,10 @@ run_bash test/incus/cluster-env-selftest.sh
 run_bash test/incus/cos-apply-lib-selftest.sh
 run_bash test/incus/host-inbound-selftest.sh
 run_bash test/incus/iperf-throughput-selftest.sh
+# #12199: RG1 movement must settle in both node views; real-output
+# secondary-hold, split-view, final-owner, and unchanged-owner controls are
+# covered with fixture-only mocks.
+run_bash test/incus/stress-failover-selftest.sh
 # #11581: fail-closed HA metrics and shared pure assurance predicates.
 run_bash test/incus/ha-assurance-selftest.sh
 # #11581: same-load failover client JSON-stream lifecycle; hermetic fixtures.
