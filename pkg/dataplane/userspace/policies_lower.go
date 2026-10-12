@@ -204,16 +204,20 @@ func buildOneRuleSnapshot(
 			Protocol: unsupportedApplicationSentinel,
 		}}
 	}
+	schedulerName := pol.SchedulerName
 	// #5575 / #11013 / #11014 / #12234: a policy the tolerant load / peer-sync
 	// compile path accepted only by DOWNGRADING a reject for dropped
 	// enforcement content had its constraint silently discarded, leaving an
 	// empty match dimension, an unconditional direct permit, or an incomplete
-	// policy subtree / unknown direct policy child. Poison the rule with the
-	// __unsupported__ application sentinel so the Rust integrity preflight
-	// rejects the WHOLE snapshot (previous-good retained; fresh-boot
-	// default-deny) — an action-agnostic fail-CLOSED instead of publishing
-	// incomplete policy content. A strict commit rejects these policies
-	// outright, so this only fires on tolerant load / peer-sync ingress.
+	// policy subtree / unknown direct policy child. #12244: that path also
+	// keeps a DENY/REJECT that references an undefined scheduler, which would
+	// otherwise publish as an inactive rule and let traffic fall through to a
+	// later permit. Poison the rule with the __unsupported__ application
+	// sentinel so the Rust integrity preflight rejects the WHOLE snapshot
+	// (previous-good retained; fresh-boot default-deny) — an action-agnostic
+	// fail-CLOSED instead of publishing incomplete policy content. A strict
+	// commit rejects these policies outright, so this only fires on tolerant
+	// load / peer-sync ingress.
 	if pol.LenientContentDropped {
 		if len(rejectedApps) == 0 {
 			rejectedApps = []string{lenientDroppedConstraintToken}
@@ -222,6 +226,16 @@ func buildOneRuleSnapshot(
 			Name:     unsupportedApplicationSentinel,
 			Protocol: unsupportedApplicationSentinel,
 		}}
+	}
+	rejectedScheduler := ""
+	// #12244: only an undefined-scheduler DENY/REJECT is a scheduler cause.
+	// Other tolerant poison may apply to a PERMIT; don't report its scheduler.
+	if pol.LenientContentDropped &&
+		(pol.Action == config.PolicyDeny || pol.Action == config.PolicyReject) &&
+		schedulerName != "" {
+		if _, ok := cfg.Schedulers[schedulerName]; !ok {
+			rejectedScheduler = schedulerName
+		}
 	}
 	// #1606 v3 fields classify each address token as a named book reference or
 	// a free-form literal.
@@ -237,7 +251,6 @@ func buildOneRuleSnapshot(
 	if dstUnrepresentable {
 		dstBookIDs, dstLiterals = nil, []string{unsupportedAddressSentinel}
 	}
-	schedulerName := pol.SchedulerName
 	// #2508: carry the per-policy `then log session-init`/`session-close`
 	// selection into the snapshot so the dataplane can gate the per-policy
 	// RT_FLOW SYSLOG records. The global NetFlow/IPFIX close exporter
@@ -290,6 +303,7 @@ func buildOneRuleSnapshot(
 		// #12217: carry the skipped policy-container children as
 		// build-time-only rejection metadata.
 		unknownSecurityPoliciesChildren: pol.UnknownSecurityPoliciesChildren,
+		rejectedScheduler:               rejectedScheduler,
 	}
 }
 
