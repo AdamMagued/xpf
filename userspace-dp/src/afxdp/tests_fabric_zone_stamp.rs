@@ -3394,7 +3394,7 @@ fn stamped_fabric_session_miss_tcp_rst_is_suppressed_on_real_poll_12051() {
 /// no-double-count contract): a counting call here stamps +1 onto the
 /// admitting rule for the first packet of every punted flow, and dropping the
 /// returned counter handle cannot undo the atomic increment inside
-/// `try_match_rule`.
+/// `apply_frag_deny_override_and_count`.
 ///
 /// The cell drives leg 1 of `fabric_punt_seed_admits_the_peers_return_7770`
 /// verbatim (LAN-ingress SYN, LAN RG local / WAN RG peer-owned) and asserts

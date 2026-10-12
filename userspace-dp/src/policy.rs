@@ -3473,7 +3473,7 @@ fn evaluate_policy_result_counted(
     // address) OVERLAPS this fragment but was skipped ONLY because l4_present ==
     // false (`note_skipped_frag_deny`). If the walk then lands on a PERMIT (or a
     // default-permit), OVERRIDE it to DROP and attribute the drop to that DENY
-    // (`apply_frag_deny_override`). Scoped narrowly: a fragment with NO
+    // (`apply_frag_deny_override_and_count`). Scoped narrowly: a fragment with NO
     // overlapping skipped DENY still forwards normally, and the L4 path
     // (l4_present == true) is byte-identical (the note/override are inert). The
     // documented trade-off is over-drop: a legitimate non-denied-port fragment
@@ -3858,7 +3858,7 @@ pub(crate) fn evaluate_junos_host_policy(
 /// in precedence order, remember the FIRST port-bearing DENY whose L3 overlaps
 /// the fragment but was skipped only for `l4_present == false`
 /// (`note_skipped_frag_deny`); override a later PERMIT to that DROP
-/// (`apply_frag_deny_override`), and convert the deliver-on-no-match
+/// (`apply_frag_deny_override_and_count`), and convert the deliver-on-no-match
 /// fall-through into `Some(frag_associated_deny_result)` when a deny was
 /// skipped — the junos-host "no implicit default-deny" lifeline is a
 /// deliver-on-no-match posture, i.e. permit-like, so it takes the same
@@ -4320,23 +4320,6 @@ fn frag_associated_deny_result(deny: SkippedFragDeny) -> PolicyEvaluationResult 
     }
 }
 
-/// #4569: override a PERMIT verdict to the fragment-associated DENY when a
-/// port-bearing DENY with overlapping L3 was skipped for this flowless
-/// fragment. Any non-PERMIT verdict (an explicit deny/reject already denies) or
-/// the absence of a skipped deny returns `result` unchanged.
-#[inline]
-fn apply_frag_deny_override(
-    result: PolicyEvaluationResult,
-    skipped: Option<SkippedFragDeny>,
-) -> PolicyEvaluationResult {
-    match skipped {
-        Some(deny) if matches!(result.action, PolicyAction::Permit) => {
-            frag_associated_deny_result(deny)
-        }
-        _ => result,
-    }
-}
-
 /// Apply fragment-deny precedence before crediting a matched rule.
 ///
 /// A flowless fragment overridden from PERMIT to DENY did not survive the
@@ -4351,12 +4334,15 @@ fn apply_frag_deny_override_and_count(
     packet_len: u64,
     hit_count: PolicyHitCount,
 ) -> PolicyEvaluationResult {
-    let overridden = skipped.is_some() && matches!(result.action, PolicyAction::Permit);
-    let result = apply_frag_deny_override(result, skipped);
-    if !overridden {
-        matched_rule.hit_counter.add_if(packet_len, hit_count);
+    match skipped {
+        Some(deny) if matches!(result.action, PolicyAction::Permit) => {
+            frag_associated_deny_result(deny)
+        }
+        _ => {
+            matched_rule.hit_counter.add_if(packet_len, hit_count);
+            result
+        }
     }
-    result
 }
 
 /// Try to match a single policy rule against packet fields.

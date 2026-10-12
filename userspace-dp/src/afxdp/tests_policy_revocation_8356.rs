@@ -3462,8 +3462,9 @@ fn a_default_policy_of_reject_does_not_revoke_a_permitted_flow_9381() {
 // survives the fragment override; the default path uses
 // `state.default_counter.add_if`. `&PolicyState` cannot prevent
 // either: the counters are ATOMICS behind shared references.
-// Passing `packet_len = 0` does not help — `HitCounter::add`
-// covers BYTES only; packet increments are unconditional.
+// Passing `packet_len = 0` does not help — the zero-length gate in
+// `HitCounter::add` covers BYTES only and the packet increment is
+// unconditional.
 //
 // So every re-derivation recorded a PHANTOM hit on whichever rule (or the
 // implicit default) it matched: up to one packet per live session per config

@@ -136,11 +136,12 @@
 //! The default path uses `state.default_counter.add_if`; `&PolicyState`
 //! cannot prevent either: both counters are ATOMICS behind shared
 //! references, so an immutable borrow is not the guarantee the claim
-//! rested on. Passing `packet_len = 0` does not help:
-//! `HitCounter::add` covers BYTES only; packet increments are unconditional.
-//! So every re-derivation recorded a PHANTOM hit on a matched rule
-//! or the implicit default — up to one packet per live session per
-//! config generation, just as an operator checks for narrowing.
+//! rested on. Passing `packet_len = 0` does not help: the zero-length gate in
+//! `HitCounter::add` covers BYTES only and the packet increment is
+//! unconditional. So every re-derivation recorded a PHANTOM hit on a
+//! matched rule or the implicit default — up to one packet per live
+//! session per config generation, just as an operator checks for narrowing.
+//!
 //! The filter needed `NonRoutingCountPolicy::Never` for precisely this reason
 //! and this module now needs the same thing: it calls
 //! `evaluate_policy_result_without_counting_at` (`PolicyHitCount::Never`), and the
