@@ -216,6 +216,50 @@ and pin.
   best-effort in the same sense as the golden lock, and its absence is
   reported rather than assumed.
 
+### Bounded APT selection evidence (#10848)
+
+The #10848 resolver probe used Debian APT 3.3.3 amd64, a private package
+root, and a signed local `file:` repository containing only an older,
+inert data-only `xpf*` package. The installed version was
+`0.0.200+gaaaaaaaaaaaa`; the repository version was
+`0.0.100+gbbbbbbbbbbbb`. The fixture's Release was freshly signed during
+the probe: it was not a captured production signature or a replay after
+previously observing newer repository metadata. Under the managed preference
+in `install.sh` (selected-channel priority 990 plus the two wildcard -1
+denies at lines 406–416), it observed:
+
+Evidence IDs below refer to the #10848 research report
+`result-openai-codex-gpt-6-astra-research-10848-apt-selection-001.md`
+(SHA-256 `ef8d32fee6c8b22874e4ce617daa97e015d75434c50f5c5cd59e91acf17127ad`).
+
+- **P2 — ordinary automatic downgrade REFUTED:** an unversioned
+  `apt-get upgrade` left the installed package at
+  `0.0.200+gaaaaaaaaaaaa` (rc 0; no change; evidence 015–016).
+- **P3 — candidate-none is REAL:** the same preferences assigned the
+  installed-but-unindexed version effective priority -1, leaving no
+  candidate. An unversioned `apt-get install` exited 100 with “no
+  installation candidate” (evidence 015, 017–018). This is an
+  availability failure, not an automatic downgrade or a successful
+  install.
+- **P5 — explicit authorized downgrade works:** an explicit request for
+  `0.0.100+gbbbbbbbbbbbb` with `--allow-downgrades` installed that version
+  in the private root (evidence 031–032). No unflagged control was run;
+  necessity of `--allow-downgrades` is not established even for this case.
+- **P7 — expired metadata is rejected on fresh acquisition:** with an
+  expired signed Release and an empty, distinct lists cache,
+  `apt-get update` exited 100 with an expiry error (evidence 029). Its
+  command-local expiry-check override positive control is evidence 030,
+  not a project or host setting.
+
+These are bounded observations of that fixture, APT version, package and
+commands—not deployed Ubuntu, production package-script, all-release-history,
+or fleet results. P7 covers fresh acquisition only: no warm-cache, clock-skew,
+or fleet conclusion is made. The repo builder still defaults
+`XPF_APT_VALID_DAYS` to 365 days for manual/air-gap signing; shortening it
+requires an automated re-sign job (`build-apt-repo.sh:31–33,44`). This
+evidence neither implements an anti-rollback floor nor settles the
+Q1–Q4 policy decisions.
+
 ### Key rotation
 
 The archive keyring ships BOTH inline in `install.sh` (new installs) AND in the
