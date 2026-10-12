@@ -14,10 +14,11 @@ import (
 // #5078: committing `chassis cluster authentication-key` must NOT restart
 // cluster comms.
 //
-// This is load-bearing and was previously unguarded — `clusterTransportKey` had
-// no test at all. It carries the six ENDPOINT fields whose change requires
-// tearing down and rebuilding heartbeat + session sync; the auth key is
-// deliberately absent, so a key commit leaves the established connection up.
+// This is load-bearing and was previously unguarded: the test pins omission of
+// the auth key from `clusterTransportKey`. The key carries configured endpoint
+// fields plus runtime VRF-binding state whose changes require rebuilding
+// heartbeat + session sync; the auth key is deliberately absent, so a key
+// commit leaves the established connection up.
 //
 // Why that matters now. An RG0 secondary whose read-only gate is ARMED cannot
 // be configured locally: `applyRG0OwnershipTransition` calls
@@ -86,9 +87,9 @@ func TestAuthKeyChangeDoesNotRestartClusterComms_5078(t *testing.T) {
 // TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078 asserts the DECISION, not
 // the struct.
 //
-// The sibling test above pins the field set of `clusterTransportKey`, and that
-// is real: adding ControlLinkAuthKey to it makes the two configs stop comparing
-// equal and REDs. But it cannot see the call site. The comparison that actually
+// The sibling test above pins that `ControlLinkAuthKey` remains excluded from
+// `clusterTransportKey`: adding it makes the two configs stop comparing equal
+// and REDs. But it cannot see the call site. The comparison that actually
 // decides a restart is INLINE in applyTailReconciles step 20
 // (daemon_apply_tail.go):
 //
@@ -257,11 +258,11 @@ func TestKeyCommitDoesNotRestartCommsAtTheCallSite_5078(t *testing.T) {
 		movedKeyed.Chassis.Cluster.PeerAddress = "10.99.0.9"
 
 		// NOTE: there is deliberately no "seat a keyed active transport" step
-		// here. `clusterTransportKey` carries the six ENDPOINT fields and not
-		// the auth key — that is the invariant this whole file exists to pin —
-		// so `clusterTransportFromConfig` of a keyed config is byte-identical
-		// to the unkeyed one and such a step would be a no-op whose comment
-		// claimed otherwise. It would also write shared daemon state from
+		// here. `clusterTransportKey` carries configured endpoints and runtime
+		// VRF-binding state but not the auth key — that is the invariant this
+		// whole file exists to pin — so `clusterTransportFromConfig` of a keyed
+		// config is byte-identical to the unkeyed one and such a step would be
+		// a no-op whose comment claimed otherwise. It would also write shared
 		// inside a subtest: under a mutation that DOES add ControlLinkAuthKey
 		// to clusterTransportKey, that write masked key_commit_must_not_restart
 		// when this subtest ran first (measured). The three subtests are

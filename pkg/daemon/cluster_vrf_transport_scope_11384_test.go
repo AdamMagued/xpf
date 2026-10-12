@@ -93,7 +93,7 @@ func TestClusterSyncVRFDeviceUsesSelectedTransport11384(t *testing.T) {
 			wantVRF: true,
 		},
 		{
-			name: "dual fabric requires both selected interfaces to be members",
+			name: "dual fabric VRF selection follows its primary member",
 			cc: &config.ClusterConfig{
 				FabricInterface:    "fab0",
 				FabricPeerAddress:  "192.0.2.3",
@@ -104,7 +104,7 @@ func TestClusterSyncVRFDeviceUsesSelectedTransport11384(t *testing.T) {
 			wantVRF: true,
 		},
 		{
-			name: "dual fabric leaves sockets unbound when one interface is outside",
+			name: "secondary outside the VRF does not veto primary binding",
 			cc: &config.ClusterConfig{
 				FabricInterface:    "fab0",
 				FabricPeerAddress:  "192.0.2.3",
@@ -112,13 +112,14 @@ func TestClusterSyncVRFDeviceUsesSelectedTransport11384(t *testing.T) {
 				Fabric1PeerAddress: "192.0.2.4",
 			},
 			members: map[string]bool{"fab0": true, "fxp0": true},
+			wantVRF: true,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			iface0, iface1 := clusterSyncVRFTransportIfaces(tc.cc)
-			d := vrfBindingTestDaemon11384(tc.members, iface0, iface1)
+			iface := clusterSyncVRFTransportIface(tc.cc)
+			d := vrfBindingTestDaemon11384(tc.members, iface)
 			want := ""
 			if tc.wantVRF {
 				want = config.ManagementVRFDeviceName
@@ -144,6 +145,31 @@ func TestClusterVRFDeviceWarnsWhenTransportIsOutsideManagementVRF11384(t *testin
 	}
 	if !strings.Contains(logs.String(), "leaving sockets unbound to VRF") {
 		t.Errorf("unhonored VRF request did not warn: %s", logs.String())
+	}
+}
+
+func TestClusterVRFBindingWarnsForPublishedStripped12168(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	defer slog.SetDefault(previous)
+
+	d := vrfBindingTestDaemon11384(map[string]bool{"em0": true}, "em0")
+	link, err := d.fabricLinkByName("em0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	link.Attrs().MasterIndex = 0
+	if got := d.transportVRFBinding(true, "em0"); got != "" {
+		t.Fatalf("published but stripped interface resolved VRF device %q", got)
+	}
+	if !strings.Contains(logs.String(), "level=WARN") {
+		t.Errorf("published-but-stripped interface did not warn: %s", logs.String())
+	}
+	for _, field := range []string{"master_index=0", "vrf=vrf-mgmt", "vrf_index=77"} {
+		if !strings.Contains(logs.String(), field) {
+			t.Errorf("stripped interface warning lacks %q: %s", field, logs.String())
+		}
 	}
 }
 

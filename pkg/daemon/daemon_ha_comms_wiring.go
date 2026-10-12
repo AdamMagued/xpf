@@ -19,7 +19,8 @@ import (
 // (#6428). Their call sites in daemon_ha_sync.go retain the same startup
 // ordering and goroutine spawn points.
 
-// resolveClusterVRFDevice is the startup-warning form of transportVRFBinding.
+// resolveClusterVRFDevice is the warning form of transportVRFBinding for
+// heartbeat bind attempts.
 func (d *Daemon) resolveClusterVRFDevice(transportIfaces ...string) string {
 	return d.transportVRFBinding(true, transportIfaces...)
 }
@@ -53,7 +54,17 @@ func (d *Daemon) transportVRFBinding(warn bool, transportIfaces ...string) strin
 			vrfIndex = vrf.Attrs().Index
 		}
 		link, err := d.fabricLinkByName(linuxName)
-		if err != nil || link == nil || link.Attrs() == nil || link.Attrs().MasterIndex != vrfIndex {
+		if err != nil || link == nil || link.Attrs() == nil {
+			return ""
+		}
+		if link.Attrs().MasterIndex != vrfIndex {
+			if warn {
+				slog.Warn("cluster transport interface is published but outside the management VRF; leaving sockets unbound to VRF",
+					"interface", linuxName,
+					"master_index", link.Attrs().MasterIndex,
+					"vrf", config.ManagementVRFDeviceName,
+					"vrf_index", vrfIndex)
+			}
 			return ""
 		}
 	}
@@ -64,11 +75,11 @@ func (d *Daemon) transportVRFBinding(warn bool, transportIfaces ...string) strin
 }
 
 // resolveClusterSyncVRFDevice scopes session sync, fabric gRPC, peer dials and
-// the transport key to exactly the same selected interfaces, including a
-// configured secondary fabric. It is quiet because keys and dials are frequent.
+// the transport key to the primary selected interface only. It is quiet
+// because keys and dials are frequent.
 func (d *Daemon) resolveClusterSyncVRFDevice(cc *config.ClusterConfig) string {
-	iface, iface1 := clusterSyncVRFTransportIfaces(cc)
-	return d.transportVRFBinding(false, iface, iface1)
+	iface := clusterSyncVRFTransportIface(cc)
+	return d.transportVRFBinding(false, iface)
 }
 
 // clusterPeerVRFDevice is the live resolver installed on the daemon-owned
@@ -85,18 +96,18 @@ func (d *Daemon) clusterPeerVRFDevice() string {
 	return d.resolveClusterSyncVRFDevice(cfg.Chassis.Cluster)
 }
 
-func clusterSyncVRFTransportIfaces(cc *config.ClusterConfig) (string, string) {
+// clusterSyncVRFTransportIface returns the selected primary transport
+// interface for VRF binding. Dual-fabric socket addresses are configured
+// separately and do not participate in VRF selection.
+func clusterSyncVRFTransportIface(cc *config.ClusterConfig) string {
 	if cc == nil {
-		return "", ""
+		return ""
 	}
-	syncIface, syncPeerAddr, syncTransport := clusterSyncTransport(cc)
+	syncIface, syncPeerAddr, _ := clusterSyncTransport(cc)
 	if syncIface == "" || syncPeerAddr == "" {
-		return "", ""
+		return ""
 	}
-	if syncTransport == "fabric" && cc.Fabric1Interface != "" && cc.Fabric1PeerAddress != "" {
-		return syncIface, cc.Fabric1Interface
-	}
-	return syncIface, ""
+	return syncIface
 }
 
 // startHAWatchdogHeartbeat starts the HA watchdog heartbeat goroutine for the

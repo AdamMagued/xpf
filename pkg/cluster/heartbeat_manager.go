@@ -202,7 +202,7 @@ func (m *Manager) startHeartbeat(localAddr, peerAddr, vrfDevice, controlIface st
 	m.mu.Unlock()
 
 	slog.Info("cluster: heartbeat started",
-		"local", localAddr, "peer", peerAddr,
+		"local", localAddr, "peer", peerAddr, "vrf", vrfDevice,
 		"interval", interval, "threshold", threshold)
 	return nil
 }

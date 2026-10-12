@@ -1115,10 +1115,13 @@ convention (`fxp0`, `em0`, `ge-{0,7}-0-X`).
 `startClusterComms` (`daemon_ha_sync.go`) launches an **asynchronous
 constructor goroutine** that resolves the sync interface address (a retry loop
 of up to ~60s during the networkd race) before it can build the session-sync
-object. A transport-field change (`clusterTransportKey`) restarts comms
-mid-flight: the apply path calls `stopClusterComms` then `startClusterComms`
-while the *prior* epoch's constructor may still be resolving. That created two
-data-race failure modes:
+object. A transport-field change or sticky off-key bind (`clusterTransportKey`)
+restarts comms mid-flight: each bind retry resolves the device afresh, and an
+attempt on a device different from the epoch's expected binding marks that
+epoch changed. Apply or reassert then replaces all sockets together, even if a
+later retry resolves back to the expected device. The apply path calls
+`stopClusterComms` then `startClusterComms` while the *prior* epoch's
+constructor may still be resolving; that exposed two data-race failure modes:
 
 - **Nil-deref panic** — `stopClusterComms` set `d.sessionSync = nil` between the
   constructor's write and its next dereference (`SetAuthProvider`).
@@ -3028,19 +3031,25 @@ never lock an operator out of a remote box it manages.
     published management interface outside `vrf-mgmt` until another commit.
     The always-on `mgmtVRFReassertLoop` checks the last apply's immutable
     `mgmtVRFIfaceSet` every 30s, compares each present link's `MasterIndex` to
-    `vrf-mgmt`, and takes `applySem` only for drift (rechecking after acquire).
-    It warns and rebinds only drifted links, then reapplies management DHCP
-    routes; failures latch #11450 management-route debt, whose 30s routing
-    owner retries without a new config or DHCP event. After any successful
-    rebind, the same pass compares the effective cluster transport binding and
-    restarts comms if it changed; an EBUSY commit can then recover when the next
-    reassert tick converges without another commit (#12168). A healthy node
-    makes no bind or route writes. The set can include `fab*`, which the #9813
-    fabric loop also owns; semaphore serialization and the in-lock drift check
-    keep those owners from issuing duplicate binds.
+    `vrf-mgmt`, and takes `applySem` only for drift or a sticky off-key cluster
+    bind (rechecking after acquire). It warns and rebinds only drifted links,
+    then reapplies management DHCP routes; failures latch #11450 management-
+    route debt, whose 30s routing owner retries without a new config or DHCP
+    event. A reassert never takes #7901 cluster restart debt: nil config,
+    absent cluster config, and bootstrap mode return before transport reconcile;
+    step 20 remains the sole owner of that debt. After a successful rebind or
+    sticky off-key attempt, the same pass compares the epoch's expected
+    transport binding and restarts all comms if it changed, even when the
+    current resolver again matches. A healthy node makes no bind or route
+    writes. The set can include `fab*`, which the #9813 fabric loop also owns;
+    semaphore serialization and the in-lock drift check keep those owners from
+    issuing duplicate binds. Session-sync and fabric-gRPC VRF binding use the
+    primary fabric only, so missing or outside-VRF `fab1` cannot veto healthy
+    `fab0` sockets.
     `mgmt_vrf_reassert_11448_test.go` covers drift, healthy-path silence, route
     debt, cancellation, periodic convergence, and an out-of-band kernel unbind
-    in a private netns (skipped without `CAP_NET_ADMIN`).
+    in a private netns (skipped without `CAP_NET_ADMIN`); #12168 adds sticky
+    transport-retry and debt-survival regressions.
 
   **Host-inbound conntrack revocation retry (#6802, the same recovery shape):**
   `flushDeniedHostInboundConntrack` (the #5566 reconcile) deletes established

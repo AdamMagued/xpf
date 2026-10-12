@@ -348,8 +348,10 @@ func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, 
 
 	// 20. Detect cluster transport changes and restart comms (#87). The same
 	// compare-and-restart helper also owns kernel convergence from the
-	// management-VRF reassert loop.
-	d.reconcileClusterTransportBinding(cfg)
+	// management-VRF reassert loop, which never consumes #7901 debt.
+	if d.cluster != nil && d.daemonCtx != nil {
+		d.reconcileClusterTransportBinding(cfg, d.takeClusterCommsRestartNeeded())
+	}
 
 	if d.cluster != nil && d.daemonCtx != nil {
 		// #4647 BUG-B: reconcile the #2239 DHCP lease-sync push loop against
@@ -464,9 +466,9 @@ func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, 
 
 // reconcileClusterTransportBinding compares the live transport epoch with
 // current kernel/published evidence and restarts it when the binding changed.
-// Callers serialize this with config applies via applySem; in particular the
-// management-VRF reassert loop calls it only after a successful rebind.
-func (d *Daemon) reconcileClusterTransportBinding(cfg *config.Config) {
+// restartOwed is consumed only by step 20; background callers always pass
+// false. Callers serialize this with config applies via applySem.
+func (d *Daemon) reconcileClusterTransportBinding(cfg *config.Config, restartOwed bool) {
 	if d.cluster == nil || d.daemonCtx == nil {
 		return
 	}
@@ -474,7 +476,6 @@ func (d *Daemon) reconcileClusterTransportBinding(cfg *config.Config) {
 	// #6290: ONE guarded snapshot. Boot startup writes this field without
 	// applySem, so the snapshot must remain protected by clusterCommsMu.
 	active := d.activeTransport()
-	restartOwed := d.takeClusterCommsRestartNeeded()
 	if active == (clusterTransportKey{}) || (newTransport == active && !restartOwed) {
 		return
 	}

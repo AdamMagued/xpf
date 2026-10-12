@@ -109,6 +109,7 @@ func TestClusterTransportKeyTracksVRFConvergence12168(t *testing.T) {
 	fab0 := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "fab0", Index: 11}}
 	fab1 := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "fab1", Index: 12}}
 	vrf := &netlink.Vrf{LinkAttrs: netlink.LinkAttrs{Name: config.ManagementVRFDeviceName, Index: 77}}
+	missingFab1 := false
 	d.linkByNameFn = func(name string) (netlink.Link, error) {
 		switch name {
 		case "em0":
@@ -116,6 +117,9 @@ func TestClusterTransportKeyTracksVRFConvergence12168(t *testing.T) {
 		case "fab0":
 			return fab0, nil
 		case "fab1":
+			if missingFab1 {
+				return nil, errors.New("fab1 missing")
+			}
 			return fab1, nil
 		case config.ManagementVRFDeviceName:
 			return vrf, nil
@@ -158,19 +162,28 @@ func TestClusterTransportKeyTracksVRFConvergence12168(t *testing.T) {
 	d.publishMgmtVRFIfaces(map[string]bool{"fab0": true, "fab1": true})
 	fabricUnbound := d.clusterTransportForConfig(fabricCfg)
 	if fabricUnbound.VRFDevice != "" {
-		t.Fatalf("published but kernel-unbound fabric interfaces resolved VRF %q", fabricUnbound.VRFDevice)
+		t.Fatalf("unbound primary fabric interface resolved VRF %q", fabricUnbound.VRFDevice)
 	}
 	fab0.Attrs().MasterIndex = vrf.Attrs().Index
-	primaryOnly := d.clusterTransportForConfig(fabricCfg)
-	if primaryOnly != fabricUnbound {
-		t.Fatalf("dual-fabric key selected VRF with only one kernel member: before=%+v after=%+v",
-			fabricUnbound, primaryOnly)
+	fabricPrimaryBound := d.clusterTransportForConfig(fabricCfg)
+	if fabricPrimaryBound == fabricUnbound || fabricPrimaryBound.VRFDevice != config.ManagementVRFDeviceName {
+		t.Fatalf("healthy primary with unbound secondary did not select VRF: before=%+v after=%+v",
+			fabricUnbound, fabricPrimaryBound)
+	}
+	missingFab1 = true
+	if got := d.clusterTransportForConfig(fabricCfg); got != fabricPrimaryBound {
+		t.Fatalf("missing secondary changed primary-only transport key: before=%+v after=%+v",
+			fabricPrimaryBound, got)
+	}
+	missingFab1 = false
+	if got := d.clusterTransportForConfig(fabricCfg); got != fabricPrimaryBound {
+		t.Fatalf("secondary outside VRF changed primary-only transport key: before=%+v after=%+v",
+			fabricPrimaryBound, got)
 	}
 	fab1.Attrs().MasterIndex = vrf.Attrs().Index
-	fabricBound := d.clusterTransportForConfig(fabricCfg)
-	if fabricBound == fabricUnbound || fabricBound.VRFDevice != config.ManagementVRFDeviceName {
-		t.Fatalf("published kernel dual-fabric membership produced key %+v, want VRF %q",
-			fabricBound, config.ManagementVRFDeviceName)
+	if got := d.clusterTransportForConfig(fabricCfg); got != fabricPrimaryBound {
+		t.Fatalf("secondary VRF convergence changed primary-only transport key: before=%+v after=%+v",
+			fabricPrimaryBound, got)
 	}
 }
 
