@@ -146,6 +146,9 @@ func TestHoldExpiryAfterPeriodicFailure12241(t *testing.T) {
 	if got := requests.Load(); got != 2 {
 		t.Fatalf("requests=%d, want 2", got)
 	}
+	for updates.Load() < 2 && time.Now().Before(expiryDeadline) {
+		time.Sleep(time.Millisecond)
+	}
 	if got := updates.Load(); got != 2 {
 		t.Fatalf("onUpdate calls=%d, want 2", got)
 	}
