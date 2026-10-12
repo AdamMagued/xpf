@@ -171,13 +171,13 @@ It does **not** judge whether a skip is justified. There is no marker
 convention on Go skips, so such a verdict would be a guess off message prose,
 and a census whose verdict is a guess trains people to argue with it.
 
-### There is no CI
+### CI does not run the packet gates
 
-`.github/` contains only `instructions/`, and the Makefile says so twice. Every
-gate above is developer-invoked and chained from no default target. The merge
-criterion in `docs/engineering-style.md` used to read "squash merge once CI is
-green", which was **vacuously satisfiable**; it now names the gates and when to
-run each.
+`.github/workflows/test.yml` runs the commands listed in
+[`ci-gate-contract.md`](ci-gate-contract.md); the packet-level gates above
+remain developer-invoked.
+
+Other stale no-CI references are tracked in #12632.
 
 ## Build & Deploy Workflow
 
