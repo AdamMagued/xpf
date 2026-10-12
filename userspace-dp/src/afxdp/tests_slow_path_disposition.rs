@@ -2831,6 +2831,12 @@ fn stage11_declared_end_rejects_v4_spi_slack_10516() {
     assert_eq!(counters.sa_miss_truncated, 1);
     assert_eq!(recycled, 1);
 }
+fn stage11_static_nat_to_self_snapshot_10516() -> ConfigSnapshot {
+    let mut snapshot = static_nat_snapshot();
+    snapshot.static_nat_rules[0].internal_ip = "192.168.1.1".to_string();
+    snapshot
+}
+
 #[test]
 fn stage11_static_dnat_external_sa_miss_and_hit_10516() {
     let src = Ipv4Addr::new(198, 51, 100, 10);
@@ -2850,17 +2856,22 @@ fn stage11_static_dnat_external_sa_miss_and_hit_10516() {
         crate::afxdp::tests_support::TEST_LAN_MAC,
     );
     let meta = stage11_ipv4_udp_meta_10516(&frame, src, dst, 6, 40_000, 4500);
-    let ownership = build_forwarding_state(&static_nat_snapshot());
+    let transit_ownership = build_forwarding_state(&static_nat_snapshot());
+    assert!(
+        !transit_ownership.owns_ipsec_local_destination(IpAddr::V4(dst)),
+        "a static NAT to a transit host is not an XFRM-local destination"
+    );
+    let snapshot = stage11_static_nat_to_self_snapshot_10516();
+    let ownership = build_forwarding_state(&snapshot);
     assert!(ownership.owns_configured_ip(IpAddr::V4(dst)));
+    assert!(
+        ownership.owns_ipsec_local_destination(IpAddr::V4(dst)),
+        "static NAT to the firewall interface is an XFRM-local destination"
+    );
     assert!(parse_session_flow_from_bytes(&frame, meta).is_some());
     let (_, miss_delegated, miss_counters, miss_recycled, miss_queues, _forwarded) =
         run_stage11_frame_poll_on_snapshot_with_options_10516(
-            &static_nat_snapshot(),
-            &frame,
-            meta,
-            None,
-            false,
-            false,
+            &snapshot, &frame, meta, None, false, false,
         );
     assert_eq!(miss_delegated.queued_packets, 0);
     assert_eq!(miss_counters.sa_miss_dropped_packets, 1);
@@ -2872,7 +2883,7 @@ fn stage11_static_dnat_external_sa_miss_and_hit_10516() {
         .expect("same-family external SA fixture");
     let (_, hit_delegated, hit_counters, hit_recycled, hit_queues, _forwarded) =
         run_stage11_frame_poll_on_snapshot_with_options_10516(
-            &static_nat_snapshot(),
+            &snapshot,
             &frame,
             meta,
             Some(key),
@@ -2945,12 +2956,18 @@ fn stage11_positive_cells_never_mint_adjudicated_q0_10516() {
     );
     let external_meta =
         stage11_ipv4_udp_meta_10516(&external_frame, external_src, external_dst, 6, 40_000, 4500);
+    let external_snapshot = stage11_static_nat_to_self_snapshot_10516();
+    let external_ownership = build_forwarding_state(&external_snapshot);
+    assert!(
+        external_ownership.owns_ipsec_local_destination(IpAddr::V4(external_dst)),
+        "the external static-NAT target must resolve to a firewall interface"
+    );
     let external_key =
         ipsec_sa_key(IpAddr::V4(external_dst), external_spi, IpAddr::V4(external_src))
             .expect("same-family external SA fixture");
     let (external_trusted, external_delegated, _, _, external_queues, _forwarded) =
         run_stage11_frame_poll_on_snapshot_with_options_10516(
-            &static_nat_snapshot(),
+            &external_snapshot,
             &external_frame,
             external_meta,
             Some(external_key),
@@ -3177,19 +3194,35 @@ fn drive_neigh_miss_10311(case: NeighMissNat10311) {
     let (frame, meta) = if v6 {
         let client: std::net::Ipv6Addr = "2001:559:8585:ef00::102".parse().unwrap();
         let server: std::net::Ipv6Addr = "2606:4700:4700::1111".parse().unwrap();
-        let frame = build_txn_tcp_syn_frame_v6(client, server, 12345, 80, crate::afxdp::tests_support::TEST_LAN_MAC);
-        let meta = txn_meta_v6(24, frame.len());
+        let frame = build_txn_tcp_syn_frame_v6(
+            client,
+            server,
+            12345,
+            80,
+            crate::afxdp::tests_support::TEST_LAN_MAC,
+        );
+        let mut meta = txn_meta_v6(24, frame.len());
+        meta.flow_src_addr = client.octets();
+        meta.flow_dst_addr = server.octets();
+        meta.flow_src_port = 12345;
+        meta.flow_dst_port = 80;
         (frame, meta)
     } else {
+        let client = Ipv4Addr::new(10, 0, 61, 102);
+        let server = Ipv4Addr::new(8, 8, 8, 8);
         let frame = build_txn_tcp_syn_frame_v4(
-            Ipv4Addr::new(10, 0, 61, 102),
-            Ipv4Addr::new(8, 8, 8, 8),
+            client,
+            server,
             12345,
             443,
             TCP_FLAG_SYN,
             crate::afxdp::tests_support::TEST_LAN_MAC,
         );
-        let meta = txn_meta_v4(24, TCP_FLAG_SYN, frame.len() as u16);
+        let mut meta = txn_meta_v4(24, TCP_FLAG_SYN, frame.len() as u16);
+        meta.flow_src_addr[..4].copy_from_slice(&client.octets());
+        meta.flow_dst_addr[..4].copy_from_slice(&server.octets());
+        meta.flow_src_port = 12345;
+        meta.flow_dst_port = 443;
         (frame, meta)
     };
     let (_batch, dbg, published) = txn_run_descriptor_capturing_shared(
@@ -3448,10 +3481,11 @@ fn neigh_miss_nptv6_suppresses_slow_path_copy_while_parked_10311() {
 // #10525: DNAT-to-self IKE must pass the userspace fine gates (lo0 + to-zone
 // junos-host) before Stage-11 reinject, and must seed the live-exchange table
 // only AFTER those gates pass. The VIP 203.0.113.9:500/udp DNATs to the
-// firewall's own 10.0.61.1:500; Stage 11 claims it pre-NAT via
-// `owns_configured_ip` (DNAT destinations are members of `local_v*`) and the
-// reinject carries the wire tuple (`NatDecision::default`, no translation), so
-// both fine gates judge the external tuple.
+// firewall's own 10.0.61.1:500; Stage 11 claims it pre-NAT because
+// `owns_ipsec_local_destination` accepts a NAT external whose translations all
+// target configured interface addresses and no transit DNAT matches it
+// (#11439). The reinject carries the wire tuple (`NatDecision::default`, no
+// translation), so both fine gates judge the external tuple.
 const IKE_10525_SRC: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 10);
 const IKE_10525_VIP: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 9);
 const IKE_10525_SPI: u64 = 0x1122_3344_5566_7788;
@@ -3513,6 +3547,27 @@ fn lo0_ike_discard_snapshot_10525() -> ConfigSnapshot {
     snapshot
 }
 
+/// `reth0.80` (ifindex 12) is VLAN 80 on parent ifindex 11, so the tagged-only
+/// ingress gate (#11297) drops untagged frames on it. Insert the 802.1Q tag
+/// ahead of the existing EtherType so IPv4 and IPv6 frames keep their family.
+fn tag_ike_frame_vlan80_10525(mut frame: Vec<u8>) -> Vec<u8> {
+    frame.splice(12..12, [0x81, 0x00, 0x00, 0x50]);
+    frame
+}
+
+/// Shim metadata for a frame tagged by `tag_ike_frame_vlan80_10525`: the VID
+/// and tag-present bit `userspace-xdp` reports for a tagged frame, and offsets
+/// past the 4-byte tag. Build `meta` from the tagged frame so `pkt_len`
+/// already counts the tag.
+fn tag_ike_meta_vlan80_10525(mut meta: UserspaceDpMeta) -> UserspaceDpMeta {
+    meta.ingress_vlan_id = 80;
+    meta.ingress_vlan_present = 1;
+    meta.l3_offset += 4;
+    meta.l4_offset += 4;
+    meta.payload_offset += 4;
+    meta
+}
+
 fn new_ike_frame_10525() -> Vec<u8> {
     let mut frame = build_stage11_ike_v4_frame_10516(
         IKE_10525_SRC,
@@ -3523,7 +3578,7 @@ fn new_ike_frame_10525() -> Vec<u8> {
         0,
     );
     frame[..6].copy_from_slice(&crate::afxdp::tests_support::TEST_WAN_MAC);
-    frame
+    tag_ike_frame_vlan80_10525(frame)
 }
 
 fn followup_ike_frame_10525() -> Vec<u8> {
@@ -3536,18 +3591,18 @@ fn followup_ike_frame_10525() -> Vec<u8> {
         IKE_10525_RESPONDER_SPI,
     );
     frame[..6].copy_from_slice(&crate::afxdp::tests_support::TEST_WAN_MAC);
-    frame
+    tag_ike_frame_vlan80_10525(frame)
 }
 
 fn ike_meta_10525(frame: &[u8]) -> UserspaceDpMeta {
-    stage11_ipv4_udp_meta_10516(
+    tag_ike_meta_vlan80_10525(stage11_ipv4_udp_meta_10516(
         frame,
         IKE_10525_SRC,
         IKE_10525_VIP,
         IKE_10525_IFINDEX,
         40_000,
         500,
-    )
+    ))
 }
 
 fn ike_key_10525() -> crate::afxdp::forwarding::IkeExchangeKey {
@@ -3573,8 +3628,8 @@ fn run_stage11_ike_poll_10525(
 ) {
     let forwarding = build_forwarding_state(snapshot);
     assert!(
-        forwarding.owns_configured_ip(IpAddr::V4(IKE_10525_VIP)),
-        "premise: the DNAT VIP must be firewall-owned so Stage 11 claims the IKE pre-NAT"
+        forwarding.owns_ipsec_local_destination(IpAddr::V4(IKE_10525_VIP)),
+        "premise: the DNAT-to-self VIP must be XFRM-local so Stage 11 claims the IKE pre-NAT"
     );
     forwarding.ipsec_sa.publish_empty_dump_for_test();
     let reinjector = Arc::new(crate::slowpath::SlowPathReinjector::new_without_worker(1500));
@@ -4062,7 +4117,7 @@ fn c2_dnat_to_self_ike_coarse_deny_drops_without_seed_10525() {
 fn t1_gre_inner_ike_application_any_deny_drops_10585() {
     let src = Ipv4Addr::new(198, 51, 100, 10);
     let dst = Ipv4Addr::new(10, 255, 0, 1);
-    let mut snapshot = gre_to_self_snapshot();
+    let mut snapshot = gre_to_self_native_untagged_snapshot();
     snapshot.policies.push(junos_host_ike_deny_10585(
         "wan",
         "198.51.100.10/32",
@@ -4090,7 +4145,7 @@ fn t1_gre_inner_ike_application_any_deny_drops_10585() {
 fn t2_gre_inner_ike_tuple_deny_drops_10585() {
     let src = Ipv4Addr::new(198, 51, 100, 10);
     let dst = Ipv4Addr::new(10, 255, 0, 1);
-    let mut snapshot = gre_to_self_snapshot();
+    let mut snapshot = gre_to_self_native_untagged_snapshot();
     snapshot.policies.push(junos_host_ike_deny_10585(
         "wan",
         "198.51.100.10/32",
@@ -4118,7 +4173,7 @@ fn t2_gre_inner_ike_tuple_deny_drops_10585() {
 fn t3_gre_inner_seeded_followup_late_deny_drops_10585() {
     let src = Ipv4Addr::new(198, 51, 100, 10);
     let dst = Ipv4Addr::new(10, 255, 0, 1);
-    let mut snapshot = gre_to_self_snapshot();
+    let mut snapshot = gre_to_self_native_untagged_snapshot();
     snapshot.policies.push(junos_host_ike_deny_10585(
         "wan",
         "198.51.100.10/32",
@@ -4153,7 +4208,7 @@ fn t3_gre_inner_seeded_followup_late_deny_drops_10585() {
 fn t4_gre_inner_ike_control_delegates_and_seeds_10585() {
     let src = Ipv4Addr::new(198, 51, 100, 10);
     let dst = Ipv4Addr::new(10, 255, 0, 1);
-    let snapshot = gre_to_self_snapshot();
+    let snapshot = gre_to_self_native_untagged_snapshot();
     let frame = build_gre_inner_ike_frame_10585(src, dst, 40_000, 500, 0x1058_5004, 0);
     let meta = gre_ike_meta_10585(&frame);
     let key = crate::afxdp::forwarding::IkeExchangeKey::new(
@@ -4190,7 +4245,10 @@ fn t5_static_nat_to_self_ike_application_any_deny_drops_10585() {
     ));
     let mut frame = build_stage11_ike_v4_frame_10516(src, dst, 40_000, 500, 0x1058_5005, 0);
     frame[..6].copy_from_slice(&crate::afxdp::tests_support::TEST_WAN_MAC);
-    let meta = stage11_ipv4_udp_meta_10516(&frame, src, dst, 12, 40_000, 500);
+    let frame = tag_ike_frame_vlan80_10525(frame);
+    let meta = tag_ike_meta_vlan80_10525(stage11_ipv4_udp_meta_10516(
+        &frame, src, dst, 12, 40_000, 500,
+    ));
     let ike_exchanges = Arc::new(crate::afxdp::forwarding::IkeExchangeTable::new());
     let (trusted, delegated, recycled, queues, batch, dbg) =
         run_stage11_ike_poll_10585(&snapshot, &frame, meta, &ike_exchanges);
@@ -4254,7 +4312,15 @@ fn t7_natt_4500_dnat_gre_and_esp_controls_10585() {
     let mut dnat_frame =
         build_stage11_ike_v4_frame_10516(src, IKE_10525_VIP, 40_000, 4500, 0x1058_5007, 0);
     dnat_frame[..6].copy_from_slice(&crate::afxdp::tests_support::TEST_WAN_MAC);
-    let dnat_meta = stage11_ipv4_udp_meta_10516(&dnat_frame, src, IKE_10525_VIP, 12, 40_000, 4500);
+    let dnat_frame = tag_ike_frame_vlan80_10525(dnat_frame);
+    let dnat_meta = tag_ike_meta_vlan80_10525(stage11_ipv4_udp_meta_10516(
+        &dnat_frame,
+        src,
+        IKE_10525_VIP,
+        12,
+        40_000,
+        4500,
+    ));
     let dnat_ike = Arc::new(crate::afxdp::forwarding::IkeExchangeTable::new());
     let (trusted, delegated, recycled, queues, batch, dbg) =
         run_stage11_ike_poll_10585(&dnat_deny, &dnat_frame, dnat_meta, &dnat_ike);
@@ -4271,7 +4337,7 @@ fn t7_natt_4500_dnat_gre_and_esp_controls_10585() {
     assert_eq!(dbg.local, 1);
     assert_eq!(batch.host_inbound_denied_packets, 0);
 
-    let mut gre_deny = gre_to_self_snapshot();
+    let mut gre_deny = gre_to_self_native_untagged_snapshot();
     gre_deny.policies.push(junos_host_ike_deny_10585(
         "wan",
         "198.51.100.10/32",
@@ -4292,7 +4358,7 @@ fn t7_natt_4500_dnat_gre_and_esp_controls_10585() {
     assert_eq!(dbg.local, 1);
     assert_eq!(batch.host_inbound_denied_packets, 0);
 
-    let gre_control = gre_to_self_snapshot();
+    let gre_control = gre_to_self_native_untagged_snapshot();
     let gre_control_frame =
         build_gre_inner_ike_frame_10585(src, gre_dst, 40_000, 4500, 0x1058_5009, 0);
     let gre_control_meta = gre_ike_meta_10585(&gre_control_frame);
@@ -4361,7 +4427,10 @@ fn t8_v6_dnat_to_self_ike_application_any_deny_drops_10585() {
         "any",
     ));
     let frame = build_stage11_ike_v6_frame_10585(src, dst, 40_000, 500, 0x1058_500a, 0);
-    let meta = stage11_ipv6_udp_meta_10585(&frame, src, dst, 12, 40_000, 500);
+    let frame = tag_ike_frame_vlan80_10525(frame);
+    let meta = tag_ike_meta_vlan80_10525(stage11_ipv6_udp_meta_10585(
+        &frame, src, dst, 12, 40_000, 500,
+    ));
     let ike_exchanges = Arc::new(crate::afxdp::forwarding::IkeExchangeTable::new());
     let (trusted, delegated, recycled, queues, batch, dbg) =
         run_stage11_ike_poll_10585(&snapshot, &frame, meta, &ike_exchanges);
@@ -4383,6 +4452,11 @@ fn t8_v6_dnat_to_self_ike_application_any_deny_drops_10585() {
                 address: "2001:db8:1058::1/128".to_string(),
                 scope: 0,
             });
+        }
+        if interface.ifindex == 11 && interface.parent_ifindex == 0 {
+            // The outer frame is untagged (VID 0): select native VLAN 80 on
+            // the underlay, as `gre_to_self_native_untagged_snapshot` does.
+            interface.native_vlan_id = 80;
         }
     }
     gre_snapshot.policies.push(junos_host_ike_deny_10585(
@@ -4413,7 +4487,7 @@ fn t8_v6_dnat_to_self_ike_application_any_deny_drops_10585() {
 fn t9_gre_inner_coarse_deny_remains_first_10585() {
     let src = Ipv4Addr::new(198, 51, 100, 10);
     let dst = Ipv4Addr::new(10, 255, 0, 1);
-    let mut snapshot = gre_to_self_snapshot();
+    let mut snapshot = gre_to_self_native_untagged_snapshot();
     for zone in snapshot.zones.iter_mut() {
         zone.host_inbound_system_services.clear();
         if zone.name == "wan" {
