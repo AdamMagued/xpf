@@ -205,6 +205,9 @@ func TestUndefinedSchedulerGlobalDenyRejectPoisons12244(t *testing.T) {
 // DENY must still come through clean (no poison, snapshot accepted).
 // RED-on-revert: deleting the `cfg.Schedulers[...]; ok → return` guard
 // poisons b-deny-def and refuses the snapshot (over-poisoning).
+// N1 (Opus R1): the same running walker must also leave an UNSCHEDULED deny
+// clean. RED-on-mutant: dropping the `pol.SchedulerName == ""` guard misses
+// cfg.Schedulers[""] and poisons c-deny-plain, refusing the whole snapshot.
 func TestDefinedSchedulerDenyWithUndefinedPermitStaysClean12244(t *testing.T) {
 	text := `schedulers { scheduler workhours { daily { start-time 09:00:00; stop-time 17:00:00; } } }` + `security {
     zones { security-zone trust { interfaces { ge-0/0/0.0; } } security-zone untrust { interfaces { ge-0/0/1.0; } } }
@@ -219,6 +222,10 @@ func TestDefinedSchedulerDenyWithUndefinedPermitStaysClean12244(t *testing.T) {
                 match { source-address any; destination-address any; application any; }
                 then { deny; }
                 scheduler-name workhours;
+            }
+            policy c-deny-plain {
+                match { source-address any; destination-address any; application any; }
+                then { deny; }
             }
         }
     }
@@ -252,15 +259,22 @@ func TestDefinedSchedulerDenyWithUndefinedPermitStaysClean12244(t *testing.T) {
 	if def.LenientContentDropped {
 		t.Fatal("defined-scheduler deny must NOT be poisoned even while the poison function runs (guard over-poisoning)")
 	}
+	plain, ok := byName["c-deny-plain"]
+	if !ok {
+		t.Fatal("c-deny-plain not found")
+	}
+	if plain.LenientContentDropped {
+		t.Fatal(`policy "c-deny-plain" poisoned: an unscheduled deny must NOT be poisoned while the poison function runs (empty SchedulerName guard)`)
+	}
 	rules, err := buildPolicySnapshotsWithSchedulerState(cfg, map[string]bool{"workhours": true})
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	if len(rules) != 2 {
-		t.Fatalf("len(rules)=%d, want 2", len(rules))
+	if len(rules) != 3 {
+		t.Fatalf("len(rules)=%d, want 3", len(rules))
 	}
 	if reasons := PolicyContentRejectionReasons(cfg, nil); len(reasons) != 0 {
-		t.Fatalf("defined-scheduler deny alongside an undefined-scheduler permit must not refuse the snapshot: %q", reasons)
+		t.Fatalf("defined-scheduler and unscheduled denies alongside an undefined-scheduler permit must not refuse the snapshot: %q", reasons)
 	}
 }
 
@@ -298,5 +312,45 @@ func TestUndefinedSchedulerPermitOtherPoisonDoesNotNameScheduler12244(t *testing
 	}
 	if strings.Contains(reasons[0], "scheduler") || strings.Contains(reasons[0], "missing-sched") {
 		t.Fatalf("undefined scheduler on a separately poisoned permit must not be reported as the cause: %q", reasons[0])
+	}
+}
+
+// N2 (Opus R1): the undefined-scheduler lookup of the attribution gate must
+// run against a DEFINED scheduler. A DENY whose scheduler exists, poisoned for
+// another dropped constraint, must not report that scheduler as a cause.
+// RED-on-mutant: replacing the cfg.Schedulers lookup with `if true` reports
+// `scheduler "workhours"` in the mirror.
+func TestDefinedSchedulerDenyOtherPoisonDoesNotNameScheduler12244(t *testing.T) {
+	cfg := &config.Config{
+		Schedulers: map[string]*config.SchedulerConfig{
+			"workhours": {Name: "workhours", StartTime: "09:00", StopTime: "17:00"},
+		},
+		Security: config.SecurityConfig{
+			Zones: map[string]*config.ZoneConfig{
+				"trust":   {Name: "trust"},
+				"untrust": {Name: "untrust"},
+			},
+			Policies: []*config.ZonePairPolicies{{
+				FromZone: "trust",
+				ToZone:   "untrust",
+				Policies: []*config.Policy{{
+					Name:                  "bad-destination",
+					Match:                 config.PolicyMatch{SourceAddresses: []string{"any"}, DestinationAddresses: []string{"missing-destination"}, Applications: []string{"any"}},
+					Action:                config.PolicyDeny,
+					SchedulerName:         "workhours",
+					LenientContentDropped: true,
+				}},
+			}},
+		},
+	}
+	reasons := PolicyContentRejectionReasons(cfg, nil)
+	if len(reasons) != 1 {
+		t.Fatalf("rejection reasons=%q, want one policy reason", reasons)
+	}
+	if !strings.Contains(reasons[0], `destination-address "missing-destination"`) {
+		t.Fatalf("rejection reason does not name the dropped destination: %q", reasons[0])
+	}
+	if strings.Contains(reasons[0], "scheduler") || strings.Contains(reasons[0], "workhours") {
+		t.Fatalf("defined scheduler on a separately poisoned deny must not be reported as the cause: %q", reasons[0])
 	}
 }
