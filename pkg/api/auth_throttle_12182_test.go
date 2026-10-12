@@ -71,8 +71,8 @@ func TestAuthThrottleFullOfLiveLockoutsRefusesAdmission12182(t *testing.T) {
 	}
 
 	_, retry := tracker.reserve("203.0.113.9", authThrottleAPIKeyAccount)
-	if retry <= 0 {
-		t.Fatal("reserve on a table full of live lockouts was admitted, want refusal with retry-after")
+	if retry != time.Second {
+		t.Fatalf("saturated reserve retry = %v, want %v", retry, time.Second)
 	}
 
 	live, total := countLiveLockedBuckets12182(tracker, now)
