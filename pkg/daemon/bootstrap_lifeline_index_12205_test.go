@@ -18,9 +18,11 @@ import (
 // rename, no reload and no fxp0 .network on exactly the shapes below. This
 // file's UNIQUE contribution is the file-creation half 12151 does not assert:
 // no .link write (and no file of any kind) on the index-1 and absent-index
-// refusals. A mutant that writes the .link before the guard fails ONLY these
-// two cells — every 12151/6789/7114/12156 control stays green — which is the
-// proof this file earns its keep (see docs/log/12205.md).
+// refusals. A mutant that writes the .link only on these refusal paths (`if
+// idx != 0 { write }` ahead of the guards) fails ONLY these two cells —
+// every 12151/6789/7114/12156 control stays green; an ungated pre-guard write
+// also reds the two #12156 MAC-form retention controls via the index-0 path
+// (see docs/log/12205.md).
 //
 // Production is correct as-is: the guards are explicit and return before the
 // .network write, the .link write, the rename and the reload. This file is
