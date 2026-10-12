@@ -637,6 +637,20 @@ compiler expands those leaves as sets. Zone-local inner names are rendered as
 Tolerant loading retains its warning downgrade; applying an older persisted
 invalid book still reaches the shared prepass.
 
+**Policy wildcards are not address-set members (#12243):** `any` and the
+single-family `any-ipv4` / `any-ipv6` are policy match keywords, and `any4` /
+`any6` are internal short forms that the userspace matcher reads as family
+wildcards. None of them is an address-book name, and no set resolver resolves
+one as a member: the apply prepass `compileAddressBook` misses them in AddrIDs
+and aborts the whole apply, and userspace expansion drops them. Strict commit
+therefore rejects a wildcard member in every set, including unreferenced and
+zone-local sets. `validateAddressSetMembersDefinedStrict`'s definedness pass
+rejects a direct `address` wildcard, naming the set, leaf and member; a nested
+`address-set` wildcard is left to the #12214 expansion pass above, which reports
+it as a policy wildcard rather than an address-set. The tolerant path warns
+instead (#1960). Persisted configs carrying one are not migrated and still fail
+apply until edited.
+
 **IPv4-mapped IPv6 address-book prefixes are rejected before commit (#10688):**
 Go's `net.IP.To4()` files `::ffff:a.b.c.d/nn` into `prefixes_v4`, but the
 userspace helper parses the colon-bearing prefix as IPv6 and rejects the entire
