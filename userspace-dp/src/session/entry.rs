@@ -343,8 +343,8 @@ pub(crate) struct SessionMetadata {
     /// `DEFAULT_POLICY_COUNTER_IDX` (`u32::MAX`) sentinel, which
     /// `hit_counter_by_idx` resolves to `PolicyState::default_counter`, so a
     /// default-PERMIT session re-counts every packet on the fast path. The
-    /// cold path still counts the first packet once
-    /// in `try_match_rule`, so each packet is counted exactly once. Like
+    /// cold path counts packet 1 in `apply_frag_deny_override_and_count`,
+    /// giving exactly one count per packet. Like
     /// `policy_id` (#3056), this rides the shared-session map and sibling-worker
     /// replicas; #3301 also carries it across the cross-node HA session-sync
     /// wire (the SESSION_OPEN delta + `SessionSyncRequest.policy_counter_idx`).

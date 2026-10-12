@@ -1025,8 +1025,10 @@ with no valueType and no validator, so any string reached the dialer's resolver.
   sentinel into the `PolicyNames` map so `show security flow session` and the
   gRPC session entries render it consistently. The sentinel is display-only —
   the implicit default touches NO per-rule hit counter (those are name-keyed
-  per #3143/#3154 and only the matched-rule path in `try_match_rule`
-  increments one). Coverage: `default_policy_sentinel_3057_test.go`
+  per #3143/#3154; on the cold path only a matched rule's
+  `apply_frag_deny_override_and_count` increments one, and #3073 re-counts
+  established packets).
+  Coverage: `default_policy_sentinel_3057_test.go`
   (Go) + `default_policy_no_match_emits_sentinel_policy_id` /
   `policy_deny_event_emit_carries_default_policy_sentinel` (Rust).
 - `pkg/dataplane/userspace/eventstream_test.go` owns the deterministic

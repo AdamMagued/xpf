@@ -5718,6 +5718,326 @@ fn flowless_fragment_fails_closed_against_skipped_port_bearing_deny_4569() {
     );
 }
 
+#[test]
+fn flowless_fragment_override_does_not_count_permit_rule_12226() {
+    let state = parse_policy_state(
+        "deny",
+        &[frag_deny_https_snapshot(), frag_permit_any_snapshot()],
+        &test_zone_name_to_id(),
+    );
+    let permit_counter = &state.rules[1].hit_counter;
+    let deny_counter = &state.rules[0].hit_counter;
+    assert_eq!(permit_counter.test_packet_count(), 0);
+    assert_eq!(deny_counter.test_packet_count(), 0);
+
+    let frag = evaluate_policy_result_l3_aware(
+        &state,
+        TEST_TRUST_ZONE_ID,
+        TEST_UNTRUST_ZONE_ID,
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 1, 2, 3)),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 5)),
+        PROTO_TCP,
+        0,
+        0,
+        None,
+        64,
+        false,
+    );
+
+    assert_eq!(frag.action, PolicyAction::Deny);
+    assert_eq!(
+        permit_counter.test_packet_count(),
+        0,
+        "the overridden permit must not count this dropped fragment",
+    );
+    assert_eq!(
+        deny_counter.test_packet_count(),
+        0,
+        "the skipped port-bearing deny remains deliberately uncounted",
+    );
+    assert_eq!(permit_counter.test_byte_count(), 0);
+    assert_eq!(deny_counter.test_byte_count(), 0);
+
+    assert_eq!(
+        evaluate_policy_result_l3_aware(
+            &state,
+            TEST_TRUST_ZONE_ID,
+            TEST_UNTRUST_ZONE_ID,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1)),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 5)),
+            PROTO_TCP,
+            0,
+            0,
+            None,
+            64,
+            false,
+        )
+        .action,
+        PolicyAction::Permit,
+    );
+    assert_eq!(permit_counter.test_packet_count(), 1);
+    assert_eq!(permit_counter.test_byte_count(), 64);
+    assert_eq!(deny_counter.test_packet_count(), 0);
+}
+
+#[test]
+fn junos_host_fragment_override_does_not_count_permit_rule_12226() {
+    let state = parse_policy_state(
+        "permit",
+        &[
+            junos_host_frag_deny_https_snapshot(),
+            junos_host_frag_permit_any_snapshot(),
+        ],
+        &test_zone_name_to_id(),
+    );
+    let permit_counter = &state.rules[1].hit_counter;
+    let deny_counter = &state.rules[0].hit_counter;
+
+    let frag = evaluate_junos_host_policy_l3_aware(
+        &state,
+        TEST_TRUST_ZONE_ID,
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 1, 2, 3)),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 1, 1)),
+        PROTO_TCP,
+        0,
+        0,
+        None,
+        64,
+        false,
+    )
+    .expect("the skipped host deny overrides the permit");
+
+    assert_eq!(frag.action, PolicyAction::Deny);
+    assert_eq!(
+        permit_counter.test_packet_count(),
+        0,
+        "the overridden host permit must not count this dropped fragment",
+    );
+    assert_eq!(
+        deny_counter.test_packet_count(),
+        0,
+        "the skipped host deny remains deliberately uncounted",
+    );
+    assert_eq!(permit_counter.test_byte_count(), 0);
+    assert_eq!(deny_counter.test_byte_count(), 0);
+
+    assert_eq!(
+        evaluate_junos_host_policy_l3_aware(
+            &state,
+            TEST_TRUST_ZONE_ID,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1)),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 1, 1)),
+            PROTO_TCP,
+            0,
+            0,
+            None,
+            64,
+            false,
+        )
+        .map(|result| result.action),
+        Some(PolicyAction::Permit),
+    );
+    assert_eq!(permit_counter.test_packet_count(), 1);
+    assert_eq!(permit_counter.test_byte_count(), 64);
+    assert_eq!(deny_counter.test_packet_count(), 0);
+}
+
+fn frag_override_tier_rule_12226(
+    policy_id: u32,
+    name: &str,
+    zones: (&str, &str, &str, &str),
+    action: &str,
+    port_bearing: bool,
+    src: &str,
+) -> PolicyRuleSnapshot {
+    let (from_zone, to_zone, match_from, match_to) = zones;
+    let mut snap = PolicyRuleSnapshot {
+        policy_id,
+        name: name.to_string(),
+        from_zone: from_zone.to_string(),
+        to_zone: to_zone.to_string(),
+        match_from_zone: match_from.to_string(),
+        match_to_zone: match_to.to_string(),
+        source_addresses: vec![src.to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        action: action.to_string(),
+        ..Default::default()
+    };
+    if port_bearing {
+        snap.applications = vec!["junos-https".to_string()];
+        snap.application_terms = vec![PolicyApplicationSnapshot {
+            name: "junos-https".to_string(),
+            protocol: "tcp".to_string(),
+            source_port: String::new(),
+            destination_port: "443".to_string(),
+            icmp_type: None,
+            icmp_code: None,
+            inactivity_timeout: None,
+        }];
+    }
+    snap
+}
+
+#[test]
+fn every_tier_counts_once_and_skips_overridden_permit_12226() {
+    let v4 = |a, b, c, d| std::net::IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, d));
+    for (tier, zones) in [
+        ("to-any", ("trust", "any", "", "")),
+        ("from-any", ("any", "untrust", "", "")),
+        ("both-any", ("any", "any", "", "")),
+        ("global", ("junos-global", "junos-global", "", "")),
+    ] {
+        let state = parse_policy_state(
+            "deny",
+            &[
+                frag_override_tier_rule_12226(
+                    7,
+                    "deny-https-10",
+                    zones,
+                    "deny",
+                    true,
+                    "10.0.0.0/8",
+                ),
+                frag_override_tier_rule_12226(8, "permit-rest", zones, "permit", false, "any"),
+            ],
+            &test_zone_name_to_id(),
+        );
+        let deny = &state.rules[0].hit_counter;
+        let permit = &state.rules[1].hit_counter;
+        let frag = evaluate_policy_result_l3_aware(
+            &state,
+            TEST_TRUST_ZONE_ID,
+            TEST_UNTRUST_ZONE_ID,
+            v4(10, 1, 2, 3),
+            v4(203, 0, 113, 5),
+            PROTO_TCP,
+            0,
+            0,
+            None,
+            64,
+            false,
+        );
+        assert_eq!(frag.action, PolicyAction::Deny, "{tier}: override");
+        assert_eq!(permit.test_packet_count(), 0, "{tier}: overridden permit");
+        assert_eq!(deny.test_packet_count(), 0, "{tier}: skipped deny");
+        let ok = evaluate_policy_result_l3_aware(
+            &state,
+            TEST_TRUST_ZONE_ID,
+            TEST_UNTRUST_ZONE_ID,
+            v4(192, 168, 1, 1),
+            v4(203, 0, 113, 5),
+            PROTO_TCP,
+            0,
+            0,
+            None,
+            64,
+            false,
+        );
+        assert_eq!(ok.action, PolicyAction::Permit, "{tier}: unaffected permit");
+        assert_eq!(permit.test_packet_count(), 1, "{tier}: counts once");
+        let quiet = evaluate_policy_result_without_counting(
+            &state,
+            TEST_TRUST_ZONE_ID,
+            TEST_UNTRUST_ZONE_ID,
+            v4(192, 168, 1, 1),
+            v4(203, 0, 113, 5),
+            PROTO_TCP,
+            40000,
+            80,
+            None,
+        );
+        assert_eq!(quiet.action, PolicyAction::Permit, "{tier}: re-derivation");
+        assert_eq!(permit.test_packet_count(), 1, "{tier}: Never stays quiet");
+    }
+    for (tier, zones) in [
+        ("host-from-any", ("any", JUNOS_HOST_ZONE_NAME, "", "")),
+        (
+            "host-global",
+            ("junos-global", "junos-global", "", JUNOS_HOST_ZONE_NAME),
+        ),
+    ] {
+        let state = parse_policy_state(
+            "permit",
+            &[
+                frag_override_tier_rule_12226(
+                    7,
+                    "deny-https-10",
+                    zones,
+                    "deny",
+                    true,
+                    "10.0.0.0/8",
+                ),
+                frag_override_tier_rule_12226(8, "permit-rest", zones, "permit", false, "any"),
+            ],
+            &test_zone_name_to_id(),
+        );
+        let deny = &state.rules[0].hit_counter;
+        let permit = &state.rules[1].hit_counter;
+        let frag = evaluate_junos_host_policy_l3_aware(
+            &state,
+            TEST_TRUST_ZONE_ID,
+            v4(10, 1, 2, 3),
+            v4(10, 0, 1, 1),
+            PROTO_TCP,
+            0,
+            0,
+            None,
+            64,
+            false,
+        )
+        .expect("host deny");
+        assert_eq!(frag.action, PolicyAction::Deny, "{tier}: override");
+        assert_eq!(permit.test_packet_count(), 0, "{tier}: overridden permit");
+        assert_eq!(deny.test_packet_count(), 0, "{tier}: skipped deny");
+        let ok = evaluate_junos_host_policy_l3_aware(
+            &state,
+            TEST_TRUST_ZONE_ID,
+            v4(192, 168, 1, 1),
+            v4(10, 0, 1, 1),
+            PROTO_TCP,
+            0,
+            0,
+            None,
+            64,
+            false,
+        )
+        .map(|r| r.action);
+        assert_eq!(ok, Some(PolicyAction::Permit), "{tier}: unaffected permit");
+        assert_eq!(permit.test_packet_count(), 1, "{tier}: counts once");
+    }
+}
+
+#[test]
+fn explicit_deny_after_skipped_deny_counts_once_12226() {
+    let v4 = |a, b, c, d| std::net::IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, d));
+    let zones = ("trust", "untrust", "", "");
+    let state = parse_policy_state(
+        "permit",
+        &[
+            frag_override_tier_rule_12226(7, "deny-https-10", zones, "deny", true, "10.0.0.0/8"),
+            frag_override_tier_rule_12226(9, "deny-any-10", zones, "deny", false, "10.0.0.0/8"),
+        ],
+        &test_zone_name_to_id(),
+    );
+    let frag = evaluate_policy_result_l3_aware(
+        &state,
+        TEST_TRUST_ZONE_ID,
+        TEST_UNTRUST_ZONE_ID,
+        v4(10, 1, 2, 3),
+        v4(203, 0, 113, 5),
+        PROTO_TCP,
+        0,
+        0,
+        None,
+        64,
+        false,
+    );
+    assert_eq!((frag.action, frag.policy_id), (PolicyAction::Deny, 9));
+    assert_eq!(state.rules[0].hit_counter.test_packet_count(), 0);
+    assert_eq!(state.rules[1].hit_counter.test_packet_count(), 1);
+}
+
 // ── #11009: one app + one L3 evaluation per rule per flowless fragment ──
 //
 // A tier miss used to evaluate a deny rule's app/L3 predicates TWICE for a
@@ -5949,9 +6269,9 @@ fn policy_hit_count_counts_every_established_packet_not_just_first() {
         &test_zone_name_to_id(),
     );
 
-    // Packet 1: the cold (session-miss) path runs policy evaluation, which
-    // increments the counter once inside `try_match_rule` and hands back the
-    // counter handle to stamp on the new session.
+    // Packet 1: the cold (session-miss) path counts once in
+    // `apply_frag_deny_override_and_count` and returns the counter handle
+    // to stamp on the new session.
     const FIRST_LEN: u64 = 100;
     let res = evaluate_policy_result_with_len(
         &state,

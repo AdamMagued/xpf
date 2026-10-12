@@ -3454,14 +3454,15 @@ fn a_default_policy_of_reject_does_not_revoke_a_permitted_flow_9381() {
 // #9385: the re-derivation records NO policy hit.
 // ---------------------------------------------------------------------------
 //
-// The module header used to state side-effect freedom as a STRUCTURAL property:
-// `evaluate_policy_result_with_icmp` "takes `&PolicyState` and RETURNS a counter
-// handle ...; it cannot count, log or meter by itself." True of the HANDLE,
-// false of the EVALUATION. `try_match_rule` calls `rule.hit_counter.add` on
-// every match and the implicit-default path calls `state.default_counter.add`,
-// and `&PolicyState` does not prevent either: the counters are ATOMICS behind
-// shared references, so an immutable borrow is not the guarantee the claim
-// rested on. Passing `packet_len = 0` did not help — the zero-length gate in
+// The module header once claimed `evaluate_policy_result_with_icmp`
+// takes `&PolicyState` and returns a counter handle, so it cannot
+// count, log, or meter. True of the HANDLE, false of the EVALUATION:
+// `apply_frag_deny_override_and_count` calls
+// `matched_rule.hit_counter.add_if` on every match that
+// survives the fragment override; the default path uses
+// `state.default_counter.add_if`. `&PolicyState` cannot prevent
+// either: the counters are ATOMICS behind shared references.
+// Passing `packet_len = 0` does not help — the zero-length gate in
 // `HitCounter::add` covers BYTES only and the packet increment is
 // unconditional.
 //
@@ -3588,10 +3589,10 @@ fn the_re_derivation_records_no_hit_on_the_matched_rule_9385() {
 /// assumed: it was written that way first, and on BASE code it read a delta of
 /// 0 and failed. `policy_deny_snapshot` has never had a MISS driven through it
 /// (every other cell in this file PRE-INSTALLS a decision carrying a
-/// `neighbor_mac`), so such a packet never reaches the counting
-/// `try_match_rule` walk at all — `tx == 0` and `policy_deny == 0`. Adding a
-/// neighbour to that snapshot was tried and did not fix it; the instrument
-/// caught that attempt too.
+/// `neighbor_mac`), so a MISS never reaches the counting
+/// `apply_frag_deny_override_and_count` call: `tx == 0` and `policy_deny == 0`.
+/// Adding a neighbour to that snapshot was tried and did not fix it; the
+/// instrument caught that attempt too.
 ///
 /// So the control runs on `inbound_dnat_snapshot`, which is PROVEN to admit and
 /// forward: `tests_policy_inbound_nat`'s shipped cells and the #9382 two-phase

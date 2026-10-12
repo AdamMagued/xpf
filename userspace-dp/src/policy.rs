@@ -1062,8 +1062,8 @@ fn flush_pending_policy_hit_record(record: &mut PendingPolicyHitRecord) {
 /// #3073: record one established-session packet against the admitting
 /// policy's hit counter, coalesced per worker. Called from the
 /// `poll_descriptor` session-hit fast path and the flow-cache hit replay —
-/// NOT the cold path, which already counts the first packet in
-/// `try_match_rule`, so every packet is counted exactly once.
+/// NOT the cold path: `apply_frag_deny_override_and_count` counts the first
+/// packet there, so each packet is counted exactly once.
 #[cfg(not(test))]
 #[inline(always)]
 pub(crate) fn record_policy_hit_counter(counter: &Arc<PolicyRuleCounter>, packet_bytes: u64) {
@@ -3473,7 +3473,7 @@ fn evaluate_policy_result_counted(
     // address) OVERLAPS this fragment but was skipped ONLY because l4_present ==
     // false (`note_skipped_frag_deny`). If the walk then lands on a PERMIT (or a
     // default-permit), OVERRIDE it to DROP and attribute the drop to that DENY
-    // (`apply_frag_deny_override`). Scoped narrowly: a fragment with NO
+    // (`apply_frag_deny_override_and_count`). Scoped narrowly: a fragment with NO
     // overlapping skipped DENY still forwards normally, and the L4 path
     // (l4_present == true) is byte-identical (the note/override are inert). The
     // documented trade-off is over-drop: a legitimate non-denied-port fragment
@@ -3495,17 +3495,21 @@ fn evaluate_policy_result_counted(
                     src_port,
                     dst_port,
                     packet_icmp,
-                    packet_len,
                     l4_present,
                     scheduler_expired,
-                    hit_count,
                     !l4_present && skipped_frag_deny.is_none(),
                 ) {
                     RuleMatchOutcome::Matched(mut result) => {
                         // #3073: 1-based handle so the fast path can re-count
                         // every packet of this flow against the same counter.
                         result.policy_counter_idx = (idx as u32).saturating_add(1);
-                        return apply_frag_deny_override(result, skipped_frag_deny);
+                        return apply_frag_deny_override_and_count(
+                            result,
+                            skipped_frag_deny,
+                            &state.rules[idx],
+                            packet_len,
+                            hit_count,
+                        );
                     }
                     RuleMatchOutcome::Miss(reason) => {
                         note_skipped_frag_deny(
@@ -3568,15 +3572,19 @@ fn evaluate_policy_result_counted(
                 src_port,
                 dst_port,
                 packet_icmp,
-                packet_len,
                 l4_present,
                 scheduler_expired,
-                hit_count,
                 !l4_present && skipped_frag_deny.is_none(),
             ) {
                 RuleMatchOutcome::Matched(mut result) => {
                     result.policy_counter_idx = (idx as u32).saturating_add(1);
-                    return apply_frag_deny_override(result, skipped_frag_deny);
+                    return apply_frag_deny_override_and_count(
+                        result,
+                        skipped_frag_deny,
+                        &state.rules[idx],
+                        packet_len,
+                        hit_count,
+                    );
                 }
                 RuleMatchOutcome::Miss(reason) => {
                     note_skipped_frag_deny(&mut skipped_frag_deny, &state.rules[idx], idx, reason);
@@ -3593,15 +3601,19 @@ fn evaluate_policy_result_counted(
                 src_port,
                 dst_port,
                 packet_icmp,
-                packet_len,
                 l4_present,
                 scheduler_expired,
-                hit_count,
                 !l4_present && skipped_frag_deny.is_none(),
             ) {
                 RuleMatchOutcome::Matched(mut result) => {
                     result.policy_counter_idx = (idx as u32).saturating_add(1);
-                    return apply_frag_deny_override(result, skipped_frag_deny);
+                    return apply_frag_deny_override_and_count(
+                        result,
+                        skipped_frag_deny,
+                        &state.rules[idx],
+                        packet_len,
+                        hit_count,
+                    );
                 }
                 RuleMatchOutcome::Miss(reason) => {
                     note_skipped_frag_deny(&mut skipped_frag_deny, &state.rules[idx], idx, reason);
@@ -3633,16 +3645,20 @@ fn evaluate_policy_result_counted(
                 src_port,
                 dst_port,
                 packet_icmp,
-                packet_len,
                 l4_present,
                 scheduler_expired,
-                hit_count,
                 !l4_present && skipped_frag_deny.is_none(),
             ) {
                 RuleMatchOutcome::Matched(mut result) => {
                     // #3073: 1-based handle (see zone-pair branch above).
                     result.policy_counter_idx = (idx as u32).saturating_add(1);
-                    return apply_frag_deny_override(result, skipped_frag_deny);
+                    return apply_frag_deny_override_and_count(
+                        result,
+                        skipped_frag_deny,
+                        rule,
+                        packet_len,
+                        hit_count,
+                    );
                 }
                 RuleMatchOutcome::Miss(reason) => {
                     note_skipped_frag_deny(&mut skipped_frag_deny, rule, idx, reason);
@@ -3711,8 +3727,8 @@ fn evaluate_policy_result_counted(
     // default-DENY this is the ONLY count (a denied flow installs no session,
     // so every dropped packet re-evaluates here); for default-PERMIT this is
     // the first-packet count and the established fast path re-counts the rest
-    // via the reserved handle below. Mirrors the per-rule `rule.hit_counter.add`
-    // in `try_match_rule`.
+    // via the reserved handle. Mirrors `matched_rule.hit_counter.add_if` in
+    // `apply_frag_deny_override_and_count`.
     state.default_counter.add_if(packet_len, hit_count);
     PolicyEvaluationResult {
         action: state.default_action,
@@ -3842,7 +3858,7 @@ pub(crate) fn evaluate_junos_host_policy(
 /// in precedence order, remember the FIRST port-bearing DENY whose L3 overlaps
 /// the fragment but was skipped only for `l4_present == false`
 /// (`note_skipped_frag_deny`); override a later PERMIT to that DROP
-/// (`apply_frag_deny_override`), and convert the deliver-on-no-match
+/// (`apply_frag_deny_override_and_count`), and convert the deliver-on-no-match
 /// fall-through into `Some(frag_associated_deny_result)` when a deny was
 /// skipped — the junos-host "no implicit default-deny" lifeline is a
 /// deliver-on-no-match posture, i.e. permit-like, so it takes the same
@@ -3852,13 +3868,13 @@ pub(crate) fn evaluate_junos_host_policy(
 /// unaffected for every flow that does not overlap a deny. The L4 path never
 /// records a skip, so it stays byte-identical.
 #[allow(clippy::too_many_arguments)]
-/// #9385: this walker passes `PolicyHitCount::Count` at each `try_match_rule`
-/// site and that is correct, not an oversight. It is the `to-zone junos-host`
-/// (host-inbound) evaluation, and #3706 deliberately makes it the counting site
-/// for a host-bound packet — the established-hit path SKIPS its own re-count for
-/// LocalDelivery precisely because this re-eval already counted the packet. Only
-/// #8356's zone-policy re-derivation is side-effect-free, and it does not come
-/// through here.
+/// #9385: this walker passes `PolicyHitCount::Count` to each
+/// `apply_frag_deny_override_and_count` call deliberately. This is the
+/// `to-zone junos-host` (host-inbound) evaluation; #3706 makes it the counting
+/// site for a host-bound packet. The established-hit path SKIPS its own
+/// re-count for LocalDelivery because this re-eval already counted the packet.
+/// Only #8356's zone-policy re-derivation is side-effect-free, and it does not
+/// come through here.
 pub(crate) fn evaluate_junos_host_policy_l3_aware(
     state: &PolicyState,
     from_id: u16,
@@ -3936,15 +3952,19 @@ pub(crate) fn evaluate_junos_host_policy_l3_aware_at(
                 src_port,
                 dst_port,
                 packet_icmp,
-                packet_len,
                 l4_present,
                 scheduler_expired,
-                PolicyHitCount::Count,
                 !l4_present && skipped_frag_deny.is_none(),
             ) {
                 RuleMatchOutcome::Matched(mut result) => {
                     result.policy_counter_idx = (idx as u32).saturating_add(1);
-                    return Some(apply_frag_deny_override(result, skipped_frag_deny));
+                    return Some(apply_frag_deny_override_and_count(
+                        result,
+                        skipped_frag_deny,
+                        &state.rules[idx],
+                        packet_len,
+                        PolicyHitCount::Count,
+                    ));
                 }
                 RuleMatchOutcome::Miss(reason) => {
                     note_skipped_frag_deny(&mut skipped_frag_deny, &state.rules[idx], idx, reason);
@@ -3973,15 +3993,19 @@ pub(crate) fn evaluate_junos_host_policy_l3_aware_at(
                 src_port,
                 dst_port,
                 packet_icmp,
-                packet_len,
                 l4_present,
                 scheduler_expired,
-                PolicyHitCount::Count,
                 !l4_present && skipped_frag_deny.is_none(),
             ) {
                 RuleMatchOutcome::Matched(mut result) => {
                     result.policy_counter_idx = (idx as u32).saturating_add(1);
-                    return Some(apply_frag_deny_override(result, skipped_frag_deny));
+                    return Some(apply_frag_deny_override_and_count(
+                        result,
+                        skipped_frag_deny,
+                        &state.rules[idx],
+                        packet_len,
+                        PolicyHitCount::Count,
+                    ));
                 }
                 RuleMatchOutcome::Miss(reason) => {
                     note_skipped_frag_deny(&mut skipped_frag_deny, &state.rules[idx], idx, reason);
@@ -4017,15 +4041,19 @@ pub(crate) fn evaluate_junos_host_policy_l3_aware_at(
             src_port,
             dst_port,
             packet_icmp,
-            packet_len,
             l4_present,
             scheduler_expired,
-            PolicyHitCount::Count,
             !l4_present && skipped_frag_deny.is_none(),
         ) {
             RuleMatchOutcome::Matched(mut result) => {
                 result.policy_counter_idx = (idx as u32).saturating_add(1);
-                return Some(apply_frag_deny_override(result, skipped_frag_deny));
+                return Some(apply_frag_deny_override_and_count(
+                    result,
+                    skipped_frag_deny,
+                    rule,
+                    packet_len,
+                    PolicyHitCount::Count,
+                ));
             }
             RuleMatchOutcome::Miss(reason) => {
                 note_skipped_frag_deny(&mut skipped_frag_deny, rule, idx, reason);
@@ -4292,20 +4320,28 @@ fn frag_associated_deny_result(deny: SkippedFragDeny) -> PolicyEvaluationResult 
     }
 }
 
-/// #4569: override a PERMIT verdict to the fragment-associated DENY when a
-/// port-bearing DENY with overlapping L3 was skipped for this flowless
-/// fragment. Any non-PERMIT verdict (an explicit deny/reject already denies) or
-/// the absence of a skipped deny returns `result` unchanged.
+/// Apply fragment-deny precedence before crediting a matched rule.
+///
+/// A flowless fragment overridden from PERMIT to DENY did not survive the
+/// matched rule's verdict, so it must not increment that PERMIT's hit counter.
+/// Explicit DENY/REJECT matches and permits without an override are still
+/// counted once. A zero `packet_len` still counts the packet when enabled.
 #[inline]
-fn apply_frag_deny_override(
+fn apply_frag_deny_override_and_count(
     result: PolicyEvaluationResult,
     skipped: Option<SkippedFragDeny>,
+    matched_rule: &PolicyRule,
+    packet_len: u64,
+    hit_count: PolicyHitCount,
 ) -> PolicyEvaluationResult {
     match skipped {
         Some(deny) if matches!(result.action, PolicyAction::Permit) => {
             frag_associated_deny_result(deny)
         }
-        _ => result,
+        _ => {
+            matched_rule.hit_counter.add_if(packet_len, hit_count);
+            result
+        }
     }
 }
 
@@ -4323,13 +4359,8 @@ fn try_match_rule(
     src_port: u16,
     dst_port: u16,
     packet_icmp: Option<(u8, u8)>,
-    packet_len: u64,
     l4_present: bool,
     scheduler_expired: bool,
-    // #9385: threaded rather than inferred from `packet_len`. A zero length means
-    // "no bytes", not "no packet" -- `HitCounter::add` bumps `packets`
-    // unconditionally and #6304's doc depends on that.
-    hit_count: PolicyHitCount,
     track_frag_deny: bool,
 ) -> RuleMatchOutcome {
     let scheduler_unknown = scheduler_expired && !rule.scheduler_name.is_empty();
@@ -4365,7 +4396,6 @@ fn try_match_rule(
     // The rule's L3 (source + destination address) match, including
     // exclusions, per-family fail-closed, book membership, and NAT64.
     if rule_l3_matches(rule, state, src_ip, dst_ip) {
-        rule.hit_counter.add_if(packet_len, hit_count);
         RuleMatchOutcome::Matched(PolicyEvaluationResult {
             action: rule.action,
             policy_id: rule.policy_id,
