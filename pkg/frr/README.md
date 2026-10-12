@@ -1355,8 +1355,8 @@ step. Both are required — neither sees the other's case:
   (`pkg/grpcapi/server_bgp_status_ip_guard_4588_test.go`).
 - **Group address-family flags are gated by neighbor address version
   (#2454).** When `compiler_protocols.go` copies a BGP group's `family inet`
-  / `family inet6` flags down to each neighbor, it parses the neighbor's
-  address (`net.ParseIP`) and inherits ONLY the matching family: an
+  / `family inet6` flags down to each neighbor, it classifies the address with
+  `FRRAddrFamily` and inherits ONLY the matching family: an
   IPv4-addressed neighbor gets `FamilyInet` (never `FamilyInet6`), an
   IPv6-addressed neighbor gets `FamilyInet6` (never `FamilyInet`). Before
   this gate, a dual-stack group (`family inet` AND `family inet6`) marked
@@ -1369,11 +1369,13 @@ step. Both are required — neither sees the other's case:
   AF setup. Edge cases: an address that is not a literal IP (a hostname or
   peer-group template) cannot be classified, so it preserves the prior
   behavior of inheriting BOTH group flags (no silent family drop, no crash);
-  a per-neighbor explicit `family` clause is operator-authoritative and is
-  applied as-is after the inherited flags. The gate does not over-restrict:
-  an IPv4 neighbor in a v4-only or family-less group still establishes — FRR
-  default `bgp default ipv4-unicast` auto-activates it, and an explicit
-  `family inet` group still surfaces `FamilyInet`.
+  a per-neighbor explicit `family` clause is operator-authoritative except
+  for explicit `family inet` on an IPv6 peer (#12185): strict compilation
+  rejects it; tolerant load leaves inet inert and emits an explicit
+  IPv4-unicast deactivation (see the #12185 bullet below). The gate does
+  not over-restrict: an IPv4 neighbor in a v4-only or family-less group
+  still establishes — FRR default `bgp default ipv4-unicast` auto-activates
+  it, and an explicit `family inet` group still surfaces `FamilyInet`.
   An IPv4 peer explicitly pinned to only inet6 also receives
   `no neighbor <peer> activate` under ipv4 unicast (#11374), overriding FRR's
   default IPv4 auto-activation; the IPv6 route-maps therefore cannot leave an
@@ -1463,6 +1465,18 @@ step. Both are required — neither sees the other's case:
   are therefore explicitly disabled under IPv4 unicast and activated under
   IPv6 unicast. The fail-on-revert render and FRR config-load cell is
   `TestFamilylessIPv6NeighborWithoutPolicyIsV6Only11564`.
+
+- **Explicit per-neighbor `family inet` on an IPv6 peer is unsupported (#12185).**
+  xpf does not render RFC 8950 extended-next-hop, so this cross-family
+  declaration cannot be activated safely. Strict compilation rejects it;
+  tolerant load warns, leaves the inet family inert, and emits an explicit
+  IPv4-unicast deactivation so FRR's default activation cannot bypass the
+  missing policies. A separately declared `inet6` family remains independent.
+  The group-inheritance gate classifies mapped IPv6 literals as IPv6, matching
+  the renderer. The `TestBGPPerNeighborCrossFamily12185FailsClosedInFRR` and
+  mapped-family render tests check address-family state. The former uses
+  `vtysh -C` for a grammar-only parse with an invalid-command negative control;
+  it does not test live BGP config loading.
 
 - **BGP neighbor control attributes are address-family scoped (#11460).**
   `route-reflector-client`, `allowas-in`, and `remove-private-AS` belong in

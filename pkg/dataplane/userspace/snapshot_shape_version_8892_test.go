@@ -236,7 +236,7 @@ func shapeDigest8892(t *testing.T) (string, int) {
 // refuse every snapshot in exchange for nothing. The golden below moved to the
 // #9984-merge digest; ProtocolVersion was 24 until #10018's lease-wire bump.
 const (
-	snapshotShapeGolden8892 = "180e7fb5f24b5f523c5253f5ab234476ca9075c46cc2de08ce0766bd08230d5c"
+	snapshotShapeGolden8892 = "af02ee891588bb85e7b173c4579e37c52769e0bbf65d6507c021708a05c54ae1"
 	// v13 BUMPED (issue 9412) against the SAME digest. The TCP close class
 	// crosses the HA session-sync path, and the old behaviour is the defect it
 	// fixes, so the v9 rule requires the bump. The session-sync messages are not
@@ -451,6 +451,14 @@ const (
 	// Master already had independent shape drift (golden b579834b, master
 	// 6daa3234), tracked by #12509. Fold that drift and this field into the v45
 	// golden below; do not blame the digest change solely on the base.
+	// v45 STANDS (#12185): BGPNeighbor.CrossFamilyInet is compiler-only
+	// state (`json:"-"`) used by the Go FRR renderer to suppress default AF
+	// activation for an IPv6 peer. ConfigSnapshot embeds Config, so this
+	// reflection walk sees it even though it is absent from the snapshot JSON.
+	// Rust keeps `config` as an opaque serde_json::Value and has no consumer
+	// for this field (grep userspace-dp/src returns no CrossFamilyInet use).
+	// No helper-visible behavior or wire shape changes; ProtocolVersion stays
+	// at 45. This is the same v45 STANDS arm used for #12288.
 	// v44 -> v45 BUMPED (#11812): single-rate PolicerSnapshot adds optional
 	// marking-action and logical-interface-policer JSON fields. The keys are
 	// omitted by default and the current Rust runtime ignores them; warnings
