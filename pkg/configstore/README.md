@@ -876,10 +876,12 @@ per-path:
   it first persists `confirm.json` with a past deadline sentinel. If the
   subsequent teardown-marker write fails or the process exits, the retained
   record still proves the rollback across clock correction or a cleared
-  #10875 alarm. If the sentinel write fails, the active rollback is not written.
-  Every confirmation path (`clearPendingConfirmLocked` — plain commit / HA sync /
-  explicit confirm / demotion) and timeout rollback (`PromoteRollback`) remove
-  `confirm.json`; a nested `commit confirmed` replaces it with the extended
+  #10875 alarm. A failed sentinel write does not abort recovery: the store
+  rolls back in memory, marks persistence degraded and teardown owed, and
+  retains the original active marker until retry writes the sentinel before
+  active rollback marker. Every confirmation path (`clearPendingConfirmLocked` —
+  plain commit / HA sync / explicit confirm / demotion) and timeout rollback
+  (`PromoteRollback`) remove `confirm.json`; a nested `commit confirmed` replaces it with the extended
   deadline. Removal is a **durable transition** too (#4864): `DeleteConfirm`
   unlinks `confirm.json` and fsyncs the parent directory
   (`fsatomic.SyncDir`), matching `WriteConfirm` — a bare `os.Remove` is not
@@ -935,12 +937,13 @@ per-path:
   policy-absent (fail-OPEN) on boot. `ReadConfirm` therefore (1) rejects a
   null/array/scalar decrypted body via `requireJSONObject` BEFORE
   decoding, and (2) rejects a decoded record with a zero `Deadline` or a
-  nil `PrevTree` — an object check alone still accepts `{}`. A
-  legitimately-written record always carries a real future deadline
-  (`time.Now().Add(window)`) and a non-nil `PrevTree`
-  (`confirmPrevTree = s.active.Clone()`, non-nil even for a first commit —
-  `FirstCommit` distinguishes the empty-bootstrap case), so valid records
-  round-trip unchanged. A rejected read is fail-CLOSED:
+  nil `PrevTree` — an object check alone still accepts `{}`. Every
+  valid record has a non-zero deadline (ordinary arms use
+  `time.Now().Add(window)`; #12167 rollback recovery intentionally writes a
+  past sentinel) and a non-nil `PrevTree` (`confirmPrevTree =
+  s.active.Clone()`, non-nil even for a first commit — `FirstCommit`
+  distinguishes the empty-bootstrap case), so valid records round-trip
+  unchanged. A rejected read is fail-CLOSED:
   `recoverPendingConfirmLocked` already logs the read error and skips
   restoration (keeping the loaded active config, never panicking), so a
   degenerate record can no longer drive a bogus empty rollback. A

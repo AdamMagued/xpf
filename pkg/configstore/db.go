@@ -478,12 +478,13 @@ func (db *DB) ReadConfirm() (*confirmRecord, error) {
 	}
 	// A structurally-valid object can still be semantically degenerate — `{}`
 	// decodes with a zero Deadline and a nil PrevTree. A pending confirm without
-	// a deadline is meaningless (the zero time is always "already expired", so
-	// recovery would immediately roll back), and one without a rollback target
-	// would revert to an empty tree. A legitimately-written record ALWAYS has a
-	// real future deadline (time.Now().Add(window)) and a non-nil PrevTree
+	// a non-zero deadline is meaningless (the zero time is always "already
+	// expired", so recovery would immediately roll back), and one without a
+	// rollback target would revert to an empty tree. A legitimately-written
+	// record has a non-zero deadline (normally time.Now().Add(window), but
+	// #12167 recovery writes a past sentinel) and a non-nil PrevTree
 	// (confirmPrevTree = s.active.Clone(), non-nil even for a first commit —
-	// FirstCommit distinguishes the empty-bootstrap case), so rejecting these
+	// FirstCommit distinguishes the empty bootstrap case), so rejecting these
 	// degenerate shapes never touches a valid record.
 	if rec.Deadline.IsZero() {
 		return nil, fmt.Errorf("parse confirm state: pending commit-confirmed record has no deadline")

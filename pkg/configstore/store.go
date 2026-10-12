@@ -239,6 +239,10 @@ type Store struct {
 	// superseding commit/sync — via clearConfirmResolutionPendingLocked. Default
 	// false; only the degrade-not-fail resolution paths set it.
 	confirmResolvePendingPersist bool
+	// firstCommitRecoveryIntent retains the past-deadline FIRST rollback
+	// sentinel when its initial write failed. The retry loop must publish this
+	// record before writing the never-committed active marker.
+	firstCommitRecoveryIntent *confirmRecord
 
 	// firstCommitTeardownOwed records that a FIRST commit-confirmed window
 	// expired during daemon downtime and its daemon-side takeover teardown is

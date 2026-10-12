@@ -1002,6 +1002,9 @@ func (s *Store) clearConfirmResolutionPendingLocked() bool {
 			return true
 		}
 	}
+	// The replacement active marker is durable, so this boot-recovery intent
+	// no longer needs replay; do not let it overwrite a later confirm record.
+	s.firstCommitRecoveryIntent = nil
 	s.confirmResolvePendingPersist = false
 	// #5835: the replacement config is durable, so remove the retained record.
 	// A durable-removal failure here retains retry debt (degraded health +

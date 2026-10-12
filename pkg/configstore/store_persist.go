@@ -923,18 +923,34 @@ func (s *Store) recoverPendingConfirmLocked() error {
 		// The operator never confirmed, so the unconfirmed config on disk
 		// must NOT stand. Revert to the prev tree with the same persistence
 		// semantics as PromoteRollback.
+		var sentinelErr error
 		if rec.FirstCommit {
 			// #12167: persist a clock-independent rollback intent before the
 			// active rollback write. If marker publication is interrupted, the
 			// next Load must recognize the retained record even if the wall
 			// clock was corrected or a #10875 alarm triggered this rollback.
+			//
+			// A failed sentinel write must not abort recovery before the
+			// in-memory rollback below. Keep the active marker untouched until
+			// retry has durably published the sentinel, so a crash always leaves
+			// the original confirm record as valid recovery evidence.
 			pastDeadline := time.Date(1, 1, 1, 0, 0, 1, 0, time.UTC)
 			rec.Deadline = pastDeadline
 			if !rec.PreviousDeadline.IsZero() {
 				rec.PreviousDeadline = pastDeadline
 			}
 			if err := s.db.WriteConfirm(rec); err != nil {
-				return fmt.Errorf("persist FIRST-rollback recovery intent (#12155): %w", err)
+				sentinelErr = err
+				s.firstCommitRecoveryIntent = rec
+				s.journalLog(&JournalEntry{
+					Action:    "persist_error",
+					Detail:    fmt.Sprintf("persist FIRST-rollback recovery intent failed; retrying before active rollback: %v", err),
+					Principal: "system:configstore",
+				})
+				slog.Error("failed to persist FIRST-rollback recovery intent; retaining the original active marker and retrying before rollback",
+					"err", err, "issue", "#12167")
+			} else {
+				s.firstCommitRecoveryIntent = nil
 			}
 		}
 		s.active = prevTree
@@ -960,7 +976,13 @@ func (s *Store) recoverPendingConfirmLocked() error {
 			s.publishActiveLocked() // #9905: publish the new active snapshot
 			s.persistMarkerCommitted = false
 			s.everCommitted = false
-			perr = s.writeActiveMarker(prevTree, false)
+			if sentinelErr != nil {
+				// Keep the durable FIRST active marker untouched until retry
+				// has made the clock-independent confirm sentinel durable.
+				perr = sentinelErr
+			} else {
+				perr = s.writeActiveMarker(prevTree, false)
+			}
 		} else {
 			compiled, cerr := s.compileTreeLenient(prevTree)
 			if cerr != nil {
@@ -1373,7 +1395,17 @@ func (s *Store) persistRetryLoop(backoff, maxBackoff time.Duration) {
 		if s.persistRefusedTree != nil && s.persistRefusedTree != s.active {
 			s.persistRefusedTree = nil
 		}
-		if s.persistDegraded && s.persistRefusedTree != s.active {
+		if s.persistDegraded && s.persistRefusedTree != s.active &&
+			s.firstCommitRecoveryIntent != nil {
+			if err := s.db.WriteConfirm(s.firstCommitRecoveryIntent); err != nil {
+				slog.Warn("FIRST-rollback recovery intent retry failed", "err", err,
+					"retry_in", backoff*2, "issue", "#12167")
+			} else {
+				s.firstCommitRecoveryIntent = nil
+			}
+		}
+		if s.persistDegraded && s.persistRefusedTree != s.active &&
+			s.firstCommitRecoveryIntent == nil {
 			// #1922: re-write with the marker the failing path requested
 			// (committed=false only for a first-commit rollback). For every
 			// other path persistMarkerCommitted is true, so this matches the
