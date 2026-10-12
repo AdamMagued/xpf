@@ -960,6 +960,12 @@ func (d *Daemon) handleConfigSyncWithAncestry(
 	// preserveNodeLocalChassis for the contract.
 	if _, err := d.syncAndApplyWithAncestry(context.Background(), configText,
 		preserveNodeLocalChassis(d.activeTreeForNodeLocal()), ancestry); err != nil {
+		var pending *cluster.ConfigApplyPendingError
+		if errors.As(err, &pending) {
+			slog.Info("cluster: config sync apply pending publication", "err", err)
+			d.reportConfigSyncDivergence()
+			return err
+		}
 		slog.Error("cluster: config sync apply failed", "err", err)
 		return err
 	}

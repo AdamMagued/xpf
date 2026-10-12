@@ -19,6 +19,7 @@ type deferredMACReapplyTestDP struct {
 	applyCalls  int
 	debtRecords int
 	policyReads int
+	applyResult *dataplane.ApplyResult
 }
 
 func (d *deferredMACReapplyTestDP) Start(context.Context) error { return nil }
@@ -29,6 +30,9 @@ func (d *deferredMACReapplyTestDP) ApplyConfig(context.Context, *config.Config) 
 	d.applyCalls++
 	if d.applyErr != nil {
 		return nil, d.applyErr
+	}
+	if d.applyResult != nil {
+		return d.applyResult.Clone(), nil
 	}
 	return &dataplane.ApplyResult{}, nil
 }
@@ -116,5 +120,24 @@ func TestReapplyAfterDeferredMACRecordsDebtWhenAuthorityUnknown(t *testing.T) {
 	}
 	if dp.debtRecords != 1 {
 		t.Fatalf("unknown authority worker-arm debt records = %d, want 1", dp.debtRecords)
+	}
+}
+
+func TestReapplyAfterDeferredMACRerecordsDeferredSnapshotGeneration(t *testing.T) {
+	cfg := &config.Config{}
+	dp := &deferredMACReapplyTestDP{
+		applyResult: &dataplane.ApplyResult{SnapshotPublishDeferred: true, Generation: 42},
+	}
+	d := &Daemon{}
+	d.setDataplane(dp)
+	d.recordDeferredSnapshotApply(cfg, 17)
+
+	d.reapplyAfterDeferredMAC(cfg)
+
+	if got := d.deferredSnapshotCompletion(42); got == nil {
+		t.Fatal("deferred-MAC replay did not re-record its deferred generation")
+	}
+	if got := d.deferredSnapshotCompletion(17); got != nil {
+		t.Fatal("deferred-MAC replay left the old generation addressable")
 	}
 }

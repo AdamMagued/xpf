@@ -11,6 +11,18 @@ import (
 	"github.com/psaab/xpf/pkg/configstore"
 )
 
+// ConfigApplyPendingError reports that the apply has not converged yet. The
+// config-apply loop keeps the received generation fenced while waiting for
+// completion, then advances high-water or sends an ACK only after publication.
+// The wait is bounded by the config-apply grace; expiry follows the NACK path.
+type ConfigApplyPendingError struct {
+	Completion <-chan error
+}
+
+func (e *ConfigApplyPendingError) Error() string {
+	return "config apply pending publication"
+}
+
 // DefaultConfigApplyFailGrace is how long a received config-sync generation may
 // stay un-applied — apply hard-failing, standby config stale, high-water pinned
 // per M-2/#4151 — before the node raises the CF config-sync monitor-failure /
@@ -27,8 +39,8 @@ import (
 // RG0-primary config rejection — which clears within a few seconds as the local
 // node settles ownership — so a genuine persistent apply failure surfaces to
 // the operator promptly while a momentary rejection never flaps the flag (the
-// timer is cancelled by the intervening successful apply). It clears on the
-// first successful apply. Sized off the peer-loss / transfer-lease timescale
+// timer is cancelled by the intervening successful apply). It clears on
+// the first successful apply. Sized off the peer-loss / transfer-lease timescale
 // (DefaultRemoteTransferOutLease is 30s); tests override via
 // SessionSync.configApplyFailGrace and SessionSync.afterFuncFn.
 const DefaultConfigApplyFailGrace = 30 * time.Second
@@ -747,6 +759,43 @@ func (s *SessionSync) configApplyLoop(ctx context.Context) {
 				applyErr = s.OnConfigReceivedWithAncestry(item.text, item.ancestry)
 			} else {
 				applyErr = s.OnConfigReceived(item.text)
+			}
+			// A deferred userspace publish owns this generation until its status
+			// tick reports that the helper accepted it. Keep the apply fence up
+			// and do not ACK/high-water it early; a refusal resolves the channel
+			// with an error and follows the ordinary NACK path below.
+			var pending *ConfigApplyPendingError
+			pendingWaited := false
+			if errors.As(applyErr, &pending) {
+				if pending.Completion == nil {
+					applyErr = errors.New("config apply returned an empty publication completion")
+				} else {
+					pendingWaited = true
+					// A missing callback must become an ordinary apply failure so
+					// config sync NACKs the generation and the health grace can fire.
+					// Otherwise this sole ordered consumer parks forever.
+					waitTimer := time.NewTimer(s.configApplyGrace())
+					select {
+					case <-ctx.Done():
+						waitTimer.Stop()
+						s.endConfigApply()
+						return
+					case applyErr = <-pending.Completion:
+					case <-waitTimer.C:
+						applyErr = errors.New("timed out waiting for deferred config publication")
+					}
+					waitTimer.Stop()
+				}
+			}
+			// The peer may reboot while deferred publication is pending. Its
+			// generation is incomparable across incarnations, so never ACK or
+			// NACK the old payload after the wait.
+			if pendingWaited && s.configItemIncarnationStale(item) {
+				s.stats.ConfigsDeadIncarnationDropped.Add(1)
+				slog.Warn("cluster sync: dropping config from a replaced peer boot incarnation after deferred publication wait",
+					"incoming_gen", item.gen, "size", len(item.text))
+				s.endConfigApply()
+				continue
 			}
 			if applyErr != nil {
 				// transient RG0-primary rejection). Do NOT advance the

@@ -502,9 +502,16 @@ func (m *Manager) takeoverReadyLocked() (bool, []string) {
 	// classifier maps are at an unpublished plan with ctrl held at 0; handing
 	// it an RG would cut transit over until the debt converges. Name the
 	// unpublished generation so the operator sees what is owed.
+	// A deferred full snapshot likewise withholds takeover readiness until the
+	// helper enforces it.
 	if m.snapshotRetryDebtLocked() {
 		reasons = append(reasons, fmt.Sprintf(
 			"userspace snapshot retry debt outstanding (generation %d unpublished)",
+			m.lastSnapshot.Generation))
+	} else if m.pendingFullSnapshotMetadata && m.lastSnapshot != nil &&
+		m.publishedSnapshot < m.lastSnapshot.Generation {
+		reasons = append(reasons, fmt.Sprintf(
+			"userspace snapshot generation %d unpublished",
 			m.lastSnapshot.Generation))
 	}
 	// Gate on the LOCAL event-stream listener being bound — the primary push
