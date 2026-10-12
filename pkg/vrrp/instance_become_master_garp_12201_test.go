@@ -88,8 +88,13 @@ func TestBecomeMaster_LaunchesOneBurstPerVIPFamily_12201(t *testing.T) {
 		case <-timer.C:
 			stack := make([]byte, 1<<16)
 			n := runtime.Stack(stack, true)
-			t.Fatalf("timed out waiting for one burst per VIP family; got %v — "+
-				"becomeMaster did not launch the GARP/NA burst (#12201)\n%s", seen, stack[:n])
+			var missing []string
+			for family := range want {
+				if _, ok := seen[family]; !ok {
+					missing = append(missing, family)
+				}
+			}
+			t.Fatalf("timed out waiting for one burst per VIP family; got %v, missing %v (#12201)\n%s", seen, missing, stack[:n])
 		}
 	}
 	for family, wantIP := range want {
@@ -121,7 +126,8 @@ func TestBecomeMaster_SuppressedEmitsNoBurst_12201(t *testing.T) {
 	if got := vi.garpEpoch.Load(); got != 1 {
 		t.Fatalf("garpEpoch = %d, want 1 — the transition must still start a new tenure", got)
 	}
-	// Deterministic: nothing reserves a burst when the launch is gated.
+	// Holds for correct code; an un-gated launch is caught by the drain
+	// window below (the spawned goroutine has not run yet).
 	if got := vi.lastGARPEpoch.Load(); got != 0 {
 		t.Fatalf("lastGARPEpoch = %d, want 0 — a suppressed transition reserved a burst", got)
 	}
