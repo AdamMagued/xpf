@@ -864,9 +864,12 @@ func (s *Store) recoverPendingConfirmLocked() error {
 	// A FIRST rollback may have written the active rollback marker and died
 	// before publishing the teardown marker. The retained expired confirm
 	// record is the recovery evidence; committed=0 plus a different guarded
-	// hash proves the active rollback already landed.
+	// hash proves the active rollback already landed. A backward-clock FIRST
+	// rollback (#12167) lands while the wall clock is still before the
+	// deadline, so a clock still behind ArmedAt is the same evidence.
 	if rec.FirstCommit && !s.everCommitted && rec.GuardedHash != "" &&
-		rec.GuardedHash != activeHash && confirmWallNow().After(rec.Deadline) {
+		rec.GuardedHash != activeHash && (confirmWallNow().After(rec.Deadline) ||
+		(!rec.ArmedAt.IsZero() && confirmWallNow().Before(rec.ArmedAt))) {
 		s.firstCommitTeardownOwed = true
 		s.firstCommitTeardownGeneration = rec.GuardedHash
 		s.firstCommitTeardownRollbackHash = activeHash
@@ -920,6 +923,20 @@ func (s *Store) recoverPendingConfirmLocked() error {
 		// The operator never confirmed, so the unconfirmed config on disk
 		// must NOT stand. Revert to the prev tree with the same persistence
 		// semantics as PromoteRollback.
+		if rec.FirstCommit {
+			// #12167: persist a clock-independent rollback intent before the
+			// active rollback write. If marker publication is interrupted, the
+			// next Load must recognize the retained record even if the wall
+			// clock was corrected or a #10875 alarm triggered this rollback.
+			pastDeadline := time.Date(1, 1, 1, 0, 0, 1, 0, time.UTC)
+			rec.Deadline = pastDeadline
+			if !rec.PreviousDeadline.IsZero() {
+				rec.PreviousDeadline = pastDeadline
+			}
+			if err := s.db.WriteConfirm(rec); err != nil {
+				return fmt.Errorf("persist FIRST-rollback recovery intent (#12155): %w", err)
+			}
+		}
 		s.active = prevTree
 		var perr error
 		// recoverErr is the #6538 fail-closed signal, returned at the end of

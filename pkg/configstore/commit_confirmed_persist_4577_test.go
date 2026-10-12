@@ -3,6 +3,7 @@ package configstore
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -152,8 +153,8 @@ func TestConfirmRecovery_WithinWindowReArmsOnLoad_4577(t *testing.T) {
 }
 
 // When chrony reports an active clock-skew alarm, recovery must roll back
-// instead of trusting that shifted deadline and re-arming it (#10875).
-func TestConfirmRecovery_ClockSkewAlarmRollsBackAfterWallStep_10875(t *testing.T) {
+// instead of re-arming while the confirm window is still open (#10875).
+func TestConfirmRecovery_ClockSkewAlarmRollsBackInsideWindow_10875(t *testing.T) {
 	originalNow, originalBootID := confirmWallNow, confirmBootID
 	if systemBootID := originalBootID(); systemBootID == "" {
 		t.Fatal("the kernel boot-id source did not yield an identifier")
@@ -193,8 +194,8 @@ func TestConfirmRecovery_ClockSkewAlarmRollsBackAfterWallStep_10875(t *testing.T
 					rec.ArmedAt, rec.ArmedBootID, armWall)
 			}
 
-			// Model downtime while keeping the clock after the arm time. A
-			// backward step before ArmedAt is covered separately below.
+			// Model downtime while the unchanged deadline is still in the
+			// future. A backward step before ArmedAt is covered separately.
 			now = armWall.Add(time.Minute)
 			bootID = "boot-after"
 			recovered := newTestStoreAt(t, path)
@@ -207,7 +208,7 @@ func TestConfirmRecovery_ClockSkewAlarmRollsBackAfterWallStep_10875(t *testing.T
 
 			if alarmActive {
 				if recovered.IsConfirmPending() {
-					t.Fatal("active clock-skew alarm must not re-arm the shifted confirm deadline")
+					t.Fatal("active clock-skew alarm must not re-arm the still-open confirm window")
 				}
 				if got := recovered.ActiveConfig().System.HostName; got != "Base" {
 					t.Fatalf("active config after skew recovery = %q, want rollback target Base", got)
@@ -281,6 +282,25 @@ func TestConfirmRecovery_BackwardWallClockRollsBackStandalone_12167(t *testing.T
 	}
 	if r, err := recovered.db.ReadConfirm(); err != nil || r != nil {
 		t.Fatalf("confirm.json must be removed after backward-clock rollback: rec=%v err=%v", r, err)
+	}
+
+	entries, err := recovered.ListCommitHistory(20)
+	if err != nil {
+		t.Fatalf("ListCommitHistory: %v", err)
+	}
+	var rollback *JournalEntry
+	for _, entry := range entries {
+		if entry.Action == "auto_rollback" {
+			rollback = entry
+		}
+	}
+	if rollback == nil {
+		t.Fatal("backward-clock recovery did not journal auto_rollback")
+	}
+	if !strings.Contains(rollback.Detail, "#12167") ||
+		rollback.Principal != "system:commit-confirmed-clock-skew" {
+		t.Fatalf("backward-clock journal reason = (%q, %q), want #12167 and system:commit-confirmed-clock-skew",
+			rollback.Detail, rollback.Principal)
 	}
 }
 

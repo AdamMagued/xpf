@@ -871,6 +871,12 @@ per-path:
   records without `ArmedAt` are capped at the maximum accepted confirm window.
   The boot ID remains diagnostic provenance; neither value is a monotonic
   deadline that can survive reboot.
+
+  Before a FIRST rollback writes the never-committed active marker (#12167),
+  it first persists `confirm.json` with a past deadline sentinel. If the
+  subsequent teardown-marker write fails or the process exits, the retained
+  record still proves the rollback across clock correction or a cleared
+  #10875 alarm. If the sentinel write fails, the active rollback is not written.
   Every confirmation path (`clearPendingConfirmLocked` — plain commit / HA sync /
   explicit confirm / demotion) and timeout rollback (`PromoteRollback`) remove
   `confirm.json`; a nested `commit confirmed` replaces it with the extended
