@@ -30,7 +30,9 @@ type userspaceEventStreamProvider interface {
 // node.
 //
 // The helper already suppresses the Open delta for these origins at install
-// (`install.rs`'s `counted` gate), so nothing here should ever see one. This
+// (the explicit `!origin.is_transient_local_seed()` conjunct at `install.rs:442`
+// — NOT the `counted` gate: seeds ARE quota-counted since #12179), so nothing
+// here should ever see one. This
 // filter is the belt to that suspenders, and the reason it is worth having is
 // recorded directly below in the fabric-redirect branch: #6599 measured what a
 // FabricRedirect-disposition Open delta does when it reaches the peer, which is

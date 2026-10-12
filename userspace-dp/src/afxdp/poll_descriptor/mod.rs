@@ -3674,13 +3674,16 @@ pub(super) fn poll_binding_process_descriptor_with_injection(
                                 })
                         })
                         // #2134: per-IP session-limit enforcement at the
-                        // new-flow decision. This dominates BOTH counted
-                        // install sites below (LocalMiss host-inbound and
-                        // ForwardFlow transit), fires exactly once per new
-                        // flow before its session exists, and reads the
-                        // SessionTable count read-only (so an over-limit /
-                        // rejected IP never gets a phantom map entry —
-                        // #2128). Keys on the pre-NAT original src/dst
+                        // new-flow decision. This check dominates all FOUR
+                        // counted install sites below in this session-miss
+                        // arm: LocalMiss host-inbound, ForwardFlow transit,
+                        // FabricPuntSeed, and MissingNeighborSeed. In
+                        // particular, it must stay before both transient-seed
+                        // arms or those newly counted installs could bypass
+                        // the quota. It fires exactly once per new flow before
+                        // its session exists and reads the SessionTable count
+                        // read-only (so an over-limit or rejected IP never gets
+                        // a phantom map entry — #2128). Keys on the pre-NAT
                         // (`flow.src_ip`/`flow.dst_ip`), matching Junos
                         // per-source-IP semantics and the screen stage's
                         // own tuple. Evaluated only if miss-time flood or
@@ -5773,14 +5776,25 @@ pub(super) fn poll_binding_process_descriptor_with_injection(
                             // fabric parent's — and, on a permit, record a seed so
                             // the return is a session HIT.
                             //
-                            // THIS NEVER CHANGES THE PACKET'S DISPOSITION. A deny,
-                            // an unresolvable zone pair, or a full session table
-                            // all leave `decision` exactly as it was and the punt
-                            // proceeds as before, with the peer adjudicating it as
-                            // it does today. The arm adds no drop site; the only
-                            // behaviour it changes is that the RETURN of a flow
-                            // THIS node ingressed and THIS node's policy permitted
-                            // is now admitted by a session instead of denied.
+                            // THIS SEED HELPER NEVER CHANGES THE CURRENT PACKET'S
+                            // DISPOSITION. A deny, an unresolvable zone pair, or
+                            // a full session table leaves `decision` unchanged
+                            // and the punt proceeds as before, with the peer
+                            // adjudicating it as it does today. The only
+                            // behavior it changes is that the RETURN of a flow
+                            // THIS node ingressed and THIS node's policy
+                            // permitted is now admitted by a session instead of
+                            // denied.
+                            //
+                            // Separately, #12179 charges permitted seeds against
+                            // session quotas. The earlier new-flow check can drop
+                            // a punted flow before this arm when its source quota
+                            // is full (`session-limit-src`; 4096 default per
+                            // source IP, ingress zone, and worker unless
+                            // positively overridden), or an enabled destination
+                            // quota is full (`session-limit-dst`). Those quota
+                            // drops are separate from this helper's disposition
+                            // handling.
                             //
                             // The three conditions of `should_seed_fabric_punt`
                             // — and in particular why the non-fabric-ingress one
