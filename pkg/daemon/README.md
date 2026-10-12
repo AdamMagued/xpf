@@ -2958,6 +2958,11 @@ never lock an operator out of a remote box it manages.
   whatever is active converges on the same invariant and is also what
   discharges the debt after an unrelated successful commit, which would
   otherwise leave a permanent false degraded on a converged node.
+  On successful convergence the #9811 retry owner captures `ActiveDigest`
+  under `applySem` and stamps that digest only after the apply succeeds and no
+  policy-invalidation debt remains. The retry stamp is distinct from rollback:
+  #12073's policy-invalidation discharge stamps the digest captured by the
+  rollback apply after its session-invalidation debt clears.
 
   SCOPE: this covers auto-rollback and cold-boot applies. Every other
   caller-less apply (DHCP lease callback, feed refresh, config poll) has the

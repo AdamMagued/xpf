@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -87,8 +89,8 @@ func TestBootRetryReconstructsZoneSnapshotAndReceivesBulkAck12210(t *testing.T) 
 	}
 	markerApplied := store.ActiveApplied()
 
-	// Reconstruct and publish a fresh session-sync object the way the comms
-	// constructor does: seed its local zone snapshot before publication.
+	// Fixture-sanity only: reconstruct a fresh session-sync object and seed it
+	// manually. This does not exercise the production constructor's seed order.
 	addrA, addrB := syncPairAddresses12210(t)
 	local := cluster.NewSessionSync(addrA, addrB, markerSyncRuntime12210{})
 	peer := cluster.NewSessionSync(addrB, addrA, markerSyncRuntime12210{})
@@ -143,10 +145,9 @@ func TestBootRetryReconstructsZoneSnapshotAndReceivesBulkAck12210(t *testing.T) 
 	if epoch, _, pending := peer.PendingBulkAck(); pending {
 		t.Errorf("#12210: peer still awaits BulkAck for epoch %d after the receiver's ACK callback", epoch)
 	}
-	// The primed flag is set by d.onSessionSyncBulkAckReceived via the async
-	// `go s.OnBulkSyncAckReceived()` dispatch (pkg/cluster/sync_conn_read.go),
-	// which has no causal link to the peerAcked wait above: poll with a
-	// bounded deadline instead of asserting immediately.
+	// Fixture-sanity (non-discriminating): async OnBulkSyncAckReceived eventually
+	// primes local peer sync, but this poll has no causal link to peerAcked and
+	// passes on the base. Keep it separate from the marker/zone/BulkAck regression.
 	primedDeadline := time.Now().Add(10 * time.Second)
 	for !d.syncPeerBulkPrimed.Load() && time.Now().Before(primedDeadline) {
 		time.Sleep(20 * time.Millisecond)
@@ -179,4 +180,27 @@ func syncPairAddresses12210(t *testing.T) (string, string) {
 		t.Fatalf("release session-sync address B: %v", err)
 	}
 	return addrA, addrB
+}
+
+// TestStartClusterCommsSeedsOwnershipBeforePublishing12210 pins the production
+// constructor ordering that the fixture-sanity integration test recreates.
+func TestStartClusterCommsSeedsOwnershipBeforePublishing12210(t *testing.T) {
+	src, err := os.ReadFile("daemon_ha_sync.go")
+	if err != nil {
+		t.Fatalf("read daemon_ha_sync.go: %v", err)
+	}
+	const fn = "func (d *Daemon) startClusterComms("
+	start := strings.Index(string(src), fn)
+	if start < 0 {
+		t.Fatal("startClusterComms not found")
+	}
+	body := string(src)[start+len(fn):]
+	if end := strings.Index(body, "\nfunc "); end >= 0 {
+		body = body[:end]
+	}
+	seed := strings.Index(body, "d.seedActiveSessionSyncZoneOwnership(ss)")
+	publish := strings.Index(body, "d.publishSessionSyncIfCurrent(commsGen, ss)")
+	if seed < 0 || publish < 0 || seed >= publish {
+		t.Fatalf("startClusterComms must seed active zone ownership before publishing the session-sync object; seed=%d publish=%d", seed, publish)
+	}
 }
