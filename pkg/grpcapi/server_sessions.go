@@ -968,8 +968,18 @@ func (s *Server) GetSessionSummary(ctx context.Context, req *pb.GetSessionSummar
 	}
 
 	// A partial scan under-counts the summary; fail the RPC rather than
-	// returning a healthy-looking but incomplete summary (#2469).
+	// returning a healthy-looking but incomplete summary (#2469). Sample
+	// cancellation every 1024 entries so an abandoned full-table scan releases
+	// its shared admission slot and stops further lookup syscalls and their
+	// RCU reads promptly.
+	if err := ctx.Err(); err != nil {
+		return nil, status.FromContextError(err).Err()
+	}
+	cancelled := newSessionWalkCancelSampler(ctx, sessionWalkCancelInterval9060)
 	if err := s.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
+		if cancelled() {
+			return false
+		}
 		resp.TotalEntries++
 		if val.IsReverse == 0 {
 			resp.ForwardOnly++
@@ -986,10 +996,19 @@ func (s *Server) GetSessionSummary(ctx context.Context, req *pb.GetSessionSummar
 		}
 		return true
 	}); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, status.FromContextError(ctxErr).Err()
+		}
 		return nil, status.Errorf(codes.Internal, "v4 session iteration: %v", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, status.FromContextError(err).Err()
 	}
 
 	if err := s.dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		if cancelled() {
+			return false
+		}
 		resp.TotalEntries++
 		if val.IsReverse == 0 {
 			resp.ForwardOnly++
@@ -1006,7 +1025,13 @@ func (s *Server) GetSessionSummary(ctx context.Context, req *pb.GetSessionSummar
 		}
 		return true
 	}); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, status.FromContextError(ctxErr).Err()
+		}
 		return nil, status.Errorf(codes.Internal, "v6 session iteration: %v", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, status.FromContextError(err).Err()
 	}
 
 	// max_sessions is the dataplane's dynamic session-table capacity (#5323):
@@ -1122,8 +1147,11 @@ func (s *Server) GetZonePairSummary(ctx context.Context, req *pb.GetZonePairSumm
 		resp.NodeId = int32(s.cluster.NodeID())
 	}
 
-	pairs, err := s.computeZonePairSummary()
+	pairs, err := s.computeZonePairSummary(ctx)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, status.FromContextError(ctxErr).Err()
+		}
 		// #8629: a server-side computation failed; the request was well formed.
 		return nil, status.Errorf(codes.Internal, "compute zone-pair summary: %v", err)
 	}
@@ -1149,7 +1177,10 @@ func (s *Server) GetZonePairSummary(ctx context.Context, req *pb.GetZonePairSumm
 // the per-zone-pair protocol breakdown, sorted by (from_zone, to_zone). A
 // backend iterator error fails the call rather than returning a partial,
 // healthy-looking breakdown (#2469), matching GetSessionSummary.
-func (s *Server) computeZonePairSummary() ([]*pb.ZonePairSessionSummary, error) {
+func (s *Server) computeZonePairSummary(ctx context.Context) ([]*pb.ZonePairSessionSummary, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, status.FromContextError(err).Err()
+	}
 	var cfg *config.Config
 	if s.store != nil {
 		cfg = s.store.ActiveConfig()
@@ -1191,21 +1222,40 @@ func (s *Server) computeZonePairSummary() ([]*pb.ZonePairSessionSummary, error) 
 		zp.Total++
 	}
 
+	cancelled := newSessionWalkCancelSampler(ctx, sessionWalkCancelInterval9060)
 	if err := s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+		if cancelled() {
+			return false
+		}
 		if val.IsReverse == 0 {
 			countSession(val.IngressZone, val.EgressZone, key.Protocol)
 		}
 		return true
 	}); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, status.FromContextError(ctxErr).Err()
+		}
 		return nil, status.Errorf(codes.Internal, "v4 session iteration: %v", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, status.FromContextError(err).Err()
+	}
 	if err := s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		if cancelled() {
+			return false
+		}
 		if val.IsReverse == 0 {
 			countSession(val.IngressZone, val.EgressZone, key.Protocol)
 		}
 		return true
 	}); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, status.FromContextError(ctxErr).Err()
+		}
 		return nil, status.Errorf(codes.Internal, "v6 session iteration: %v", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, status.FromContextError(err).Err()
 	}
 
 	result := make([]*pb.ZonePairSessionSummary, 0, len(counts))

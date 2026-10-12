@@ -17,6 +17,8 @@ package grpcapi
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
 	"sort"
 	"strconv"
 	"strings"
@@ -152,6 +154,64 @@ func parseTopMetrics(t *testing.T, out string) (metrics []uint64, total int) {
 		metrics = append(metrics, v)
 	}
 	return metrics, total
+}
+
+func TestSessionsTopRendersCandidateAddresses(t *testing.T) {
+	sessions := buildTopSessions()
+	want := make(map[uint64][2]string, len(sessions))
+	for i, se := range sessions {
+		var src, dst string
+		if se.isV6 {
+			srcIP := net.IP([]byte{0x20, 0x01, 0x05, 0x59, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, byte(i >> 8), byte(i)})
+			dstIP := net.IP([]byte{0x20, 0x01, 0x05, 0x59, 0x85, 0x85, 0, 0x80, 0, 0, 0, 0, 0, 0, 0x02, 0x00})
+			src = fmt.Sprintf("[%s]:%d", srcIP, se.port)
+			dst = fmt.Sprintf("[%s]:443", dstIP)
+		} else {
+			src = fmt.Sprintf("10.0.%d.%d:%d", byte(i>>8), byte(i), se.port)
+			dst = "172.16.80.8:443"
+		}
+		want[se.metric] = [2]string{src, dst}
+	}
+
+	dp := &topSessionsDP{Manager: dataplane.New(), sessions: sessions}
+	s := newViewServer(t, dp)
+	resp, err := s.ShowText(context.Background(), &pb.ShowTextRequest{Topic: "sessions-top:bytes"})
+	if err != nil {
+		t.Fatalf("ShowText(sessions-top:bytes) error = %v", err)
+	}
+
+	seenHeader := false
+	rows := 0
+	for _, line := range strings.Split(resp.GetOutput(), "\n") {
+		if strings.Contains(line, "Source") && strings.Contains(line, "Destination") {
+			seenHeader = true
+			continue
+		}
+		if !seenHeader {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 6 {
+			continue
+		}
+		metricText := strings.SplitN(fields[5], "/", 2)[0]
+		metric, err := strconv.ParseUint(metricText, 10, 64)
+		if err != nil {
+			continue
+		}
+		addresses, ok := want[metric]
+		if !ok {
+			t.Fatalf("row with unknown metric %d: %q", metric, line)
+		}
+		if fields[1] != addresses[0] || fields[2] != addresses[1] {
+			t.Errorf("metric %d: src/dst = %s %s, want %s %s",
+				metric, fields[1], fields[2], addresses[0], addresses[1])
+		}
+		rows++
+	}
+	if rows != topSessionsK {
+		t.Fatalf("rendered %d address rows, want %d\n%s", rows, topSessionsK, resp.GetOutput())
+	}
 }
 
 func TestSessionsTopBoundedSelectionMatchesFullSort(t *testing.T) {
