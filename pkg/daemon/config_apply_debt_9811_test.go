@@ -110,9 +110,10 @@ func newRealApplyRollbackHarness9811(t *testing.T, script []invalDebtOutcome1207
 }
 
 // TestSuccessfulConfirmedRollbackOwesNothing9811 exercises a real apply. The
-// #12073 debt discharge already stamps successful rollback applies
-// (daemon_policy_invalidate_capture.go:701-704); this passes on base and is
-// intentionally not evidence for a new rollback stamp in this change.
+// #12073 debt discharge already stamps successful rollback applies through
+// dischargePolicyInvalidationDebtLocked -> MarkAppliedDigest(debt.appliedDigest);
+// this passes on base and is intentionally not evidence for a new rollback
+// stamp in this change.
 func TestSuccessfulConfirmedRollbackOwesNothing9811(t *testing.T) {
 	h, gen := newRealApplyRollbackHarness9811(t, nil)
 	h.d.executeConfirmedRollback(gen)

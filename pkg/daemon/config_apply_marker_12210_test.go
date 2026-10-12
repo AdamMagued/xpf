@@ -194,13 +194,31 @@ func TestStartClusterCommsSeedsOwnershipBeforePublishing12210(t *testing.T) {
 	if start < 0 {
 		t.Fatal("startClusterComms not found")
 	}
-	body := string(src)[start+len(fn):]
-	if end := strings.Index(body, "\nfunc "); end >= 0 {
-		body = body[:end]
+	rest := string(src)[start+len(fn):]
+	if end := strings.Index(rest, "\nfunc "); end >= 0 {
+		rest = rest[:end]
 	}
+	// Comments are stripped before matching, mirroring
+	// TestStartClusterCommsConsumesTheDropSignal_7071: a source-scanning
+	// guard that reads its own explanatory prose is satisfied by the
+	// sentence describing the thing it is meant to find.
+	var code []string
+	for _, line := range strings.Split(rest, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "//") {
+			continue
+		}
+		code = append(code, line)
+	}
+	body := strings.Join(code, "\n")
 	seed := strings.Index(body, "d.seedActiveSessionSyncZoneOwnership(ss)")
 	publish := strings.Index(body, "d.publishSessionSyncIfCurrent(commsGen, ss)")
-	if seed < 0 || publish < 0 || seed >= publish {
+	// Non-vacuity: both calls must be present at all. Without this the
+	// ordering assertion below would pass for free on a body that never
+	// seeds or never publishes.
+	if seed < 0 || publish < 0 {
+		t.Fatalf("startClusterComms no longer seeds and publishes at all, so the seed-before-publish ordering is vacuous; seed=%d publish=%d", seed, publish)
+	}
+	if seed >= publish {
 		t.Fatalf("startClusterComms must seed active zone ownership before publishing the session-sync object; seed=%d publish=%d", seed, publish)
 	}
 }
