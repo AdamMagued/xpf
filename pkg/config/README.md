@@ -748,16 +748,14 @@ folds every zone-local entry into the global `SecurityConfig.AddressBook`
 under a `/`-separated zone-qualified internal name (`zone-local/<zone>/<name>`)
 and rewrites each policy match token that resolves zone-locally to that
 qualified name. A token NOT defined in the policy's zone book is left unchanged
-so it resolves against the global book. The synthetic `zone-local/` namespace
-is collision-proof: the lexer permits `/` in an identifier token (needed for
-IP literals like `10.0.0.0/24`), but `validateAddressBookEntryNamesStrict`
-(#3061, run BEFORE the fold on the pristine global book) hard-rejects `/` in
-any address-book entry name (global or zone-local) and any security-zone name
-at commit — matching Junos object-naming rules — so no operator-typed name can
-contain `/` and therefore none can equal a synthetic name (only the NAME is
-checked, never the address VALUE/prefix; the fold also skips an already-present
-key as a defence-in-depth no-clobber on the tolerant load path, which warns
-rather than rejects per #1960). After this pass
+so it resolves against the global book. Strict validation reserves the
+synthetic `zone-local/` prefix by rejecting operator entry names that begin
+with it, and rejects `/` in security-zone names (#3061, relaxed in #4340 for
+slashes elsewhere in entry names). A tolerant load may still encounter a
+persisted pre-validator literal qualified key: the fold skips an already-
+present global key of either kind, marks it in `CollidingNames`, and refuses
+policy references rather than clobbering it (#12232). The naming violation
+warns rather than rejects on tolerant loads (#1960). After this pass
 the entire downstream path (wire snapshot, `nameToID`,
 `classifyPolicyAddresses`, the strict/warn validators, the
 `resolveUserspaceAddressBookEntry` runtime resolver) keeps operating on a
@@ -1917,7 +1915,10 @@ gates (#3339/#3472) and the strict same-name `address`/`address-set` gate
 pre-existing configurations, but records the colliding names and refuses a
 policy reference that could otherwise resolve to a different winner. Nested
 application-set references are checked with the same collision registry;
-address-book collisions are carried through the zone-local fold. The policy is
+address-book collisions are carried through the zone-local fold. The fold
+also treats a pre-existing global `zone-local/<zone>/<name>` key of either
+kind as a twin, marking it colliding so cross-kind references are refused
+(#12232). The policy is
 lowered to the existing `__unsupported__` or `__unsupported_address__` sentinel,
 and `PolicyContentRejectionReasons` names the refused token so the helper keeps
 previous-good state (or boots default-deny) rather than publishing a

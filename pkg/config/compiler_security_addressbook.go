@@ -6,22 +6,21 @@ import (
 )
 
 // zoneLocalNamePrefix marks a zone-qualified internal address-book name
-// minted by resolveZoneLocalAddressBooks (#3061). The synthetic name is kept
-// collision-proof against operator-typed names by two narrow gates in
-// validateAddressBookEntryNamesStrict (relaxed in #4340): an operator
-// address-book entry name may NOT begin with this "zone-local/" prefix, and a
-// security-zone name may NOT contain `/`. A `/` is otherwise permitted inside
-// an entry NAME so real vSRX configs can name an object after its prefix
-// (net_10.0.0.0/8) — the zone is the `/`-free first segment after the prefix,
-// so ZoneLocalUnqualify still splits zone from a `/`-bearing name on the first
-// `/` unambiguously. The fold also skips a key already present in the global
-// book as a defence-in-depth no-clobber for the tolerant load path (a
-// persisted pre-validator config that an older binary accepted).
+// minted by resolveZoneLocalAddressBooks (#3061). Strict validation reserves
+// the `zone-local/` prefix for synthetic names: operator address-book entries
+// may not begin with it, and security-zone names may not contain `/`. A `/`
+// may still appear elsewhere in an entry name (for example `net_10.0.0.0/8`).
+// Since the zone is the `/`-free first segment after the prefix,
+// ZoneLocalUnqualify splits it from a `/`-bearing entry name unambiguously.
+// Tolerant loads may encounter a persisted pre-validator literal key; the
+// fold skips an existing global key of either kind and marks it in
+// CollidingNames so policy references are refused rather than misbound.
 const zoneLocalNamePrefix = "zone-local/"
 
 // zoneLocalQualify mints the global-book key for a zone-local address-book
-// entry. Both components are `/`-free, so the result is unambiguous and can
-// never equal a user-typed token.
+// entry. The `/`-free zone segment makes the qualified key unambiguous even
+// when the entry name contains `/`. Strict validation reserves the prefix,
+// but a tolerant load may preserve a pre-validator user token with that key.
 func zoneLocalQualify(zone, name string) string {
 	return zoneLocalNamePrefix + zone + "/" + name
 }
@@ -126,6 +125,19 @@ func resolveZoneLocalAddressBooks(sec *SecurityConfig) {
 	// name. Address-set member references are re-pointed to the same zone's
 	// qualified name when the member is also zone-local (zone-local first),
 	// otherwise left as a global reference.
+	// `address` and `address-set` share one operator-visible namespace (#5676),
+	// so a pre-existing global key of EITHER kind is a literal twin.
+	foldKeyTaken := func(q string) bool {
+		_, isAddr := gb.Addresses[q]
+		_, isSet := gb.AddressSets[q]
+		return isAddr || isSet
+	}
+	markFoldCollision := func(name string) {
+		if gb.CollidingNames == nil {
+			gb.CollidingNames = make(map[string]struct{})
+		}
+		gb.CollidingNames[name] = struct{}{}
+	}
 	for zoneName, z := range sec.Zones {
 		if z == nil || z.AddressBook == nil {
 			continue
@@ -140,8 +152,11 @@ func resolveZoneLocalAddressBooks(sec *SecurityConfig) {
 		}
 		for name, addr := range z.AddressBook.Addresses {
 			q := zoneLocalQualify(zoneName, name)
-			if _, exists := gb.Addresses[q]; exists {
-				continue // no-clobber (see zoneLocalNamePrefix); strict path never hits this
+			if foldKeyTaken(q) {
+				// Keep the operator's entry, but refuse policy references rather
+				// than silently substituting it for the zone-local definition.
+				markFoldCollision(q)
+				continue
 			}
 			// #9524: carry the unimplemented-form taint, or a zone-local mixed
 			// entry would resolve to its prefix alone once folded.
@@ -150,8 +165,9 @@ func resolveZoneLocalAddressBooks(sec *SecurityConfig) {
 		}
 		for name, set := range z.AddressBook.AddressSets {
 			q := zoneLocalQualify(zoneName, name)
-			if _, exists := gb.AddressSets[q]; exists {
-				continue // no-clobber (see zoneLocalNamePrefix)
+			if foldKeyTaken(q) {
+				markFoldCollision(q)
+				continue
 			}
 			ns := &AddressSet{
 				Name:           q,
