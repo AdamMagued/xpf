@@ -61,18 +61,26 @@ pub(in crate::afxdp) static WORKER_COMMAND_QUEUE_POISON_RECOVERIES: AtomicU64 = 
 ///   - the worker RECORD is never removed — no PRODUCTION path removes a single
 ///     record (registration is post-spawn-success and teardown publishes an
 ///     empty map; #7209's `remove_record_for_test` is `cfg(test)` only);
-///   - every producer fans out with `for rec in workers.records().values()` —
+///   - record-keyed producers fan out with `for rec in workers.records().values()` —
 ///     since #7209 that reads the published `ArcSwap` rather than an owned
-///     `BTreeMap`, which changes WHERE the set comes from and nothing about
-///     this argument — and no `dead` check, so it keeps pushing into that queue
-///     forever.
+///     `BTreeMap`, which changes WHERE the set comes from. `WorkerManager`'s
+///     dead-worker check sheds these producers' commands instead of enqueueing
+///     to a dead worker;
+///   - session-upsert replication is also liveness-aware (#12192): its
+///     generation-scoped `WorkerCommandQueues` resolves each bare peer handle
+///     to the runtime atomics paired with that exact Arc;
+///   - other producers that receive only a peer-queue slice have no dead flag:
+///     CoS redirect, PPTP broadcast, session-delete replication
+///     (`replicate_session_delete`, `replicate_purge_delete`,
+///     `replicate_session_delete_repairing`,
+///     `replicate_session_delete_conditional`) and local-tunnel `UpsertLocal`
+///     fan-out still push to dead workers. `push_bounded` caps those queues at
+///     4096, so their backlog remains bounded, never unbounded.
 ///
-/// The `dead` flag is read by `coordinator/status.rs` for diagnostics AND by
-/// record-keyed fan-out producers, which shed (skip + count) dead workers
-/// instead of feeding them (#9900 F-093). Slice-based producers (session
-/// replication, CoS redirect, PPTP broadcast) carry bare queue handles with
-/// no record access and still push; `push_bounded` caps those queues at 4096
-/// so a dead worker's backlog is bounded, never unbounded.
+/// The `dead` flag is read by `coordinator/status.rs` for diagnostics and by
+/// the record-keyed and session-upsert fan-out paths described above. This is
+/// deliberately not a blanket guarantee for every producer: the remaining
+/// slice-based paths still have bounded-queue behavior only.
 ///
 /// 4096 mirrors `MAX_PENDING_SESSION_DELTAS`, the sibling bound this codebase
 /// already applies to the same class of producer-side deque. Matching it is
@@ -91,6 +99,19 @@ pub(in crate::afxdp) const MAX_PENDING_WORKER_COMMANDS: usize = 4096;
 /// queue" while hiding whether anything was actually lost, and the two have
 /// opposite remediations.
 pub(in crate::afxdp) static WORKER_COMMAND_QUEUE_DROPS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static CURRENT_THREAD_WORKER_COMMAND_QUEUE_DROPS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Current-thread mirror of the generic drop counter for exact tests that
+/// must exclude unrelated tests' process-global queue refusals.
+#[cfg(test)]
+pub(crate) fn current_thread_worker_command_queue_drops_for_test() -> u64 {
+    CURRENT_THREAD_WORKER_COMMAND_QUEUE_DROPS.with(std::cell::Cell::get)
+}
 
 /// #9900 F-093: worker commands SHED because the target worker is dead
 /// (the #925 supervisor recorded its panic and the thread exited).
@@ -786,6 +807,8 @@ pub(in crate::afxdp) fn push_bounded(
     cmd: WorkerCommand,
 ) -> bool {
     if pending.len() >= MAX_PENDING_WORKER_COMMANDS {
+        #[cfg(test)]
+        CURRENT_THREAD_WORKER_COMMAND_QUEUE_DROPS.with(|drops| drops.set(drops.get() + 1));
         WORKER_COMMAND_QUEUE_DROPS.fetch_add(1, Ordering::Relaxed);
         return false;
     }
@@ -806,6 +829,8 @@ pub(in crate::afxdp) fn push_shaped_local_bounded(
     req: TxRequest,
 ) -> Result<(), TxRequest> {
     if pending.len() >= MAX_PENDING_WORKER_COMMANDS {
+        #[cfg(test)]
+        CURRENT_THREAD_WORKER_COMMAND_QUEUE_DROPS.with(|drops| drops.set(drops.get() + 1));
         WORKER_COMMAND_QUEUE_DROPS.fetch_add(1, Ordering::Relaxed);
         return Err(req);
     }

@@ -353,10 +353,10 @@ fn remove_shared_session_is_not_counted_as_a_publish() {
 }
 
 /// The replication leg reports a call count, an enqueue count, and a queue
-/// depth. `enqueued / upserts` recovers the N-way sibling fan-out multiplier
-/// without the analysis layer needing the worker count out of band, which is
-/// why both are counted rather than just one: three sibling queues must show
-/// exactly three enqueues for one call.
+/// depth. Production `enqueued / upserts` is the live-sibling multiplier:
+/// dead-worker legs skipped by #12192 are excluded. On this healthy fixture,
+/// all three sibling queues are live, so the ratio equals the configured
+/// sibling count.
 ///
 /// RED on revert: dropping the counter bumps from `replicate_session_upsert`
 /// leaves every delta at 0 and the fan-out assertion fails on its message.
@@ -370,7 +370,7 @@ fn replicate_session_upsert_counts_fanout_and_queue_depth() {
         .collect();
 
     let before = replication_counters();
-    replicate_session_upsert(&queues, &entry(40003));
+    replicate_session_upsert(&queues, empty_worker_commands_by_id(), &entry(40003));
     let after = replication_counters();
 
     assert_eq!(
@@ -381,8 +381,8 @@ fn replicate_session_upsert_counts_fanout_and_queue_depth() {
     assert_eq!(
         after.enqueued - before.enqueued,
         3,
-        "three sibling queues must record three enqueues — this ratio IS the \
-         fan-out multiplier the analysis layer divides by"
+        "three live sibling queues must record three enqueues; dead-worker \
+         legs are excluded from this metric"
     );
     assert!(
         after.depth_max >= 1,
@@ -430,7 +430,7 @@ fn replicate_session_upsert_counts_a_blocked_enqueue() {
             // `replicate_session_upsert` blocks and the `join()` hangs.
             let _exempt = CounterExempt::new();
             entered.store(true, Ordering::SeqCst);
-            replicate_session_upsert(&queues, &entry(40004));
+            replicate_session_upsert(&queues, empty_worker_commands_by_id(), &entry(40004));
         })
     };
     while !entered.load(Ordering::SeqCst) {
@@ -489,7 +489,7 @@ fn replicate_session_upsert_depth_sum_accumulates_per_call_backlog() {
     }
 
     let before = replication_counters();
-    replicate_session_upsert(&queues, &entry(40007));
+    replicate_session_upsert(&queues, empty_worker_commands_by_id(), &entry(40007));
     let after = replication_counters();
 
     // Post-push depths are 4 / 12 / 8; the worst is 12.
@@ -544,12 +544,12 @@ fn depth_sum_accumulates_while_depth_max_stays_a_high_water() {
             q.push_back(WorkerCommand::UpsertSynced(entry(61_000 + n as u16)));
         }
     }
-    replicate_session_upsert(&queues, &entry(40008));
+    replicate_session_upsert(&queues, empty_worker_commands_by_id(), &entry(40008));
     let after_deep = replication_counters();
 
     // Now drain to empty and replicate again — a SHALLOW call.
     queues[0].lock().expect("drain queue").clear();
-    replicate_session_upsert(&queues, &entry(40009));
+    replicate_session_upsert(&queues, empty_worker_commands_by_id(), &entry(40009));
     let after_shallow = replication_counters();
 
     assert!(
@@ -593,7 +593,7 @@ fn replicate_session_upsert_depth_high_water_tracks_backlog() {
         }
     }
 
-    replicate_session_upsert(&queues, &entry(40005));
+    replicate_session_upsert(&queues, empty_worker_commands_by_id(), &entry(40005));
 
     let after = replication_counters();
     assert!(
@@ -609,10 +609,10 @@ fn replicate_session_upsert_depth_high_water_tracks_backlog() {
 
 /// OVER-REACH GUARD. `replicate_session_delete` fans out over the same sibling
 /// queues through the same helper. Counting deletes as upserts would corrupt
-/// the fan-out ratio (`enqueued / upserts`) that the analysis layer uses to
-/// recover the sibling worker count — on a connection-rate run, where each
-/// flow is installed and later torn down, it would report roughly double the
-/// worker count and silently rescale the whole attribution.
+/// the live-sibling ratio (`enqueued / upserts`), which equals the configured
+/// sibling count only while all workers are alive. On a connection-rate run,
+/// where each flow is installed and later torn down, it would report roughly
+/// double the live-sibling count and silently rescale the whole attribution.
 ///
 /// Stays GREEN under the revert (all counters pinned at 0, so "delete adds
 /// nothing" still holds).
@@ -773,7 +773,7 @@ fn replication_contention_denominator_counts_only_attempted_acquisitions() {
         let queues: Vec<_> = queues.iter().map(Arc::clone).collect();
         std::thread::spawn(move || {
             let _exempt = CounterExempt::new();
-            replicate_session_upsert(&queues, &entry(40011));
+            replicate_session_upsert(&queues, empty_worker_commands_by_id(), &entry(40011));
         })
     };
 
@@ -809,14 +809,14 @@ fn replication_contention_denominator_counts_only_attempted_acquisitions() {
     drop(held);
     replicator.join().expect("replicating thread must not panic");
 
-    // At rest the total is unchanged by this reordering — the fan-out ratio
-    // the analyzer divides by must still be exactly the sibling count.
+    // At rest the total is unchanged by this reordering. All three queues in
+    // this fixture are live, so each attempt is counted and the ratio remains
+    // the configured sibling count.
     let after = replication_counters();
     assert_eq!(
         after.enqueued - before.enqueued,
         3,
-        "once the call completes every sibling must be counted, so \
-         enqueued/upserts is still the fan-out multiplier"
+        "the three live fixture queues must each be counted once"
     );
     assert_eq!(
         after.upserts - before.upserts,

@@ -409,9 +409,10 @@ pub(crate) struct ProcessStatus {
     /// Read as pairs: `..._lock_contended_total / ..._lock_acquisitions_total`
     /// is the publish leg's blocked fraction, and
     /// `session_replication_lock_contended_total / session_replication_enqueued_total`
-    /// the replication leg's. `session_replication_enqueued_total /
-    /// session_replication_upserts_total` recovers the N-way sibling
-    /// fan-out. `session_replication_queue_depth_max` is a monotonic
+    /// is the replication leg's. `session_replication_enqueued_total /
+    /// session_replication_upserts_total` is the live-sibling multiplier
+    /// (dead-worker legs skipped by #12192 are excluded).
+    /// `session_replication_queue_depth_max` is a monotonic
     /// high-water gauge, not a counter — do not `rate()` it.
     ///
     /// The NAT-allocator leg is per pool and rides `source_nat_pools`
