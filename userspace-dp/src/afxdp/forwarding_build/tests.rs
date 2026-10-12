@@ -1746,6 +1746,69 @@ fn build_forwarding_state_builds_distinct_parent_bound_ingress_keys_11461() {
 }
 
 #[test]
+fn untagged_nonzero_units_do_not_claim_parent_vid0_key_12250() {
+    let unit = |name: &str, ifindex: i32| InterfaceSnapshot {
+        name: name.into(),
+        ifindex,
+        parent_ifindex: 42,
+        is_unit: Some(true),
+        ..Default::default()
+    };
+    let rows = vec![
+        InterfaceSnapshot {
+            name: "st0".into(),
+            ifindex: 42,
+            is_unit: Some(false),
+            ..Default::default()
+        },
+        unit("st0.0", 42),
+        unit("st0.1", 43),
+        unit("st0.2", 44),
+    ];
+    for interfaces in [rows.clone(), rows.into_iter().rev().collect()] {
+        let state = try_build_forwarding_state_with_policy_counters(
+            &ConfigSnapshot {
+                interfaces,
+                ..Default::default()
+            },
+            &crate::policy::PolicyCounterStore::default(),
+        )
+        .expect("untagged nonzero siblings must not collide on the parent VID-0 key");
+        assert_eq!(state.ingress_logical_ifindex.get(&(42, 0)), Some(&42));
+    }
+}
+
+#[test]
+fn duplicate_unit0_vid0_ingress_key_still_rejects_12250() {
+    let unit0 = |name: &str, ifindex: i32| InterfaceSnapshot {
+        name: name.into(),
+        ifindex,
+        parent_ifindex: 6,
+        is_unit: Some(true),
+        ..Default::default()
+    };
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![unit0("reth0.0", 20), unit0("ge-0-0-1.0", 30)],
+        ..Default::default()
+    };
+    assert!(matches!(
+        try_build_forwarding_state_with_policy_counters(
+            &snapshot,
+            &crate::policy::PolicyCounterStore::default()
+        ),
+        Err(
+            crate::policy::SnapshotIntegrityError::InterfaceDuplicateIngressKey {
+                bind_ifindex: 6,
+                vlan_id: 0,
+                first_ifindex: 20,
+                second_ifindex: 30,
+                ..
+            }
+        )
+    ));
+}
+
+#[test]
 fn native_vlan_untagged_uses_native_unit_policy_11434() {
     use crate::{PolicyRuleSnapshot, ZoneSnapshot};
     use crate::afxdp::forwarding::{

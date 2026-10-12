@@ -1461,15 +1461,17 @@ pub(super) fn populate_egress(
         // The base interface row is not a logical untagged identity. Unit 0
         // without a VLAN id is explicit and keeps its existing VID-0 fallback.
         // Old Go and fixture snapshots may omit `is_unit`; use the shared
-        // structural/fallback detector, then parse the terminal unit number.
-        if is_logical_unit_row(&iface.name, iface.is_unit)
-            && iface
+        // structural/fallback detector, then parse the terminal unit number
+        // once for both the unit-0 fallback and the nonzero-unit skip below.
+        let logical_unit_number = if is_logical_unit_row(&iface.name, iface.is_unit) {
+            iface
                 .name
                 .rsplit_once('.')
                 .and_then(|(_, unit)| unit.parse::<u32>().ok())
-                == Some(0)
-            && vlan_id == 0
-        {
+        } else {
+            None
+        };
+        if logical_unit_number == Some(0) && vlan_id == 0 {
             untagged_unit_ifindexes.insert(bind_ifindex);
         }
 
@@ -1481,33 +1483,45 @@ pub(super) fn populate_egress(
         // permissive.
         let mtu = super::validated::InterfaceMtu::try_from_snapshot(iface.mtu, &iface.name)?.get();
         let ingress_key = (bind_ifindex, vlan_id);
+        // An untagged nonzero logical unit does not own the parent's VID-0
+        // ingress key. A MAC-less tunnel unit can carry `parent_ifindex`
+        // for its base while receiving traffic on a distinct ifindex;
+        // mapping the parent key to that sibling would reject a valid
+        // snapshot and misidentify untagged traffic on the base.
+        let untagged_nonzero_unit =
+            vlan_id == 0 && logical_unit_number.is_some_and(|unit| unit != 0);
         if iface.parent_ifindex > 0 {
-            if let Some((first_ifindex, first_interface)) =
-                parent_bound_ingress_owners.get(&ingress_key)
-            {
-                if *first_ifindex != iface.ifindex {
-                    return Err(
-                        crate::policy::SnapshotIntegrityError::InterfaceDuplicateIngressKey {
-                            bind_ifindex,
-                            vlan_id,
-                            first_ifindex: *first_ifindex,
-                            second_ifindex: iface.ifindex,
-                            first_interface: (*first_interface).to_string(),
-                            second_interface: iface.name.clone(),
-                        },
-                    );
+            if !untagged_nonzero_unit {
+                if let Some((first_ifindex, first_interface)) =
+                    parent_bound_ingress_owners.get(&ingress_key)
+                {
+                    if *first_ifindex != iface.ifindex {
+                        return Err(
+                            crate::policy::SnapshotIntegrityError::InterfaceDuplicateIngressKey {
+                                bind_ifindex,
+                                vlan_id,
+                                first_ifindex: *first_ifindex,
+                                second_ifindex: iface.ifindex,
+                                first_interface: (*first_interface).to_string(),
+                                second_interface: iface.name.clone(),
+                            },
+                        );
+                    }
+                } else {
+                    parent_bound_ingress_owners
+                        .insert(ingress_key, (iface.ifindex, iface.name.as_str()));
                 }
-            } else {
-                parent_bound_ingress_owners
-                    .insert(ingress_key, (iface.ifindex, iface.name.as_str()));
+                // Parent-bound units with a real VID own the parent/VLAN key;
+                // unit 0 owns the untagged key. Keep rejecting distinct
+                // logical ifindexes that collide on either identity.
+                // Parent-bound rows use `insert` so they take precedence
+                // over a base-interface row, while the base row below uses
+                // `or_insert` so the intentional base-row fallback remains
+                // intact when no parent-bound unit claims the key.
+                state
+                    .ingress_logical_ifindex
+                    .insert(ingress_key, iface.ifindex);
             }
-            // Parent-bound units take precedence over a base-interface row,
-            // but two distinct logical ifindexes cannot share this key.
-            // Detect only parent-bound duplicates so the intentional
-            // base-row fallback remains intact.
-            state
-                .ingress_logical_ifindex
-                .insert(ingress_key, iface.ifindex);
         } else {
             state
                 .ingress_logical_ifindex
