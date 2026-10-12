@@ -694,8 +694,47 @@ func TestApplicationSpec_UserAppBeforePredefinedSet_AppIDOffRejectsAtCommit(t *t
 	if err == nil {
 		t.Fatal("expected commit to reject malformed user application junos-sip shadowing the predefined junos-sip bundle")
 	}
-	if !strings.Contains(err.Error(), "junos-sip") ||
-		!strings.Contains(err.Error(), "destination-port") {
+	if !strings.Contains(err.Error(), `application "junos-sip": destination-port`) {
 		t.Fatalf("error %q must name user application junos-sip and destination-port", err.Error())
+	}
+}
+
+// A user application shadowing a predefined APPLICATION keeps application
+// semantics at runtime (ResolveApplication is user-first), so the strict walk
+// must test userApps before the PredefinedApplications early-return. Hoisting
+// that return above the user-app check skips the malformed user junos-http,
+// commits green, and fails closed at apply (the #12221 class).
+func TestApplicationSpec_UserAppBeforePredefinedApp_AppIDOffRejectsAtCommit(t *testing.T) {
+	tree := flatTreeFromSets(t,
+		"set applications application junos-http protocol tcp",
+		"set applications application junos-http destination-port nope",
+		"set security zones security-zone trust",
+		"set security zones security-zone untrust",
+		"set security policies from-zone trust to-zone untrust policy p match source-address any",
+		"set security policies from-zone trust to-zone untrust policy p match destination-address any",
+		"set security policies from-zone trust to-zone untrust policy p match application junos-http",
+		"set security policies from-zone trust to-zone untrust policy p then deny",
+	)
+	_, err := CompileConfig(tree)
+	if err == nil || !strings.Contains(err.Error(), `application "junos-http": destination-port`) {
+		t.Fatalf("want commit reject naming user application junos-http, got %v", err)
+	}
+}
+
+func TestApplicationSpec_UserAppShadowingPredefinedSet_DoesNotValidateBundleMembers(t *testing.T) {
+	tree := flatTreeFromSets(t,
+		"set applications application junos-sip protocol udp",
+		"set applications application junos-sip destination-port 5060",
+		"set applications application junos-sip-tcp protocol tcp",
+		"set applications application junos-sip-tcp destination-port nope",
+		"set security zones security-zone trust",
+		"set security zones security-zone untrust",
+		"set security policies from-zone trust to-zone untrust policy p match source-address any",
+		"set security policies from-zone trust to-zone untrust policy p match destination-address any",
+		"set security policies from-zone trust to-zone untrust policy p match application junos-sip",
+		"set security policies from-zone trust to-zone untrust policy p then deny",
+	)
+	if _, err := CompileConfig(tree); err != nil {
+		t.Fatalf("user app junos-sip shadows the bundle; runtime never reads junos-sip-tcp, so commit must succeed: %v", err)
 	}
 }
