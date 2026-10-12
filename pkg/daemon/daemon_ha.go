@@ -885,15 +885,24 @@ func (d *Daemon) reconcileRG0ConfigOwnership() {
 	}
 	// #12171: GroupState snapshots RG0 before running its transfer-readiness
 	// callback outside the manager lock. Recheck ownership after that callback
-	// so a concurrent event cannot make this reconcile consume a promotion
-	// latch from a stale Secondary snapshot or re-arm the gate on a new Primary.
+	// so a stale snapshot from a concurrent event makes this reconcile bail in
+	// BOTH directions: a stale Secondary snapshot must not consume a promotion
+	// latch from a self-election that already opened the gate, and a stale
+	// Primary snapshot must not re-open config writes on a node that is now
+	// RG0 secondary. The recheck only narrows the race to the final
+	// accessor-to-gate span; full serialization of event and reconcile handling
+	// is a follow-up.
 	if primary, known := d.cluster.LocalGroupPrimary(0); !known || primary != (rg0.State == cluster.StatePrimary) {
 		return
 	}
 
 	if d.store.ClusterReadOnly() == wantReadOnly {
 		if wantReadOnly && d.store.IsConfirmPending() && d.cluster.IsPeerPrimary(0) {
-			d.applyRG0OwnershipTransition(rg0.State, true)
+			// The peer-primary condition above is the demotion evidence, but
+			// pass false so apply re-derives the takeover itself: that sets
+			// peerTakeoverObserved and logs the peer-takeover reasons rather
+			// than the generic demotion lines.
+			d.applyRG0OwnershipTransition(rg0.State, false)
 		}
 		return
 	}
