@@ -93,7 +93,6 @@ func (r *nmManualRetry12159) arm(_ time.Duration, fn func()) {
 	r.retry = fn
 	r.mu.Unlock()
 }
-
 func (r *nmManualRetry12159) fire(t *testing.T) {
 	t.Helper()
 	r.mu.Lock()
@@ -382,7 +381,7 @@ func TestFailedRetriesRefreshCrashQuietWindow12159(t *testing.T) {
 	})
 }
 
-const nmPostReadyCrasherHelper12159 = `#!/usr/bin/python3
+const nmCountingPersistentHelper12159 = `#!/usr/bin/python3
 import os, socket, sys, time
 args = sys.argv[1:]
 path = args[args.index("--control-socket") + 1]
@@ -391,23 +390,27 @@ try:
     n = int(open(counter).read())
 except Exception:
     n = 0
-n += 1
-open(counter, "w").write(str(n))
+open(counter, "w").write(str(n + 1))
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.bind(path)
 s.listen(4)
-time.sleep(0.03)
-os._exit(7)
+while True:
+    time.sleep(300)
 `
 
 func TestSustainedPostReadyCrashLoopIncrementsCounter12159(t *testing.T) {
 	oldBase, oldMax := helperRestartBackoffBase, helperRestartBackoffMax
-	helperRestartBackoffBase, helperRestartBackoffMax = 10*time.Millisecond, 640*time.Millisecond
+	helperRestartBackoffBase, helperRestartBackoffMax = 10*time.Millisecond, 10*time.Second
 	t.Cleanup(func() { helperRestartBackoffBase, helperRestartBackoffMax = oldBase, oldMax })
 
-	m := startNMHelper12159(t, nmPostReadyCrasherHelper12159, func(d time.Duration, fn func()) {
-		time.AfterFunc(d, fn)
-	})
+	capAttempt := helperCrashLoopAttempt()
+	if capAttempt != 11 {
+		t.Fatalf("backoff cap reached at attempt %d, want attempt 11", capAttempt)
+	}
+	cycles := capAttempt + 3
+	retry := &nmManualRetry12159{}
+	m := startNMHelper12159(t, nmCountingPersistentHelper12159, retry.arm)
+	waitNMSupervisorRunning12159(t, m)
 	m.mu.Lock()
 	dir := filepath.Dir(m.cfg.ControlSocket)
 	m.mu.Unlock()
@@ -417,38 +420,54 @@ func TestSustainedPostReadyCrashLoopIncrementsCounter12159(t *testing.T) {
 		_, _ = fmt.Sscanf(string(b), "%d", &n)
 		return n
 	}
+	// With a 10ms base and 10s cap, the quiet window is 20s and the cap
+	// starts at attempt 11. Three more manual crash/fire cycles prove exits
+	// remain counted after CrashLooping() becomes true, without timer waits.
 
-	started := time.Now()
-	var previous, midCount, midEpisodes int
-	for time.Since(started) < 8*time.Second {
-		count := m.HelperCrashExitCount()
-		if count < previous {
-			t.Fatalf("unexpected-exit counter decreased: %d -> %d", previous, count)
+	var midCount, midEpisodes, midRetained int
+	var countedExitAfterLoop bool
+	for cycle := 1; cycle <= cycles; cycle++ {
+		before := m.HelperCrashState()
+		exitsBefore := m.HelperCrashExitCount()
+		killNMSupervisedChild12159(t, m)
+		exits := m.HelperCrashExitCount()
+		rec := m.HelperCrashState()
+		_, looping := m.HelperSupervisorState()
+		if exits != exitsBefore+1 {
+			t.Fatalf("cycle %d counted exits=%d, want previous %d plus one",
+				cycle, exits, exitsBefore)
 		}
-		previous = count
-		if midCount == 0 && time.Since(started) >= 4*time.Second {
-			midCount = count
-			_, midEpisodes = m.HelperCrashHistory()
+		if rec.Restarts != cycle {
+			t.Fatalf("cycle %d restart count=%d, want %d", cycle, rec.Restarts, cycle)
 		}
-		time.Sleep(50 * time.Millisecond)
+		if looping != rec.CrashLooping() {
+			t.Fatalf("cycle %d supervisor loop state=%v, record=%+v",
+				cycle, looping, rec)
+		}
+		if (cycle >= capAttempt) != looping {
+			t.Fatalf("cycle %d looping=%v, want %v at cap attempt %d",
+				cycle, looping, cycle >= capAttempt, capAttempt)
+		}
+		if before.CrashLooping() && exits > exitsBefore {
+			countedExitAfterLoop = true
+		}
+		if cycle == cycles/2 {
+			midCount = exits
+			episodes, total := m.HelperCrashHistory()
+			midEpisodes, midRetained = total, len(episodes)
+		}
+		retry.fire(t)
+		waitNMSupervisorRunning12159(t, m)
 	}
-	m.mu.Lock()
-	m.stopLocked()
-	m.mu.Unlock()
 
 	starts := readAttempts()
 	exits := m.HelperCrashExitCount()
-	_, episodes := m.HelperCrashHistory()
-	t.Logf("8s sustained post-ready loop: starts=%d unexpected exits=%d completed episodes=%d mid-run exits=%d",
-		starts, exits, episodes, midCount)
-	// RB1: relational assertions only — no absolute wall-clock count. Each
-	// crash-restart cycle costs the backoff delay plus ~100ms of readiness
-	// polling, so the expected starts in 8s sits within one cycle of any
-	// fixed threshold and millisecond drift reds it (starts=15 vs 16).
-	// Eight starts still proves the loop ran well past the 640ms backoff
-	// cap (~2.7s expected) with several capped cycles behind it.
-	if starts < 8 {
-		t.Fatalf("premise: only %d helper starts, want at least 8", starts)
+	episodes, total := m.HelperCrashHistory()
+	t.Logf("deterministic post-ready loop: starts=%d unexpected exits=%d completed episodes=%d mid-run exits=%d",
+		starts, exits, total, midCount)
+	if starts != cycles+1 {
+		t.Fatalf("helper starts=%d, want %d for %d crash/retry cycles",
+			starts, cycles+1, cycles)
 	}
 	if exits < starts-1 {
 		t.Fatalf("unexpected exits=%d for %d starts, want all but at most the final live child",
@@ -457,11 +476,14 @@ func TestSustainedPostReadyCrashLoopIncrementsCounter12159(t *testing.T) {
 	if exits > starts {
 		t.Fatalf("unexpected exits=%d exceeds helper starts=%d", exits, starts)
 	}
-	if midCount == 0 || midCount > exits {
+	if midCount <= 0 || midCount > exits {
 		t.Fatalf("counter did not increment monotonically during the loop: mid=%d final=%d", midCount, exits)
 	}
-	if midEpisodes != 0 || episodes != 0 {
-		t.Fatalf("quiet-window ring unexpectedly closed during sustained loop: mid=%d final=%d",
-			midEpisodes, episodes)
+	if midEpisodes != 0 || midRetained != 0 || total != 0 || len(episodes) != 0 {
+		t.Fatalf("quiet-window ring unexpectedly closed during sustained loop: mid=%d/%d final=%d/%d",
+			midEpisodes, midRetained, total, len(episodes))
+	}
+	if !countedExitAfterLoop {
+		t.Fatal("no unexpected exit was counted after CrashLooping() became true")
 	}
 }
