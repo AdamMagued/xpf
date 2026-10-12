@@ -516,12 +516,36 @@ CI_WORKFLOW="${REPO_ROOT}/.github/workflows/test.yml"
 # Slice the census job block through the next top-level job so checks are
 # scoped to the gated job, not other workflow jobs.
 CENSUS_JOB="$(awk 'BEGIN{in_job=0} /^  census:/{in_job=1; print; next} /^  [A-Za-z0-9_.-]+:/{if (in_job) exit} in_job{print}' "$CI_WORKFLOW")"
-# Require the exact command line and reject fail-open job or step mutations.
-CENSUS_RUN_OK=0
-CENSUS_FAIL_OPEN=0
-printf '%s\n' "$CENSUS_JOB" | grep -Eq '^[[:space:]]*run: sh scripts/harness-census\.sh[[:space:]]*$' && CENSUS_RUN_OK=1
-printf '%s\n' "$CENSUS_JOB" | grep -Eq 'continue-on-error|\|\|[[:space:]]*[^[:space:]]*true|\|\|[[:space:]]*:|^[[:space:]]*if[[:space:]]*:' && CENSUS_FAIL_OPEN=1
-if [[ $CENSUS_RUN_OK -eq 1 && $CENSUS_FAIL_OPEN -eq 0 ]]; then
+# Allowlist: the census job must equal this literal byte for byte. A
+# deny-list cannot enumerate every fail-open edit (if:, continue-on-error,
+# shell:, needs:, env:, ref:, || true, || :, heredoc decoys), so any
+# deviation -- including a renamed job or moved run line -- fails closed.
+EXPECTED_CENSUS_JOB="$(cat <<'EXPECTED_CENSUS_JOB_EOF'
+  census:
+    name: Harness census and self-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Census runnable-harness reachability
+        run: sh scripts/harness-census.sh
+      - name: Self-test the census
+        run: bash ./test/incus/harness-census-selftest.sh
+EXPECTED_CENSUS_JOB_EOF
+)"
+# Workflow-level keys must be exactly the expected set: a top-level
+# `defaults:` (for example `run: shell: true {0}`) can neuter the census
+# step while leaving the allowlisted job block untouched.
+TOP_LEVEL_KEYS="$(grep -E '^[^[:space:]#][^:]*:' "$CI_WORKFLOW" 2>/dev/null | sed 's/:.*//' | LC_ALL=C sort)"
+EXPECTED_TOP_LEVEL_KEYS="jobs
+name
+on
+permissions"
+CENSUS_WIRING_OK=0
+if [[ "$CENSUS_JOB" == "$EXPECTED_CENSUS_JOB" && "$TOP_LEVEL_KEYS" == "$EXPECTED_TOP_LEVEL_KEYS" ]]; then
+	CENSUS_WIRING_OK=1
+fi
+if [[ $CENSUS_WIRING_OK -eq 1 ]]; then
 	FX_CI="$(new_fixture ci-undeclared)"
 	add_harness "$FX_CI" ctl.sh 'echo control'
 	add_harness "$FX_CI" fresh-undeclared-harness.sh 'echo gate'
@@ -542,10 +566,8 @@ MK
 		bad "the CI-invoked census passed a fresh undeclared harness (rc=$rc)"
 		printf '%s\n' "$out" | sed 's/^/         /' >&2
 	fi
-elif [[ $CENSUS_FAIL_OPEN -eq 1 ]]; then
-	bad "test.yml census job is fail-open (continue-on-error, || true, or if:)"
 else
-	bad "test.yml does not invoke the expected fail-closed census command"
+	bad "test.yml census wiring differs from the exact allowlist (including || true or || :)"
 fi
 
 # ── cell L — the real tree must be GREEN ──────────────────────────────────
