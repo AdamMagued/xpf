@@ -1112,9 +1112,11 @@ func (d *Daemon) publishFabricRefreshChansIfCurrent(gen uint64, ch0, ch1 chan st
 //   - beginClusterCommsEpoch runs FIRST: it bumps clusterCommsGen and installs
 //     the cancellable sub-context every goroutine spawned below captures and
 //     every publish presents.
-//   - each socket path resolves its own transport interface membership:
-//     heartbeat uses ControlInterface; session sync and gRPC use the selected
-//     sync transport, including an active secondary fabric.
+//   - each socket path resolves its own transport interface membership on
+//     each bind attempt. The active key remains the epoch-start snapshot; any
+//     attempt that resolves a different device marks that epoch's binding
+//     changed so the next commit or reassert replaces every socket together.
+//     Heartbeat restarts after apply step 2.7 also resolve afresh.
 //   - syncRGStrictVIPOwnershipMode runs before the heartbeat goroutine: once
 //     VRRP starts driving rg_active it must already follow VIP ownership.
 //   - clusterCommsWG.Add(1) executes on THIS stack, never inside the goroutine,
@@ -1134,12 +1136,11 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 		return
 	}
 	cc := cfg.Chassis.Cluster
-
-	// Create an independently-cancellable sub-context so cluster comms can
-	// be restarted on config change (#87) without cancelling the daemon ctx.
+	// Create an independently-cancellable sub-context so cluster comms can be
+	// restarted on config change (#87) without cancelling the daemon ctx.
 	// beginClusterCommsEpoch bumps the epoch generation under clusterCommsMu so
 	// a constructor goroutine from a superseded epoch (still resolving its sync
-	// address) drops its publish instead of clobbering this epoch's state
+	// address) drops its publish instead of clobbering the existing epoch's state
 	// (#4958).
 	commsCtx, commsGen, commsCancel := d.beginClusterCommsEpoch(ctx)
 	// #7071: consume the drop signal, as both sibling publishers already do
@@ -1159,11 +1160,24 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 	// without it leaks the context itself (nothing else holds that cancel), and
 	// cancelling here is safe precisely because we have launched nothing on it
 	// yet — this is the first statement after the epoch opens.
-	if !d.setActiveTransportIfCurrent(commsGen, clusterTransportFromConfig(cfg)) {
+	if !d.setActiveTransportIfCurrent(commsGen, d.clusterTransportForConfig(cfg)) {
 		commsCancel()
 		return
 	}
 
+	if d.cluster != nil {
+		// Do not let a superseded concurrent start overwrite the live
+		// heartbeat resolver with a closure for its stale comms generation.
+		d.clusterCommsMu.Lock()
+		if commsGen == d.clusterCommsGen {
+			d.cluster.SetHeartbeatVRFDeviceFunc(func(controlIface string) string {
+				device := d.resolveClusterVRFDevice(controlIface)
+				d.noteClusterTransportBinding(commsGen, device)
+				return device
+			})
+		}
+		d.clusterCommsMu.Unlock()
+	}
 	d.startHAWatchdogHeartbeat(commsCtx, cc)
 
 	// In VRRP mode, make strict VIP ownership the runtime default so
@@ -1174,11 +1188,10 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 	d.syncRGStrictVIPOwnershipMode(cc)
 
 	// Start heartbeat if control-interface and peer-address are configured.
-	// Retry on bind failure: the control interface address and VRF device
-	// may not be ready during daemon startup (networkd race).
+	// The retry loop resolves VRF membership on each attempt; a failed boot
+	// apply can publish management-VRF membership after comms start.
 	if cc.ControlInterface != "" && cc.PeerAddress != "" {
-		heartbeatVRFDevice := d.resolveClusterVRFDevice(cc.ControlInterface)
-		go d.startHeartbeatWithRetry(commsCtx, cc.ControlInterface, cc.PeerAddress, heartbeatVRFDevice)
+		go d.startHeartbeatWithRetryForEpoch(commsCtx, cc.ControlInterface, cc.PeerAddress, commsGen)
 	}
 
 	syncIface, syncPeerAddr, syncTransport := clusterSyncTransport(cc)
@@ -1254,11 +1267,9 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// concurrent stopClusterComms that nils the field cannot turn a
 			// re-dereference into a nil-deref panic, and a superseded epoch's
 			// late publish is dropped rather than clobbering the live epoch.
-			syncTransportIfaces := []string{syncIface}
-			if syncLocal1 != "" {
-				syncTransportIfaces = append(syncTransportIfaces, cc.Fabric1Interface)
-			}
-			syncVRFDevice := d.resolveClusterVRFDevice(syncTransportIfaces...)
+			selectedSyncIface := clusterSyncVRFTransportIface(cc)
+			// The transport key and each session/gRPC bind use this exact
+			// primary interface; device membership is refreshed per attempt.
 
 			var ss *cluster.SessionSync
 			if syncLocal1 != "" {
@@ -1276,7 +1287,11 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			}
 			d.wireSessionSyncTransportRefs(ss, cc, syncTransport, syncPeerAddr, syncLocal1)
 
-			d.startFabricGRPCListeners(commsCtx, syncIP, syncLocal1, syncVRFDevice)
+			d.startFabricGRPCListeners(commsCtx, syncIP, syncLocal1, func() string {
+				device := d.transportVRFBinding(true, selectedSyncIface)
+				d.noteClusterTransportBinding(commsGen, device)
+				return device
+			})
 
 			// Wire sync stats into cluster manager for CLI display.
 			d.cluster.SetSyncStats(ss)
@@ -1291,7 +1306,8 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 
 			d.wireClusterFenceCallbacks(commsCtx, ss)
 
-			ss.SetVRFDevice(syncVRFDevice)
+			// (SetVRFDevice runs per attempt below because kernel membership
+			// may converge while the constructor is retrying.)
 
 			wiredStream := d.wireUserspaceEventStreamForSync(commsCtx)
 
@@ -1367,6 +1383,9 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 						return d.cluster.LocalProcessToken()
 					}
 				}
+				syncVRFDevice := d.transportVRFBinding(true, selectedSyncIface)
+				d.noteClusterTransportBinding(commsGen, syncVRFDevice)
+				ss.SetVRFDevice(syncVRFDevice)
 				if err := ss.Start(commsCtx); err != nil {
 					if i < 5 {
 						slog.Info("cluster: sync bind not ready, retrying",
@@ -1511,19 +1530,25 @@ func (d *Daemon) fenceAllRedundancyGroups(ctx context.Context) cluster.FenceResu
 	return res
 }
 
-// startHeartbeatWithRetry resolves the control-link local address and starts
-// the cluster heartbeat, retrying on a not-ready bind (the control interface
-// address and VRF device may not be ready during daemon startup — a networkd
-// race). It runs in its own goroutine, owned by the comms sub-context.
+// startHeartbeatWithRetryForEpoch resolves the control-link local address and
+// VRF device on every attempt, then starts the cluster heartbeat. Both the
+// address and management-VRF membership may become ready during the startup
+// retry window. Production runs it in its own goroutine, owned by the comms
+// sub-context.
 //
 // It exits immediately when ctx is cancelled (#4033): stopClusterComms cancels
 // the comms context before installing new comms, so without this the old retry
-// goroutine would survive the teardown and keep looping — up to 30 * 2s = 60s
-// — and could call StartHeartbeat AFTER stopClusterComms, installing a
-// heartbeat into a torn-down comms lifecycle and racing the replacement
-// goroutine. Every iteration (and every retry sleep) observes ctx so a comms
-// restart leaves exactly one retry goroutine and one heartbeat.
-func (d *Daemon) startHeartbeatWithRetry(ctx context.Context, controlIface, peerAddr, vrfDevice string) {
+// goroutine would survive teardown and keep looping — up to 30 * 2s = 60s —
+// and could call StartHeartbeat AFTER stopClusterComms, installing a heartbeat
+// into a torn-down comms lifecycle and racing the replacement goroutine. Every
+// iteration (and every retry sleep) observes ctx so a comms restart leaves
+// exactly one retry goroutine and one heartbeat.
+//
+// A resolved attempt in a current, nonzero comms generation records an off-key
+// VRF binding as sticky for the epoch; a later on-key retry cannot restore
+// sockets already opened with another device. Superseded epochs cannot update
+// the active transport key.
+func (d *Daemon) startHeartbeatWithRetryForEpoch(ctx context.Context, controlIface, peerAddr string, commsGen uint64) {
 	for i := 0; i < 30; i++ {
 		if ctx.Err() != nil {
 			slog.Info("cluster: heartbeat start aborted, comms context cancelled")
@@ -1540,6 +1565,8 @@ func (d *Daemon) startHeartbeatWithRetry(ctx context.Context, controlIface, peer
 			}
 			continue
 		}
+		vrfDevice := d.resolveClusterVRFDevice(controlIface)
+		d.noteClusterTransportBinding(commsGen, vrfDevice)
 		if err := d.cluster.StartHeartbeat(localIP, peerAddr, vrfDevice, controlIface); err != nil {
 			// #7257: a start the teardown superseded is terminal, not a bind
 			// failure. Retrying would race the same teardown again and, on
@@ -1672,10 +1699,10 @@ func (d *Daemon) stopClusterComms() {
 	}
 }
 
-// clusterTransportKey extracts the cluster transport fields that determine
-// heartbeat and session sync endpoints. Used to detect config changes that
-// require restarting cluster comms: step 20 compares the WHOLE struct, so every
-// field here participates in the restart decision.
+// clusterTransportKey extracts the cluster endpoints and kernel-evidenced VRF
+// binding that determine heartbeat and session sync sockets. Used to detect
+// config and kernel-membership changes that require restarting cluster comms:
+// step 20 compares the WHOLE struct, so every field here participates.
 //
 // The `log` tag is the key suffix step 20 uses when it reports that decision.
 // It exists so transportChangeLogArgs can derive the line from the struct
@@ -1688,6 +1715,10 @@ type clusterTransportKey struct {
 	FabricPeerAddress  string `log:"fabric_peer"`
 	Fabric1Interface   string `log:"fabric1"`
 	Fabric1PeerAddress string `log:"fabric1_peer"`
+	VRFDevice          string `log:"vrf"`
+	// BindingChanged remains true for this epoch once a retry resolves a
+	// different device than VRFDevice; only a new epoch may clear it.
+	BindingChanged bool `log:"binding_changed"`
 }
 
 // transportChangeLogArgs builds the key/value pairs for step 20's
@@ -1696,11 +1727,12 @@ type clusterTransportKey struct {
 //
 // Derived from the struct by reflection rather than written out by hand,
 // because the two had already drifted: the comparison that decides the restart
-// used all six fields while the line that reported it printed four, so a commit
-// changing only fab1 correctly restarted comms and then logged four identical
-// old/new pairs — a line asserting a change and showing none, which reads as a
-// spurious restart (#7073). Deriving it makes that drift unrepresentable: a
-// field added to the struct joins the comparison and the line together.
+// used every field while the line that reported it printed only four, so a
+// commit changing only fab1 correctly restarted comms and then logged four
+// identical old/new pairs — a line asserting a change and showing none, which
+// reads as a spurious restart (#7073). Deriving it makes that drift
+// unrepresentable: a field added to the struct joins the comparison and the
+// line together.
 //
 // A field with no `log` tag still gets logged, under its Go name; the tag is
 // for a readable key, not for inclusion. Omission is not a reachable state.
@@ -1716,11 +1748,9 @@ func transportChangeLogArgs(active, next clusterTransportKey) []any {
 		if name == "" {
 			name = rt.Field(i).Name
 		}
-		// .Interface(), not .String(): reflect.Value.String() does not fail on a
-		// non-string field, it returns "<int Value>". Every field is a string
-		// today, so this is not a live bug — but the whole point of deriving
-		// the line is that a future field joins it automatically, and joining
-		// it as garbage would be worse than the omission this replaced.
+		// Pass typed values through to the structured logger; the key can
+		// include bool and future non-string fields. Keeping this generic
+		// makes comparison and reporting stay aligned as fields are added.
 		args = append(args,
 			"old_"+name, av.Field(i).Interface(),
 			"new_"+name, nv.Field(i).Interface())
@@ -1741,6 +1771,20 @@ func clusterTransportFromConfig(cfg *config.Config) clusterTransportKey {
 		Fabric1Interface:   cc.Fabric1Interface,
 		Fabric1PeerAddress: cc.Fabric1PeerAddress,
 	}
+}
+
+// clusterTransportForConfig computes the configured transport endpoints and
+// the current VRF device from the same primary-interface set used by
+// session-sync, fabric gRPC and peer dials. Each comms epoch publishes this
+// device as its start-time snapshot; an off-key socket bind marks that epoch
+// sticky-changed so a later apply or reassert replaces all sockets together.
+func (d *Daemon) clusterTransportForConfig(cfg *config.Config) clusterTransportKey {
+	key := clusterTransportFromConfig(cfg)
+	if cfg == nil || cfg.Chassis.Cluster == nil {
+		return key
+	}
+	key.VRFDevice = d.resolveClusterSyncVRFDevice(cfg.Chassis.Cluster)
+	return key
 }
 
 // setActiveTransportIfCurrent publishes the transport key of the comms epoch
@@ -1795,6 +1839,21 @@ func (d *Daemon) setActiveTransportIfCurrent(gen uint64, k clusterTransportKey) 
 	}
 	d.activeClusterTransport = k
 	return true
+}
+
+// noteClusterTransportBinding makes an off-key bind attempt sticky for its
+// comms epoch. A successful bind on a later retry cannot restore sockets that
+// already bound with the other device, so only a new epoch may clear the flag.
+func (d *Daemon) noteClusterTransportBinding(gen uint64, device string) {
+	if gen == 0 {
+		return
+	}
+	active := d.activeTransport()
+	if active.VRFDevice == device {
+		return
+	}
+	active.BindingChanged = true
+	d.setActiveTransportIfCurrent(gen, active)
 }
 
 func (d *Daemon) activeTransport() clusterTransportKey {

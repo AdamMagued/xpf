@@ -42,25 +42,27 @@ func TestStartHeartbeatWithRetryExitsBeforeStartOnCancel(t *testing.T) {
 	defer d.cluster.StopHeartbeat()
 
 	ctx, cancel := context.WithCancel(context.Background())
+	commsCtx, gen, cancelComms := d.beginClusterCommsEpoch(ctx)
+	defer cancelComms()
 	cancel() // comms already torn down
 
 	done := make(chan struct{})
 	go func() {
 		// A real control interface would resolve here, but the ctx guard runs
 		// first, so the interface name is irrelevant.
-		d.startHeartbeatWithRetry(ctx, "127.0.0.1", "127.0.0.1", "")
+		d.startHeartbeatWithRetryForEpoch(commsCtx, "127.0.0.1", "127.0.0.1", gen)
 		close(done)
 	}()
 
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("startHeartbeatWithRetry did not exit on a cancelled ctx (ignored commsCtx)")
+		t.Fatal("startHeartbeatWithRetryForEpoch did not exit on a cancelled ctx (ignored commsCtx)")
 	}
 
 	// No heartbeat may have been installed.
 	if d.cluster.HeartbeatRunning() {
-		t.Fatal("startHeartbeatWithRetry installed a heartbeat despite a cancelled ctx")
+		t.Fatal("startHeartbeatWithRetryForEpoch installed a heartbeat despite a cancelled ctx")
 	}
 }
 
@@ -74,12 +76,14 @@ func TestStartHeartbeatWithRetryExitsMidRetryOnCancel(t *testing.T) {
 	defer d.cluster.StopHeartbeat()
 
 	ctx, cancel := context.WithCancel(context.Background())
+	commsCtx, gen, cancelComms := d.beginClusterCommsEpoch(ctx)
+	defer cancelComms()
 	done := make(chan struct{})
 	start := time.Now()
 	go func() {
 		// "xpf-nonexistent-4033" does not exist, so resolveClusterInterfaceAddr
 		// returns "" and the loop parks in the ctx-aware retry sleep.
-		d.startHeartbeatWithRetry(ctx, "xpf-nonexistent-4033", "127.0.0.1", "")
+		d.startHeartbeatWithRetryForEpoch(commsCtx, "xpf-nonexistent-4033", "127.0.0.1", gen)
 		close(done)
 	}()
 
@@ -89,10 +93,10 @@ func TestStartHeartbeatWithRetryExitsMidRetryOnCancel(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
-		t.Fatal("startHeartbeatWithRetry did not exit on mid-retry ctx cancel (retry loop ignored commsCtx)")
+		t.Fatal("startHeartbeatWithRetryForEpoch did not exit on mid-retry ctx cancel (retry loop ignored commsCtx)")
 	}
 	if elapsed := time.Since(start); elapsed > 10*time.Second {
-		t.Fatalf("startHeartbeatWithRetry took %v to honour ctx cancel", elapsed)
+		t.Fatalf("startHeartbeatWithRetryForEpoch took %v to honour ctx cancel", elapsed)
 	}
 	if d.cluster.HeartbeatRunning() {
 		t.Fatal("no heartbeat should be installed for an unresolvable interface")

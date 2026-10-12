@@ -202,7 +202,7 @@ func (m *Manager) startHeartbeat(localAddr, peerAddr, vrfDevice, controlIface st
 	m.mu.Unlock()
 
 	slog.Info("cluster: heartbeat started",
-		"local", localAddr, "peer", peerAddr,
+		"local", localAddr, "peer", peerAddr, "vrf", vrfDevice,
 		"interval", interval, "threshold", threshold)
 	return nil
 }
@@ -422,6 +422,7 @@ func (m *Manager) RestartHeartbeat() bool {
 	localAddr := m.hbLocalAddr
 	peerAddr := m.hbPeerAddr
 	vrfDevice := m.hbVRFDevice
+	vrfDeviceFn := m.hbVRFDeviceFn
 	controlIface := m.hbControlIface
 	notify := m.hbRestartNotifyFn
 	receiver := m.hbReceiver
@@ -451,8 +452,12 @@ func (m *Manager) RestartHeartbeat() bool {
 		lastSeenSeed = receiver.lastSeen.Load()
 	}
 
+	vrfForLog := vrfDevice
+	if vrfDeviceFn != nil {
+		vrfForLog = "resolved-per-attempt"
+	}
 	slog.Info("cluster: restarting heartbeat after VRF rebind",
-		"local", localAddr, "peer", peerAddr, "vrf", vrfDevice)
+		"local", localAddr, "peer", peerAddr, "vrf", vrfForLog)
 
 	// Freshen the peer's sync-recency suppression guard before our UDP
 	// heartbeats go silent.
@@ -461,9 +466,12 @@ func (m *Manager) RestartHeartbeat() bool {
 	}
 
 	m.stopHeartbeat()
-
-	for i := 0; i < 5; i++ {
-		if err := m.startHeartbeat(localAddr, peerAddr, vrfDevice, controlIface, lastSeenSeed, inheritedHold); err != nil {
+	for i := range 5 {
+		attemptVRFDevice := vrfDevice
+		if vrfDeviceFn != nil {
+			attemptVRFDevice = vrfDeviceFn(controlIface)
+		}
+		if err := m.startHeartbeat(localAddr, peerAddr, attemptVRFDevice, controlIface, lastSeenSeed, inheritedHold); err != nil {
 			slog.Warn("cluster: heartbeat restart bind failed, retrying",
 				"err", err, "attempt", i+1)
 			// Keep the peer's suppression guard fed (2s recency window)

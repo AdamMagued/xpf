@@ -1148,7 +1148,7 @@ func TestPrimaryOwnerRGIDsFollowsConfigAndOwnership(t *testing.T) {
 }
 
 func TestWireUserspaceEventStreamCallbacksStandaloneWiresSessionAndFullResync(t *testing.T) {
-	socketPath := filepath.Join(t.TempDir(), "events.sock")
+	socketPath := filepath.Join(t.TempDir(), "e")
 	es := dpuserspace.NewEventStream(socketPath)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

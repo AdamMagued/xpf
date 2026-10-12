@@ -966,12 +966,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 				d.fabricMu.RUnlock()
 			}
 			return addrs
-		}, func() string {
-			if c := d.store.ActiveConfig(); c != nil && c.Chassis.Cluster != nil {
-				return d.resolveClusterSyncVRFDevice(c.Chassis.Cluster)
-			}
-			return ""
-		}())
+		}, d.clusterPeerVRFDevice)
 
 		// Set the RBAC login class for the in-process console shell (#6701).
 		// See applyCLILoginClass (cli_rbac.go) for why identity comes from the

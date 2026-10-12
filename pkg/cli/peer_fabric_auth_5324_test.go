@@ -125,6 +125,39 @@ func TestDialPeerKeyedAttachesCredentialAcceptedByArmedFabric(t *testing.T) {
 	}
 }
 
+// TestDialPeerRefreshesFabricVRFPerDial12168 verifies that a peer VRF rebind
+// changes the device used by both the TCP reachability probe and the gRPC
+// dialer, rather than retaining SetFabricPeer's startup value.
+func TestDialPeerRefreshesFabricVRFPerDial12168(t *testing.T) {
+	port, stop := startFakeFabricServer(t, nil)
+	defer stop()
+
+	vrfDevice := ""
+	resolutions := 0
+	c := &CLI{fabricPeerPort: port}
+	c.SetFabricPeer(
+		func() []string { return []string{"127.0.0.1"} },
+		func() string {
+			resolutions++
+			return vrfDevice
+		},
+	)
+	if err := callPeerStatus(t, c); err != nil {
+		t.Fatalf("initial main-table peer RPC: %v", err)
+	}
+	if resolutions != 1 {
+		t.Fatalf("initial dial resolved VRF %d times, want 1", resolutions)
+	}
+
+	vrfDevice = "lo"
+	if err := callPeerStatus(t, c); err != nil {
+		t.Fatalf("peer RPC after live VRF rebind: %v", err)
+	}
+	if resolutions != 2 {
+		t.Fatalf("post-rebind dial resolved VRF %d times, want 2 total", resolutions)
+	}
+}
+
 // TestDialPeerInsecureOnlyRejectedByArmedFabric documents the pre-fix behavior:
 // a dialer that omits the credential (fabricAuthKeyFn returns nil so no token is
 // sent, exactly like the reverted insecure-only dialer) is rejected

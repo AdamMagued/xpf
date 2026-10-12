@@ -458,7 +458,8 @@ type Manager struct {
 	hbThreshold      int
 	hbLocalAddr      string // last StartHeartbeat localAddr (for restart)
 	hbPeerAddr       string // last StartHeartbeat peerAddr (for restart)
-	hbVRFDevice      string // last StartHeartbeat vrfDevice (for restart)
+	hbVRFDevice      string // last StartHeartbeat vrfDevice (for status/direct callers)
+	hbVRFDeviceFn    func(controlIface string) string
 	// hbControlIface is the control INTERFACE this heartbeat was started on
 	// (#8987). Recorded alongside the other StartHeartbeat args so a restart
 	// carries it unchanged and it can never describe a different heartbeat than
@@ -851,6 +852,15 @@ func (m *Manager) HeartbeatControlInterface() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.hbControlIface
+}
+
+// HeartbeatVRFDevice returns the VRF device supplied to the last successfully
+// published heartbeat start. A non-empty value means its sockets were created
+// with SO_BINDTODEVICE for that device.
+func (m *Manager) HeartbeatVRFDevice() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.hbVRFDevice
 }
 
 // controlLinkAuthKey returns the configured cluster control-channel PSK (raw

@@ -156,7 +156,7 @@ config change → `stopClusterComms` → `startClusterComms`, and the
    restart the old retry goroutine survived `stopClusterComms` (up to
    30×2s = 60s), and could call `StartHeartbeat` *after* teardown,
    installing a heartbeat into a dead comms lifecycle and racing the
-   replacement goroutine. The loop is now `startHeartbeatWithRetry(ctx,
+   replacement goroutine. The loop is now `startHeartbeatWithRetryForEpoch(ctx,
    …)`: every iteration checks `ctx.Err()` and every retry sleep uses
    `sleepCtx(ctx, …)`, so a cancelled comms context makes the goroutine
    exit promptly. Combined with (1)'s stop-previous, a comms restart

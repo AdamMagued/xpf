@@ -268,8 +268,8 @@ func TestEventStreamFallbackLoop_RewiresReplacementStream(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	wired, _ := startEventStreamForRewireTest(t, ctx, "wired.sock")
-	replacement, replacementPath := startEventStreamForRewireTest(t, ctx, "replacement.sock")
+	wired, _ := startEventStreamForRewireTest(t, ctx, "w")
+	replacement, replacementPath := startEventStreamForRewireTest(t, ctx, "r")
 
 	// A cluster that is primary for NOTHING: handleEventStreamDelta then
 	// takes its "ignored (not primary for any RG)" arm and ACKs, so the ACK
@@ -415,7 +415,7 @@ func runEmptyCellWiringBinder(t *testing.T, withCluster bool) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	es, path := startEventStreamForRewireTest(t, ctx, "late-entry.sock")
+	es, path := startEventStreamForRewireTest(t, ctx, "l")
 
 	d := &Daemon{store: storeWithActiveConfigForDrainTest(t)}
 	if withCluster {
@@ -513,7 +513,7 @@ func (c *connectedStreamDrainerDP) DrainSessionDeltas(uint32) ([]dpuserspace.Ses
 // test would silently measure the already-bound site instead.
 func connectedEventStreamForDrainTest(t *testing.T, ctx context.Context) *dpuserspace.EventStream {
 	t.Helper()
-	es, path := startEventStreamForRewireTest(t, ctx, "connected.sock")
+	es, path := startEventStreamForRewireTest(t, ctx, "c")
 	conn, err := dialEventStreamForRewireTest(t, path)
 	if err != nil {
 		t.Fatalf("dial event stream: %v", err)

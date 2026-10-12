@@ -53,13 +53,17 @@ func (s *Server) dialPeer(ctx context.Context) (*grpc.ClientConn, error) {
 		grpc.WithUnaryInterceptor(FabricAuthUnaryClientInterceptor),
 		grpc.WithStreamInterceptor(FabricAuthStreamClientInterceptor),
 	}
-	if s.fabricVRFDevice != "" {
+	vrfDevice := ""
+	if s.fabricVRFDeviceFn != nil {
+		vrfDevice = s.fabricVRFDeviceFn()
+	}
+	if vrfDevice != "" {
 		dialOpts = append(dialOpts, grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
 			dialer := &net.Dialer{
 				Control: func(network, address string, c syscall.RawConn) error {
 					var err error
 					c.Control(func(fd uintptr) {
-						err = unix.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, s.fabricVRFDevice)
+						err = unix.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, vrfDevice)
 					})
 					return err
 				},

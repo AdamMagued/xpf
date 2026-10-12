@@ -28,11 +28,19 @@ func (d *Daemon) mgmtVRFReassertLoop(ctx context.Context) {
 }
 
 // reassertMgmtVRFOnce restores drifted members under applySem, then refreshes
-// their DHCP routes in the management table. The drift gate runs before and
-// after acquiring the semaphore: a commit that lands while this pass waits may
-// already have rebound the interfaces or published a different set.
+// their DHCP routes in the management table. Its quick gate also watches the
+// active transport's sticky binding mismatch, since kernel drift may already
+// have been repaired before the background pass runs.
 func (d *Daemon) reassertMgmtVRFOnce(ctx context.Context) {
-	if d.routing == nil || d.applySem == nil || len(d.mgmtVRFInterfacesOutsideVRF()) == 0 {
+	if d.applySem == nil {
+		return
+	}
+	bindingChanged := d.activeTransport().BindingChanged
+	var drifted []string
+	if d.routing != nil {
+		drifted = d.mgmtVRFInterfacesOutsideVRF()
+	}
+	if len(drifted) == 0 && !bindingChanged {
 		return
 	}
 	if err := d.applySem.Acquire(ctx, 1); err != nil {
@@ -40,10 +48,15 @@ func (d *Daemon) reassertMgmtVRFOnce(ctx context.Context) {
 	}
 	defer d.applySem.Release(1)
 
-	drifted := d.mgmtVRFInterfacesOutsideVRF()
-	if len(drifted) == 0 {
+	bindingChanged = d.activeTransport().BindingChanged
+	drifted = nil
+	if d.routing != nil {
+		drifted = d.mgmtVRFInterfacesOutsideVRF()
+	}
+	if len(drifted) == 0 && !bindingChanged {
 		return
 	}
+	rebound := false
 	for _, name := range drifted {
 		slog.Warn("management interface outside the management VRF — re-binding",
 			"interface", name)
@@ -52,10 +65,22 @@ func (d *Daemon) reassertMgmtVRFOnce(ctx context.Context) {
 				"interface", name, "err", err)
 			continue
 		}
+		rebound = true
 		slog.Info("management interface bound to the management VRF", "interface", name)
 	}
-	routeErr := mgmtVRFRouteReconcileFn(d)
-	d.noteMgmtRouteReconcileResult(routeErr)
+	if rebound || bindingChanged {
+		var cfg *config.Config
+		if d.store != nil {
+			cfg = d.store.ActiveConfig()
+		}
+		if cfg != nil && cfg.Chassis.Cluster != nil && !d.inBootstrap() {
+			d.reconcileClusterTransportBinding(cfg, false)
+		}
+	}
+	if len(drifted) > 0 {
+		routeErr := mgmtVRFRouteReconcileFn(d)
+		d.noteMgmtRouteReconcileResult(routeErr)
+	}
 }
 
 // mgmtVRFInterfacesOutsideVRF reports published management interfaces whose

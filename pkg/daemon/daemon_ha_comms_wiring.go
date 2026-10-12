@@ -19,50 +19,95 @@ import (
 // (#6428). Their call sites in daemon_ha_sync.go retain the same startup
 // ordering and goroutine spawn points.
 
-// resolveClusterVRFDevice returns vrf-mgmt only when every cluster transport
-// interface belongs to it. The published set uses post-LinuxIfName spellings;
-// an unrelated management interface must not determine a transport's routing
-// table. Non-members stay unbound so their routes resolve in the main table.
+// resolveClusterVRFDevice is the warning form of transportVRFBinding for
+// heartbeat bind attempts.
 func (d *Daemon) resolveClusterVRFDevice(transportIfaces ...string) string {
+	return d.transportVRFBinding(true, transportIfaces...)
+}
+
+// transportVRFBinding is the single predicate for socket binding and the
+// transport restart key. Every selected interface must be both published and
+// a kernel member of vrf-mgmt. Desired-only membership after EBUSY must not
+// destroy working main-table comms; kernel-only membership after a warm restart
+// must not consume the later publication transition while sockets are unbound.
+// Empty selections, missing links and failed lookups remain unbound.
+func (d *Daemon) transportVRFBinding(warn bool, transportIfaces ...string) string {
 	members := d.mgmtVRFIfaceSet()
-	hasTransport := false
+	vrfIndex := 0
 	for _, iface := range transportIfaces {
 		if iface == "" {
 			continue
 		}
-		hasTransport = true
 		linuxName := config.LinuxIfName(iface)
-		if members[linuxName] {
-			continue
+		if !members[linuxName] {
+			if warn && (len(members) > 0 || config.IsManagementIfName(iface)) {
+				slog.Warn("cluster transport interface is not a management VRF member; leaving sockets unbound to VRF",
+					"interface", linuxName, "vrf", config.ManagementVRFDeviceName)
+			}
+			return ""
 		}
-		if len(members) > 0 || config.IsManagementIfName(iface) {
-			slog.Warn("cluster transport interface is not a management VRF member; leaving sockets unbound to VRF",
-				"interface", linuxName, "vrf", config.ManagementVRFDeviceName)
+		if vrfIndex == 0 {
+			vrf, err := d.fabricLinkByName(config.ManagementVRFDeviceName)
+			if err != nil || vrf == nil || vrf.Attrs() == nil || vrf.Attrs().Index == 0 {
+				return ""
+			}
+			vrfIndex = vrf.Attrs().Index
 		}
-		return ""
+		link, err := d.fabricLinkByName(linuxName)
+		if err != nil || link == nil || link.Attrs() == nil {
+			return ""
+		}
+		if link.Attrs().MasterIndex != vrfIndex {
+			if warn {
+				slog.Warn("cluster transport interface is published but outside the management VRF; leaving sockets unbound to VRF",
+					"interface", linuxName,
+					"master_index", link.Attrs().MasterIndex,
+					"vrf", config.ManagementVRFDeviceName,
+					"vrf_index", vrfIndex)
+			}
+			return ""
+		}
 	}
-	if !hasTransport {
+	if vrfIndex == 0 {
 		return ""
 	}
 	return config.ManagementVRFDeviceName
 }
 
-// resolveClusterSyncVRFDevice scopes CLI and gRPC peer dials to the same
-// transport selected for session sync, including a configured secondary
-// fabric when fabric transport is active.
+// resolveClusterSyncVRFDevice scopes session sync, fabric gRPC, peer dials and
+// the transport key to the primary selected interface only. It is quiet
+// because keys and dials are frequent.
 func (d *Daemon) resolveClusterSyncVRFDevice(cc *config.ClusterConfig) string {
+	iface := clusterSyncVRFTransportIface(cc)
+	return d.transportVRFBinding(false, iface)
+}
+
+// clusterPeerVRFDevice is the live resolver installed on the daemon-owned
+// CLI and gRPC peer dialers. Read the active config and re-evaluate the same
+// published-plus-kernel predicate for each dial.
+func (d *Daemon) clusterPeerVRFDevice() string {
+	if d.store == nil {
+		return ""
+	}
+	cfg := d.store.ActiveConfig()
+	if cfg == nil || cfg.Chassis.Cluster == nil {
+		return ""
+	}
+	return d.resolveClusterSyncVRFDevice(cfg.Chassis.Cluster)
+}
+
+// clusterSyncVRFTransportIface returns the selected primary transport
+// interface for VRF binding. Dual-fabric socket addresses are configured
+// separately and do not participate in VRF selection.
+func clusterSyncVRFTransportIface(cc *config.ClusterConfig) string {
 	if cc == nil {
 		return ""
 	}
-	syncIface, syncPeerAddr, syncTransport := clusterSyncTransport(cc)
+	syncIface, syncPeerAddr, _ := clusterSyncTransport(cc)
 	if syncIface == "" || syncPeerAddr == "" {
 		return ""
 	}
-	transportIfaces := []string{syncIface}
-	if syncTransport == "fabric" && cc.Fabric1Interface != "" && cc.Fabric1PeerAddress != "" {
-		transportIfaces = append(transportIfaces, cc.Fabric1Interface)
-	}
-	return d.resolveClusterVRFDevice(transportIfaces...)
+	return syncIface
 }
 
 // startHAWatchdogHeartbeat starts the HA watchdog heartbeat goroutine for the
@@ -174,7 +219,7 @@ func (d *Daemon) wireSessionSyncTransportRefs(ss *cluster.SessionSync, cc *confi
 // listener(s) once d.grpcSrv exists (it is set after startClusterComms
 // returns). Extracted verbatim from startClusterComms (#6428) — pure code
 // motion; the goroutine is spawned at the same point in the sequence.
-func (d *Daemon) startFabricGRPCListeners(commsCtx context.Context, syncIP, syncLocal1, vrfDevice string) {
+func (d *Daemon) startFabricGRPCListeners(commsCtx context.Context, syncIP, syncLocal1 string, vrfDeviceFn func() string) {
 	// Start gRPC fabric listener(s) so peer can proxy monitor requests.
 	// d.grpcSrv is set after startClusterComms returns, so we poll briefly.
 	// Uses the sync interface address (fabric or control-link).
@@ -193,10 +238,10 @@ func (d *Daemon) startFabricGRPCListeners(commsCtx context.Context, syncIP, sync
 					// Extract fab1 local IP (syncLocal1 is "ip:4785").
 					fab1Host, _, _ := net.SplitHostPort(syncLocal1)
 					grpcAddr1 := net.JoinHostPort(fab1Host, "50051")
-					go d.grpcSrv.RunFabricListener(commsCtx, grpcAddr1, vrfDevice)
+					go d.grpcSrv.RunFabricListenerWithVRFDeviceFunc(commsCtx, grpcAddr1, vrfDeviceFn)
 					slog.Info("gRPC dual fabric listeners", "fab0", grpcAddr, "fab1", grpcAddr1)
 				}
-				d.grpcSrv.RunFabricListener(commsCtx, grpcAddr, vrfDevice)
+				d.grpcSrv.RunFabricListenerWithVRFDeviceFunc(commsCtx, grpcAddr, vrfDeviceFn)
 				return
 			}
 			time.Sleep(time.Second)

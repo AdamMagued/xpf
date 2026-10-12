@@ -179,8 +179,8 @@ type CLI struct {
 	factoryResetFn func(ctx context.Context, wipe func() error) error
 
 	// Fabric peer dialing for cluster-wide queries (fab0 + optional fab1).
-	fabricPeerAddrFn func() []string
-	fabricVRFDevice  string
+	fabricPeerAddrFn  func() []string
+	fabricVRFDeviceFn func() string
 	// fabricAuthKeyFn resolves the #4107 control-link PSK the CLI attaches to
 	// peer fabric dials (dialPeer). Nil in production, where fabricAuthKey()
 	// falls back to the cluster manager's live key; a test seam sets it
@@ -466,9 +466,11 @@ func (c *CLI) SetFactoryResetFn(fn func(ctx context.Context, wipe func() error) 
 }
 
 // SetFabricPeer configures fabric peer dialing for cluster-wide queries.
-func (c *CLI) SetFabricPeer(addrFn func() []string, vrfDevice string) {
+// VRF membership is resolved for each dial so a live management-VRF rebind
+// cannot leave the CLI on the transport device captured at startup.
+func (c *CLI) SetFabricPeer(addrFn func() []string, vrfDeviceFn func() string) {
 	c.fabricPeerAddrFn = addrFn
-	c.fabricVRFDevice = vrfDevice
+	c.fabricVRFDeviceFn = vrfDeviceFn
 }
 
 // Run starts the interactive CLI loop.
