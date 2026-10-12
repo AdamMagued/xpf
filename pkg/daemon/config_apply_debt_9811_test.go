@@ -64,6 +64,9 @@ func TestConfirmedRollbackApplyFailureIsRetriedUntilItConverges9811(t *testing.T
 	if !strings.Contains(lastErr, "connection refused") {
 		t.Errorf("last error = %q, want the apply's own error", lastErr)
 	}
+	if d.store.ActiveApplied() {
+		t.Fatal("a failed auto-rollback apply must not stamp the active config as applied")
+	}
 
 	// The retry owner runs while the fault persists. The COUNT must climb: a
 	// flat count with the debt still owed is exactly the signature of a debt
@@ -75,6 +78,9 @@ func TestConfirmedRollbackApplyFailureIsRetriedUntilItConverges9811(t *testing.T
 	}
 	if owed, failures, _ := d.ConfigApplyDebt(); !owed || failures != 2 {
 		t.Fatalf("after one retry against a persisting fault: owed=%v failures=%d, want true/2 — a flat count with the debt owed means nothing is retrying it", owed, failures)
+	}
+	if d.store.ActiveApplied() {
+		t.Fatal("a failed retry must not stamp the active config as applied")
 	}
 
 	// Fault clears; the next tick must converge and discharge.
@@ -90,20 +96,35 @@ func TestConfirmedRollbackApplyFailureIsRetriedUntilItConverges9811(t *testing.T
 	if lastErr != "" {
 		t.Errorf("last error = %q after convergence, want it cleared", lastErr)
 	}
+	if !d.store.ActiveApplied() {
+		t.Fatal("a converging retry did not stamp the active rollback target as applied")
+	}
 }
 
-// TestSuccessfulConfirmedRollbackOwesNothing9811 is the control the issue asks
-// for, and it is not optional: without it, a mechanism that latched the debt
-// unconditionally would satisfy every assertion above.
-func TestSuccessfulConfirmedRollbackOwesNothing9811(t *testing.T) {
-	d, gen := newDebtDaemon9811(t)
-	// applyErrForTest nil = clean apply.
-	d.executeConfirmedRollback(gen)
+func newRealApplyRollbackHarness9811(t *testing.T, script []invalDebtOutcome12073) (*invalDebtHarness12073, uint64) {
+	t.Helper()
+	h := newInvalDebtHarness12073(t, script)
+	s, gen := newRollbackTestStore(t)
+	h.d.store = s
+	return h, gen
+}
 
-	if owed, failures, _ := d.ConfigApplyDebt(); owed || failures != 0 {
+// TestSuccessfulConfirmedRollbackOwesNothing9811 exercises a real apply. The
+// #12073 debt discharge already stamps successful rollback applies through
+// dischargePolicyInvalidationDebtLocked -> MarkAppliedDigest(debt.appliedDigest);
+// this passes on base and is intentionally not evidence for a new rollback
+// stamp in this change.
+func TestSuccessfulConfirmedRollbackOwesNothing9811(t *testing.T) {
+	h, gen := newRealApplyRollbackHarness9811(t, nil)
+	h.d.executeConfirmedRollback(gen)
+
+	if owed, failures, _ := h.d.ConfigApplyDebt(); owed || failures != 0 {
 		t.Fatalf("a SUCCESSFUL auto-rollback owes a config apply (owed=%v failures=%d); over-latching pins /health at 503 on a converged node", owed, failures)
 	}
-	if got := d.store.ActiveConfig().System.HostName; got != "A" {
+	if !h.d.store.ActiveApplied() {
+		t.Fatal("a real-apply successful auto-rollback did not stamp through the #12073 debt discharge")
+	}
+	if got := h.d.store.ActiveConfig().System.HostName; got != "A" {
 		t.Fatalf("store did not roll back: host-name = %q, want A", got)
 	}
 }
@@ -163,5 +184,81 @@ func TestReassertAppliesTheACTIVEConfigNotTheFailedOne9811(t *testing.T) {
 	}
 	if owed, _, _ := d.ConfigApplyDebt(); owed {
 		t.Fatal("the debt survived a successful apply of the active config; an unrelated commit must be able to discharge it or /health stays degraded forever")
+	}
+}
+
+// TestConfirmedRollbackDefersMarkerUntilInvalidationLands9811 pins the
+// fail-closed ordering for a deferred userspace snapshot: successful config
+// apply alone cannot stamp while policy-invalidation debt remains outstanding.
+func TestConfirmedRollbackDefersMarkerUntilInvalidationLands9811(t *testing.T) {
+	h, gen := newRealApplyRollbackHarness9811(t, []invalDebtOutcome12073{{deferred: true}})
+	h.d.executeConfirmedRollback(gen)
+
+	if h.d.store.ActiveApplied() {
+		t.Fatal("FAIL-OPEN: rollback stamped applied while its deferred snapshot has not landed")
+	}
+	if h.d.policyInvalidationDebt == nil {
+		t.Fatal("fixture: deferred publication must leave policy-invalidation debt outstanding")
+	}
+	h.d.dischargePolicyInvalidationAfterPublish(h.dp.lastApply.Generation)
+	if !h.d.store.ActiveApplied() {
+		t.Fatal("deferred landing did not stamp the applied marker")
+	}
+}
+
+// TestRetryDoesNotStampWhilePolicyInvalidationDebtOutstanding9811 pins the
+// retry owner's separate fail-closed guard: a converged apply cannot certify
+// active while session-invalidation debt is still outstanding.
+func TestRetryDoesNotStampWhilePolicyInvalidationDebtOutstanding9811(t *testing.T) {
+	d, gen := newDebtDaemon9811(t)
+	d.applyErrForTest = errors.New("transient rollback apply")
+	d.executeConfirmedRollback(gen)
+	active := d.store.ActiveConfig()
+	d.policyInvalidationDebt = &policyInvalidationDebt{
+		oldCfg: active, newCfg: active,
+		capture: &policyInvalidationCapture{readErr: errors.New("incomplete READ")},
+	}
+	d.applyErrForTest = nil
+
+	d.reassertConfigApplyOnce(context.Background())
+	if owed, _, _ := d.ConfigApplyDebt(); owed {
+		t.Fatal("fixture: retry did not converge")
+	}
+	if d.policyInvalidationDebt == nil {
+		t.Fatal("fixture: policy-invalidation debt must remain outstanding")
+	}
+	if d.store.ActiveApplied() {
+		t.Fatal("FAIL-OPEN: retry stamped applied while policy-invalidation debt is outstanding")
+	}
+}
+
+// TestRetryStampKeysCapturedDigest9811 pins #6296's mid-retry promotion
+// boundary: the retry may stamp only the digest it captured before applying.
+func TestRetryStampKeysCapturedDigest9811(t *testing.T) {
+	d, gen := newDebtDaemon9811(t)
+	d.applyErrForTest = errors.New("transient rollback apply")
+	d.executeConfirmedRollback(gen)
+	d.applyErrForTest = nil
+
+	promoted := false
+	d.applyBodyForTest = func(_ *config.Config) {
+		if promoted {
+			return
+		}
+		promoted = true
+		if _, err := d.store.SyncApply("system { host-name promoted-mid-retry; }", nil); err != nil {
+			t.Errorf("injected promoter: %v", err)
+		}
+	}
+	d.reassertConfigApplyOnce(context.Background())
+
+	if owed, _, _ := d.ConfigApplyDebt(); owed {
+		t.Fatal("fixture: retry did not converge")
+	}
+	if got := d.store.ActiveConfig().System.HostName; got != "promoted-mid-retry" {
+		t.Fatalf("fixture: injected promotion did not land (host=%q)", got)
+	}
+	if d.store.ActiveApplied() {
+		t.Fatal("#6296: retry stamp certified a config promoted during its apply (re-read instead of captured digest)")
 	}
 }

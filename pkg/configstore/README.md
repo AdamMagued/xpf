@@ -183,25 +183,30 @@ inline archive-site-password warning in #651).
   the apply and, under the #1799 degrade-not-fail doctrine, do NOT roll it back
   on an apply failure — so a config can be the active tree yet never have
   converged on the dataplane. The daemon stamps the marker after a
-  fully-successful `applyConfigLocked` (boot, commit, config-sync); boot/feed
-  `applyActiveConfigResult` records success before releasing `applySem`, so a
-  competing promotion cannot inherit a different config's apply result.
+  fully-successful `applyConfigLocked` (boot, commit, config-sync and #9811
+  retry); #12073 rollback stamps through the invalidation-debt discharge.
+  Boot/feed `applyActiveConfigResult` records success before releasing
+  `applySem`, so a competing promotion cannot inherit a different config's
+  apply result.
   `ActiveApplied` reports whether the CURRENT active text matches that
   last-applied digest.
   `pkg/daemon` `handleConfigSync` ANDs its active-text convergence shortcut with
   `ActiveApplied()` so a promoted-but-unapplied synced config is not treated as
   converged (the HA config high-water then stays pinned until a retry lands).
-  Two ways to stamp: `MarkActiveApplied` re-reads `s.active` at call time (the
-  boot/commit paths use it while holding the apply semaphore, when active is
-  stable); `MarkAppliedDigest` stamps a digest the caller CAPTURED earlier via
+  `MarkActiveApplied` re-reads `s.active` at call time (the boot/commit paths
+  use it while holding the apply semaphore, when active is stable);
+  `MarkAppliedDigest` stamps a digest the caller CAPTURED earlier via
   `ActiveDigest`, for the exact config it applied. The config-sync receive path
   (`daemon.syncAndApply`) uses the capture/replay pair (#6296): it captures the
   digest right after `SyncApply` promotes the peer config and replays it on full
-  success, both under the apply semaphore — so a concurrent secondary-side
-  promoter (a local commit / commit-confirmed rollback) mutating `s.active` in
-  what used to be a post-semaphore-release window can no longer make the marker
-  key a different, never-applied tree. `ActiveDigest` returns exactly the value
-  `ActiveApplied` compares against (`configTextDigest(s.active.Format())`).
+  success, both under the apply semaphore. This prevents a concurrent
+  secondary-side promoter from making the marker key a different, never-applied
+  tree. The #9811 retry owner likewise captures the active digest under
+  `applySem` and stamps it only after a successful retry with no outstanding
+  policy-invalidation debt. A successful commit-confirmed rollback is stamped
+  by the #12073 invalidation-debt discharge after that debt clears.
+  `ActiveDigest` returns exactly the value `ActiveApplied` compares against
+  (`configTextDigest(s.active.Format())`).
 - `ActiveDigestFor(cfg)` / `RetainedGeneration(digest)` — `store_generation.go`, the
   IPsec generation marker (#9641). `ActiveDigestFor` returns `ActiveDigest()` only when
   `cfg` IS the compiled active config (pointer identity and digest read under one lock),

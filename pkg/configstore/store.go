@@ -544,10 +544,12 @@ type Store struct {
 	archiveSettledAttempt uint64
 
 	// appliedDigest is the digest of the active config TEXT that most recently
-	// completed a full apply to the dataplane/kernel (#4957). It is written by
-	// the daemon (MarkActiveApplied) ONLY after applyConfigLocked returns success
-	// for the current active config — at boot, on a committed config, and after a
-	// peer config-sync. It is INTENTIONALLY not reset by a bare promotion: SyncApply
+	// completed a full apply to the dataplane/kernel (#4957). The daemon writes
+	// it only after successful applies: boot/committed configs use
+	// MarkActiveApplied; config-sync and #9811 retries stamp a captured digest
+	// via MarkAppliedDigest. The #12073 rollback invalidation discharge stamps
+	// its captured digest only after the policy-session debt is cleared.
+	// appliedDigest is INTENTIONALLY not reset by a bare promotion: SyncApply
 	// (and Commit/Load) promote s.active BEFORE the apply runs and, under the #1799
 	// degrade-not-fail doctrine, do NOT roll s.active back when the subsequent apply
 	// FAILS. So a config can be the active tree yet never have converged on the
