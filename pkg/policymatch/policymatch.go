@@ -23,7 +23,8 @@
 // This package replicates the runtime policy precedence and matching semantics
 // for the supplied policy-stage tuple. It does not execute inbound destination
 // NAT: when that is configured, callers must supply the post-translation
-// destination address/port. The shared usage text and Result note make this
+// destination address/port, and to-zone must be the zone of the translated
+// (real-server) destination. The shared usage text and Result note make this
 // input contract explicit on operator-facing surfaces. The ground truth for
 // policy matching is userspace-dp/src/policy.rs (evaluate_policy_result_with_len
 // + try_match_rule + parse_v3_literal_set + CompiledApplications) fed by the
@@ -336,7 +337,8 @@ const matchPoliciesUsageTail = ` from-zone <zone> to-zone <zone>
          ... protocol tcp non-first-fragment          (non-first TCP fragment)
        when inbound destination NAT is configured, destination-ip and
        destination-port must be the post-DNAT/post-translation (real-server)
-       tuple; this simulator does not perform NAT.`
+       tuple, and to-zone must be the zone of the translated (real-server)
+       destination; this simulator does not perform NAT.`
 
 // MatchPoliciesUsage is the full usage/help block printed by `show security
 // match-policies` when the required from-zone/to-zone selectors are missing
@@ -349,7 +351,7 @@ const TestPolicyUsage = "usage: test policy" + matchPoliciesUsageTail
 
 // PostNATInputRequirementNote describes the policy-only simulator's tuple-stage
 // contract when inbound destination translation is configured.
-const PostNATInputRequirementNote = "Inbound destination NAT is not simulated. Supply the post-DNAT/post-translation (real-server) tuple, not the pre-NAT VIP: use CLI destination-ip/destination-port or REST dst_ip/dst_port."
+const PostNATInputRequirementNote = "Inbound destination NAT is not simulated. Supply the post-DNAT/post-translation (real-server) tuple, not the pre-NAT VIP: use CLI destination-ip/destination-port or REST dst_ip/dst_port. The to-zone must be the zone of the translated (real-server) destination."
 
 func postNATInputNote(cfg *config.Config) string {
 	if cfg == nil {
@@ -364,7 +366,8 @@ func postNATInputNote(cfg *config.Config) string {
 }
 
 // Query is a 5-tuple policy-simulation request. The destination address and
-// port are expected to already reflect inbound destination NAT; Match does not
+// port are expected to already reflect inbound destination NAT, and ToZone
+// must be the zone of the translated (real-server) destination; Match does not
 // execute DNAT, static NAT, NPTv6, or NAT64. A nil SrcIP/DstIP or an empty
 // Protocol means that query dimension is unspecified. Omitted address selectors
 // match any address; a term constrained on protocol, port, or ICMP type/code
@@ -784,8 +787,9 @@ type Result struct {
 
 	// PostNATInputNote is non-empty when the config contains inbound destination
 	// translation. MatchPolicies is policy-only: callers must provide the
-	// translated destination address/port, not the pre-NAT VIP. The note is
-	// repeated on every result so a verdict is not mistaken for a pre-NAT
+	// translated destination address/port, not the pre-NAT VIP, and ToZone
+	// must be the zone of the translated (real-server) destination. The note
+	// is repeated on every result so a verdict is not mistaken for a pre-NAT
 	// dataplane simulation.
 	PostNATInputNote string
 

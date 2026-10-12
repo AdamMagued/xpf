@@ -37,7 +37,8 @@ pins that the two surfaces render identically.
 
 `Match` is policy-only and does not perform inbound destination NAT. When
 DNAT, static NAT, NPTv6, or NAT64 is configured, callers must supply the
-post-translation destination address and port. Shared usage text and
+post-translation destination address and port, and `to-zone` must be the zone
+of the translated (real-server) destination. Shared usage text and
 `Result.PostNATInputNote` expose this requirement on operator-facing surfaces.
 
 ## Port input validation (#3116)

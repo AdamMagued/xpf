@@ -877,8 +877,9 @@ type MatchPoliciesResult struct {
 	FeedPublicationDebtFeeds []string `json:"feed_publication_debt_feeds,omitempty"`
 	FeedPublicationDebtNote  string   `json:"feed_publication_debt_note,omitempty"`
 	// PostNATInputNote is present when inbound destination NAT is configured;
-	// destination-ip/port selectors must already be post-translation because the
-	// policy simulator does not perform NAT.
+	// destination-ip/port selectors must already be post-translation and
+	// to-zone must be the zone of the translated (real-server) destination,
+	// because the policy simulator does not perform NAT.
 	PostNATInputNote string `json:"post_nat_input_note,omitempty"`
 }
 

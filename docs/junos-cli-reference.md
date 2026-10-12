@@ -1134,7 +1134,8 @@ and `test policy from-zone <z> to-zone <z> [...]` (both local and remote CLI).
 The 5-tuple policy simulator evaluates policy precedence on the supplied
 policy-stage tuple; it does not perform inbound destination NAT. When inbound
 DNAT/static-NAT/NPTv6/NAT64 is configured, callers must supply the
-post-translation (real-server) `destination-ip`/`destination-port`, not the VIP.
+post-translation (real-server) `destination-ip`/`destination-port`, not the VIP,
+and `to-zone` must be the zone of the translated (real-server) destination.
 CLI surfaces print this input requirement with their verdicts. Selectors:
 `source-ip`, `destination-ip`, `source-port`, `destination-port`,
 `protocol <name|number>`, `icmp-type`, `icmp-code`, `ingress-interface` (#5579),

@@ -3170,7 +3170,8 @@ the drop fails loudly instead of going quietly vacuous.
   and `scheduler_active` (field 20) mirror these.
 - #12246: when inbound destination NAT is configured, the policy-only simulator
   expects REST fields `dst_ip` and `dst_port` to already describe the
-  post-translation (real-server) tuple. The response includes
+  post-translation (real-server) tuple, and `to_zone` must be the zone of the
+  translated (real-server) destination. The response includes
   `post_nat_input_note` on matched and unmatched verdicts so a VIP-only query is
   not mistaken for the dataplane's post-DNAT decision.
 - #3627 B1a: a `to-zone junos-host` query also carries the structured

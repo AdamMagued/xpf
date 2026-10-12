@@ -53,14 +53,21 @@ func TestPostNATInputRequirement12246(t *testing.T) {
 		})
 	}
 
+	// The dataplane derives to-zone from the translated destination's egress,
+	// so the requirement must name the zone as well as the address/port.
+	const translatedZone = "to-zone must be the zone of the translated"
+	if !strings.Contains(PostNATInputRequirementNote, translatedZone) {
+		t.Errorf("post-NAT requirement must name the translated destination's to-zone: %q", PostNATInputRequirementNote)
+	}
 	for name, usage := range map[string]string{
 		"match-policies": MatchPoliciesUsage,
 		"test policy":    TestPolicyUsage,
 	} {
 		if !strings.Contains(usage, "post-DNAT/post-translation") ||
 			!strings.Contains(usage, "destination-ip") ||
-			!strings.Contains(usage, "destination-port") {
-			t.Errorf("%s usage must state the expected post-DNAT destination tuple:\n%s", name, usage)
+			!strings.Contains(usage, "destination-port") ||
+			!strings.Contains(usage, translatedZone) {
+			t.Errorf("%s usage must state the expected post-DNAT destination tuple and zone:\n%s", name, usage)
 		}
 	}
 }

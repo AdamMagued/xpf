@@ -7796,8 +7796,10 @@ type MatchPoliciesResponse struct {
 	FeedPublicationDebtNote  string   `protobuf:"bytes,30,opt,name=feed_publication_debt_note,json=feedPublicationDebtNote,proto3" json:"feed_publication_debt_note,omitempty"`
 	// #12246: the simulator does not perform inbound destination NAT. When this
 	// note is present, destination-ip/port inputs must already describe the
-	// post-translation tuple; it is repeated on matched and unmatched responses
-	// so clients do not read a pre-NAT VIP verdict as the dataplane decision.
+	// post-translation tuple and to_zone must be the zone of the translated
+	// (real-server) destination; it is repeated on matched and unmatched
+	// responses so clients do not read a pre-NAT VIP verdict as the dataplane
+	// decision.
 	PostNatInputNote string `protobuf:"bytes,31,opt,name=post_nat_input_note,json=postNatInputNote,proto3" json:"post_nat_input_note,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
