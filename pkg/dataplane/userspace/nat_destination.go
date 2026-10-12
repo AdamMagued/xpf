@@ -169,10 +169,12 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 			// expander the source path uses (appendNATDestinationAddressName).
 			// Each resolved host installs its own table entry below; a non-host
 			// prefix is stripped to its network address like a literal CIDR
-			// destination. On an unknown name the raw token is appended: it
-			// cannot parse as an IP and is skipped in the emit loop, so the rule
-			// matches NOTHING (fail-closed). The commit-time strict gate
-			// (validateNATSourceAddressNameReferencesStrict) makes the typo
+			// prefix destination. A failed expansion poisons its whole closure.
+			// The raw-name fallback keeps the constraint non-empty; ordinary
+			// names do not parse as IPs, but a CIDR-shaped book name can parse as
+			// a literal prefix (#12626), so this fallback is not guaranteed to
+			// match nothing. The commit-time strict gate
+			// (validateNATSourceAddressNameReferencesStrict) makes the reference
 			// operator-visible.
 			// #3431: resolve EVERY name of a bracket list / repeated leaf.
 			for _, name := range rule.Match.DestinationAddressNameList() {
@@ -208,13 +210,13 @@ func buildDestinationNATSnapshotsWithFeeds(cfg *config.Config, natCounterIDs map
 			// source = fail-open (a destination translation the operator scoped
 			// to a named source set fired for everyone). Resolve the name to its
 			// concrete prefixes via the same address-book expander the policy
-			// path uses and append them. On an unknown name we append the raw
-			// token: it cannot parse on the Rust side (IpAddr::parse fails) so it
-			// contributes no prefix, but it keeps the source list NON-EMPTY so
-			// source_constrained stays true and the rule matches NOTHING
-			// (fail-closed) instead of collapsing back to match-any. A commit-
-			// time strict gate (validateNATSourceAddressNameReferencesStrict)
-			// makes the typo operator-visible; this is the dataplane backstop.
+			// path uses and append them. An unresolved member poisons the whole
+			// closure, while the raw-name fallback keeps source_constrained true.
+			// An ordinary name will not parse in Rust, but a CIDR-shaped book
+			// name can parse as a literal prefix (#12626), so this fallback is
+			// not guaranteed to match nothing. A commit-time strict gate
+			// (validateNATSourceAddressNameReferencesStrict) makes the typo
+			// operator-visible; this is the dataplane backstop.
 			// #3431: resolve EVERY name of a bracket list / repeated leaf.
 			for _, name := range rule.Match.SourceAddressNameList() {
 				sourceAddrs = appendNATSourceAddressName(cfg, feedOverlay, sourceAddrs, name)

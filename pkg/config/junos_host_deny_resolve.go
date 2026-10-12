@@ -46,9 +46,9 @@ func junosHostFamilyL4(family string, l4 []JunosHostDenyL4) []JunosHostDenyL4 {
 
 // junosHostResolveAddrSet resolves a policy source/destination token list to
 // static per-family CIDR sets. ok=false when any token (or nested member) is
-// feed-tainted, resolves through a wildcard/dns-name/range address (Value ""),
-// or names an unknown book entry. any* is true when a wildcard token widens the
-// family to match-all.
+// feed-tainted, colliding, resolves through a wildcard/dns-name/range address
+// (Value==""), or names an unknown book entry. any* is true when a wildcard token
+// widens the family to match-all.
 func junosHostResolveAddrSet(cfg *Config, tokens []string, feedBound map[string]bool) (v4, v6 []string, anyV4, anyV6, ok bool) {
 	ok = true
 	if len(tokens) == 0 {
@@ -114,7 +114,7 @@ func junosHostResolveAddrSet(cfg *Config, tokens []string, feedBound map[string]
 			anyV6 = true
 			continue
 		}
-		if junosHostNameFeedTainted(ab, feedBound, tok, map[string]bool{}) {
+		if junosHostNameUnrepresentable(ab, feedBound, tok, map[string]bool{}) {
 			ok = false
 			continue
 		}
@@ -158,11 +158,16 @@ func junosHostAddrScoped(tokens []string) bool {
 	return false
 }
 
-// junosHostNameFeedTainted reports whether an address token, or ANY nested
-// address-set member, is bound to a dynamic feed (so its resolved set is not
-// commit-stable and cannot be a static nft rule, §6.2). A name may be
-// SIMULTANEOUSLY static and feed-backed, so the whole closure is inspected.
-func junosHostNameFeedTainted(ab *AddressBook, feedBound map[string]bool, name string, visited map[string]bool) bool {
+// junosHostNameUnrepresentable reports whether an address token, or ANY nested
+// address-set member, is bound to a dynamic feed or has an ambiguous colliding
+// name. Either condition prevents a complete, static host projection. A name
+// may be SIMULTANEOUSLY static and feed-backed, so the whole closure is inspected.
+func junosHostNameUnrepresentable(ab *AddressBook, feedBound map[string]bool, name string, visited map[string]bool) bool {
+	if ab != nil {
+		if _, collision := ab.CollidingNames[name]; collision {
+			return true
+		}
+	}
 	if feedBound[name] {
 		return true
 	}
@@ -176,12 +181,12 @@ func junosHostNameFeedTainted(ab *AddressBook, feedBound map[string]bool, name s
 	visited[name] = true
 	defer delete(visited, name)
 	for _, m := range set.Addresses {
-		if junosHostNameFeedTainted(ab, feedBound, m, visited) {
+		if junosHostNameUnrepresentable(ab, feedBound, m, visited) {
 			return true
 		}
 	}
 	for _, s := range set.AddressSets {
-		if junosHostNameFeedTainted(ab, feedBound, s, visited) {
+		if junosHostNameUnrepresentable(ab, feedBound, s, visited) {
 			return true
 		}
 	}
@@ -213,6 +218,10 @@ func junosHostResolveApplications(cfg *Config, tokens []string) (l4 []JunosHostD
 		switch tok {
 		case "", "any":
 			appAny = true
+			continue
+		}
+		if applicationReferenceCollides(tok, &cfg.Applications) {
+			ok = false
 			continue
 		}
 		// #5677: resolve a user/predefined APPLICATION first, so a user

@@ -1090,18 +1090,18 @@ func validateSourceNATPoolAddressScopeStrict(cfg *Config) error {
 // The name is resolved to concrete prefixes at snapshot-build time
 // (appendNATSourceAddressName → resolveNATAddressNamePrefixes →
 // expandBookNameRecursive, the feed-aware recursive expander since #4925). Two
-// distinct failures both translate to a rule that matches NOTHING (fail-closed
-// but SILENT):
+// distinct failures are rejected by this strict gate:
 //
 //   - a wholly UNDEFINED name (a typo) — neither an address-book entry nor a
 //     dynamic-address feed binding; and
 //   - a DEFINED-but-UNRESOLVABLE name (#3425) — a defined `address` with no
-//     prefix (empty Value), a defined-but-EMPTY `address-set`, or a set with a
-//     dangling / member-less expansion. expandBookNameRecursive returns an
-//     empty prefix list for these, so the builder appends the raw (unparseable)
-//     token to keep the constraint non-empty and the rule translates no
-//     traffic — exactly the policy-address fail-open class #3149 closes for
-//     security policies, here for NAT.
+//     usable prefix, an empty unbound `address-set`, or a set with any
+//     dangling, unusable, or unready member. Runtime resolution poisons the
+//     WHOLE closure when a member remains unresolved rather than returning a
+//     surviving subset and keeps the raw name as a non-empty constraint. A
+//     normal name does not parse as an IP/CIDR and matches nothing, but a
+//     CIDR-shaped book name can parse as a literal prefix; making the fallback
+//     unparseable by construction is tracked by #12626.
 //
 // This gate makes BOTH visible at commit, consistent with the policy-address
 // representability gate (validatePolicyMatchAddressSetMembersStrict) and the
@@ -1122,10 +1122,13 @@ func validateSourceNATPoolAddressScopeStrict(cfg *Config) error {
 // This paragraph describes the STRICT-COMMIT gate behavior ONLY. Since #4925 the
 // LENIENT runtime resolver (resolveNATAddressNamePrefixes ->
 // expandBookNameRecursive, pkg/dataplane/userspace/nat.go) DOES feed-resolve
-// nested set members via the policy SSOT expander, so at RUNTIME a mixed
-// static+feed set partially resolves (it carries the resolvable members'
-// prefixes) instead of being poisoned whole. The commit gate is intentionally
-// stricter than the runtime path; this comment does not change that behavior.
+// nested set members via the policy SSOT expander, so a READY feed member
+// contributes its live prefixes alongside static members. However, any member
+// that remains unresolved (e.g. an empty unbound set, a dangling reference or
+// unusable static address without a ready feed value, or an unready feed
+// binding) poisons the entire closure at runtime; the resolver does not publish
+// the surviving subset. The commit gate is intentionally stricter for ready
+// feed members nested in a set; this comment does not change that behavior.
 //
 // On the tolerant load / peer-sync paths the call site downgrades to a warning
 // (opts.lenientFirewallRefs) so an already-persisted or peer-synced config
@@ -1167,21 +1170,23 @@ func validateNATSourceAddressNameReferencesStrict(cfg *Config) error {
 				"%s NAT rule-set %q rule %q references undefined "+
 					"%s %q (define `security address-book "+
 					"address %s` / `address-set %s`, or fix the name — the "+
-					"%s would otherwise be silently lost and the "+
-					"rule would match no traffic)",
+					"lenient %s path keeps a raw-name fallback; if it parses as "+
+					"an IP/CIDR it may be used as a literal prefix instead "+
+					"(#12626))",
 				natType, ruleSet, ruleName, field, name, name, name, scope)
 		}
-		// #3425: a DEFINED name that the runtime resolver cannot expand to >= 1
-		// literal address (empty address, empty/dangling set). The builder
-		// appends the raw token → the rule is non-empty but unmatchable. Reject
-		// it so the operator sees the dead scope at commit.
+		// #3425: a DEFINED name that strict resolution cannot reduce to a
+		// concrete address (empty address or any empty/dangling/unusable set
+		// member). Runtime poisons the whole closure and retains a raw-name
+		// fallback; a CIDR-shaped name can parse as a literal prefix (#12626).
 		if cause := policyMatchAddressBookResolves(ab, name); cause != nil {
 			return fmt.Errorf(
 				"%s NAT rule-set %q rule %q match %s %q does not resolve to "+
-					"any address: %w — the rule commits but the dataplane "+
-					"installs a match-nothing %s so the translation never "+
-					"fires (add at least one resolvable member / a prefix to "+
-					"the address, or remove the reference) (#3425)",
+					"any address: %w — the lenient path retains a raw-name fallback "+
+					"for the %s (a CIDR-shaped name may parse as a literal prefix; "+
+					"#12626), so the rule may not match the intended closure "+
+					"(add at least one resolvable member / a usable prefix to the "+
+					"address, or remove the reference) (#3425)",
 				natType, ruleSet, ruleName, field, name, cause, scope)
 		}
 		return nil
@@ -1204,10 +1209,12 @@ func validateNATSourceAddressNameReferencesStrict(cfg *Config) error {
 			}
 			// #3229: destination-address-name is the destination twin of
 			// source-address-name and resolves through the same address-book
-			// expander (appendNATDestinationAddressName). A dangling or
-			// unresolvable reference installs no destination = the rule matches
-			// nothing (fail-closed but silent); gate it here so the problem is
-			// operator-visible at commit, exactly like the source name above.
+			// expander (appendNATDestinationAddressName). NAT name expansion
+			// poisons a closure with any unresolved reference. Its raw-name
+			// fallback is not guaranteed to match nothing: a CIDR-shaped book
+			// name can parse as a literal prefix (#12626). The commit-time strict
+			// gate makes the problem operator-visible, exactly like the source
+			// name above.
 			// #3431: validate every value of a bracket list / repeated leaf.
 			for _, name := range rule.Match.DestinationAddressNameList() {
 				if err := nameError(natType, rs.Name, rule.Name,

@@ -1,0 +1,269 @@
+package config
+
+import (
+	"strings"
+	"testing"
+)
+
+func assertHostDenyNotRendered12216(t *testing.T, cfg *Config, source, application string) {
+	t.Helper()
+	cfg.Security.Policies = []*ZonePairPolicies{{
+		FromZone: "untrust",
+		ToZone:   "junos-host",
+		Policies: []*Policy{{
+			Name:   "blocked",
+			Action: PolicyDeny,
+			Match: PolicyMatch{
+				SourceAddresses:      []string{source},
+				DestinationAddresses: []string{"any"},
+				Applications:         []string{application},
+			},
+		}},
+	}}
+	projection := BuildJunosHostDenyProjection(cfg)
+	if len(projection.Programs) != 1 || projection.Programs[0].Representable {
+		t.Fatalf("ambiguous or dangling host deny must be explicitly unrepresentable: %+v", projection.Programs)
+	}
+	key := JunosHostZonePairPolicyKey("untrust", "blocked")
+	if projection.RenderedPolicyKeys[key] {
+		t.Fatalf("unrepresentable host deny must not suppress its policy warning: %+v", projection.RenderedPolicyKeys)
+	}
+}
+
+func TestJunosHostAddressBookCollisionsAreUnrepresentable12216(t *testing.T) {
+	cases := []struct {
+		name string
+		book *AddressBook
+		ref  string
+	}{
+		{
+			name: "direct address-address-set collision",
+			book: &AddressBook{
+				Addresses: map[string]*Address{
+					"blocked": {Name: "blocked", Value: "10.0.0.0/8"},
+					"other":   {Name: "other", Value: "192.0.2.1/32"},
+				},
+				AddressSets: map[string]*AddressSet{
+					"blocked": {Name: "blocked", Addresses: []string{"other"}},
+				},
+				CollidingNames: map[string]struct{}{"blocked": {}},
+			},
+			ref: "blocked",
+		},
+		{
+			name: "nested address-set collision",
+			book: &AddressBook{
+				Addresses: map[string]*Address{
+					"blocked": {Name: "blocked", Value: "10.0.0.0/8"},
+					"other":   {Name: "other", Value: "192.0.2.1/32"},
+				},
+				AddressSets: map[string]*AddressSet{
+					"blocked": {Name: "blocked", Addresses: []string{"other"}},
+					"outer":   {Name: "outer", AddressSets: []string{"blocked"}},
+				},
+				CollidingNames: map[string]struct{}{"blocked": {}},
+			},
+			ref: "outer",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := jhTestConfig()
+			cfg.Security.AddressBook = tc.book
+			v4, v6, _, _, ok := junosHostResolveAddrSet(cfg, []string{tc.ref}, nil)
+			if ok {
+				t.Fatalf("host projection accepted colliding reference %q: v4=%v v6=%v", tc.ref, v4, v6)
+			}
+			term := junosHostProjectTerm(cfg, "deny", &Policy{
+				Action: PolicyDeny,
+				Match: PolicyMatch{
+					SourceAddresses:      []string{tc.ref},
+					DestinationAddresses: []string{"any"},
+					Applications:         []string{"any"},
+				},
+			}, nil)
+			if term.representable {
+				t.Fatalf("host deny projection represented colliding reference %q", tc.ref)
+			}
+
+			assertHostDenyNotRendered12216(t, cfg, tc.ref, "any")
+		})
+	}
+}
+
+func TestJunosHostDanglingAddressSetIsUnrepresentable12216(t *testing.T) {
+	cfg := jhTestConfig()
+	cfg.Security.AddressBook = &AddressBook{
+		Addresses: map[string]*Address{
+			"good": {Name: "good", Value: "10.20.0.0/16"},
+		},
+		AddressSets: map[string]*AddressSet{
+			"mixed": {Name: "mixed", Addresses: []string{"good", "ghost"}},
+		},
+	}
+	v4, _, _, _, ok := junosHostResolveAddrSet(cfg, []string{"mixed"}, nil)
+	if ok {
+		t.Fatalf("host projection accepted a dangling set's surviving subset: v4=%v", v4)
+	}
+	term := junosHostProjectTerm(cfg, "deny", &Policy{
+		Action: PolicyDeny,
+		Match: PolicyMatch{
+			SourceAddresses:      []string{"mixed"},
+			DestinationAddresses: []string{"any"},
+			Applications:         []string{"any"},
+		},
+	}, nil)
+	if term.representable {
+		t.Fatal("host deny projection represented a set with a dangling member")
+	}
+	assertHostDenyNotRendered12216(t, cfg, "mixed", "any")
+}
+
+func TestJunosHostApplicationCollisionsAreUnrepresentable12216(t *testing.T) {
+	cases := []struct {
+		name string
+		apps ApplicationsConfig
+		ref  string
+	}{
+		{
+			name: "direct application-application-set collision",
+			apps: ApplicationsConfig{
+				Applications: map[string]*Application{
+					"web": {Name: "web", Protocol: "tcp", DestinationPort: "80"},
+				},
+				ApplicationSets: map[string]*ApplicationSet{
+					"web": {Name: "web", Applications: []string{"junos-https"}},
+				},
+				CollidingNames: map[string]struct{}{"web": {}},
+			},
+			ref: "web",
+		},
+		{
+			name: "nested application-set collision",
+			apps: ApplicationsConfig{
+				Applications: map[string]*Application{
+					"tcp-web": {Name: "tcp-web", Protocol: "tcp", DestinationPort: "80"},
+				},
+				ApplicationSets: map[string]*ApplicationSet{
+					"ambiguous": {Name: "ambiguous", Applications: []string{"tcp-web"}},
+					"outer":     {Name: "outer", Applications: []string{"ambiguous"}},
+				},
+				CollidingNames: map[string]struct{}{"ambiguous": {}},
+			},
+			ref: "outer",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := jhTestConfig()
+			cfg.Applications = tc.apps
+			l4, appAny, ok := junosHostResolveApplications(cfg, []string{tc.ref})
+			if ok || appAny || len(l4) != 0 {
+				t.Fatalf("host projection accepted collision %q: l4=%+v appAny=%v ok=%v", tc.ref, l4, appAny, ok)
+			}
+			assertHostDenyNotRendered12216(t, cfg, "any", tc.ref)
+		})
+	}
+}
+
+func TestJunosHostApplicationCollisionUnderPredefinedName12216(t *testing.T) {
+	cmds := []string{
+		"set interfaces ge-0/0/1 unit 0 family inet address 10.0.2.10/24",
+		"set security zones security-zone untrust interfaces ge-0/0/1.0 host-inbound-traffic system-services ssh",
+		"set applications application-set junos-http application x",
+		"set applications application-set outer application junos-http",
+		"set security policies from-zone untrust to-zone junos-host policy blocked match source-address any",
+		"set security policies from-zone untrust to-zone junos-host policy blocked match destination-address any",
+		"set security policies from-zone untrust to-zone junos-host policy blocked match application outer",
+		"set security policies from-zone untrust to-zone junos-host policy blocked then deny",
+		"set applications application x protocol tcp destination-port 80",
+		"set applications application-set x application junos-https",
+	}
+	cfg, err := CompileConfigLenient(buildTree(t, cmds))
+	if err != nil {
+		t.Fatalf("lenient compile: %v", err)
+	}
+	if _, colliding := cfg.Applications.CollidingNames["x"]; !colliding {
+		t.Fatal("fixture must mark nested member x as colliding")
+	}
+
+	projection := BuildJunosHostDenyProjection(cfg)
+	foundZone := false
+	for _, program := range projection.Programs {
+		if program.Zone != "untrust" {
+			continue
+		}
+		foundZone = true
+		if program.Representable {
+			t.Fatalf("set-first nested collision must make untrust unrepresentable: %+v", program)
+		}
+	}
+	if !foundZone {
+		t.Fatalf("fixture produced no untrust program: %+v", projection.Programs)
+	}
+	key := JunosHostZonePairPolicyKey("untrust", "blocked")
+	if projection.RenderedPolicyKeys[key] {
+		t.Fatalf("nested application collision must not suppress the host-deny warning: %+v", projection.RenderedPolicyKeys)
+	}
+}
+
+func TestJunosHostAppOnlyNestedCollision12216(t *testing.T) {
+	base := []string{
+		"set interfaces ge-0/0/1 unit 0 family inet address 10.0.2.10/24",
+		"set security zones security-zone untrust interfaces ge-0/0/1.0 host-inbound-traffic system-services ssh",
+		"set applications application app term ssh protocol tcp destination-port 22",
+		"set applications application app term web protocol tcp destination-port 80",
+		"set applications application app-ssh protocol udp destination-port 53",
+		"set applications application-set outer application app-ssh",
+		"set applications application-set outer application junos-https",
+	}
+	for _, ref := range []string{"app", "outer"} {
+		t.Run(ref, func(t *testing.T) {
+			p := "set security policies from-zone untrust to-zone junos-host policy blocked "
+			cmds := append(append([]string{}, base...),
+				p+"match source-address any", p+"match destination-address any",
+				p+"match application "+ref, p+"then deny")
+			cfg, err := CompileConfigLenient(buildTree(t, cmds))
+			if err != nil {
+				t.Fatalf("lenient compile: %v", err)
+			}
+			if _, colliding := cfg.Applications.CollidingNames["app-ssh"]; !colliding {
+				t.Fatal("fixture must mark app-ssh as colliding")
+			}
+			if _, inSets := cfg.Applications.ApplicationSets["app-ssh"]; inSets {
+				t.Fatal("fixture must keep app-ssh application-only, not a set")
+			}
+			if _, inApps := cfg.Applications.Applications["app-ssh"]; !inApps {
+				t.Fatal("fixture must keep app-ssh as an authored application")
+			}
+			projection := BuildJunosHostDenyProjection(cfg)
+			foundZone := false
+			for _, program := range projection.Programs {
+				if program.Zone != "untrust" {
+					continue
+				}
+				foundZone = true
+				if program.Representable {
+					t.Fatalf("app-only nested collision must make untrust unrepresentable: %+v", program)
+				}
+				if len(program.RulesV4) != 0 {
+					t.Fatalf("unrepresentable program must render no rules: %+v", program.RulesV4)
+				}
+			}
+			if !foundZone {
+				t.Fatalf("fixture produced no untrust program: %+v", projection.Programs)
+			}
+			key := JunosHostZonePairPolicyKey("untrust", "blocked")
+			if projection.RenderedPolicyKeys[key] {
+				t.Fatalf("app-only nested collision must not suppress the host-deny warning: %+v", projection.RenderedPolicyKeys)
+			}
+			drops := ApplicationReferenceMatchDrops(ref, &cfg.Applications)
+			if len(drops) == 0 {
+				t.Fatalf("reference %q must carry match drops; got none", ref)
+			}
+			if joined := strings.Join(drops, "\n"); !strings.Contains(joined, `member "app-ssh" has an ambiguous colliding name`) {
+				t.Fatalf("reference %q drops = %q, want the colliding member named", ref, drops)
+			}
+		})
+	}
+}

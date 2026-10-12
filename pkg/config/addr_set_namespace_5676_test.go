@@ -119,8 +119,10 @@ func TestAddrSetCollisionLenientDowngrades(t *testing.T) {
 	if !found {
 		t.Fatalf("lenient compile must record a collision warning; warnings = %v", cfg.Warnings)
 	}
-	// Both entries survive in their distinct maps — the namespace is tagged at
-	// storage, and the runtime resolver picks the documented winner.
+	// Both entries survive in their distinct maps, with collision metadata
+	// preserved at storage. The NAT address-name, userspace policy, and
+	// junos-host paths refuse references to this name rather than selecting a
+	// winner.
 	ab := cfg.Security.AddressBook
 	if _, ok := ab.Addresses["blocklist"]; !ok {
 		t.Fatalf("expected the plain address `blocklist` to survive the lenient load")

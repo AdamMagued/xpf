@@ -159,22 +159,24 @@ never reached the forwarding path. The NAT side was completed in #3303: the
 snapshot builder now threads the feed overlay into the source/destination NAT
 builders, so a NAT rule scoped to a feed-backed `match
 source-address-name` / `match destination-address-name` resolves the live feed
-prefixes the same way the policy path does (a DIRECT name reference). #3294
-extended the SECURITY-POLICY path so an address-SET whose member is a
-feed-backed binding now merges that member's live feed prefixes into the set's
+prefixes the same way the policy path does for a DIRECT name reference (#3303).
+Direct feed references also have strict commit support (#2008/#3418).
+#3294 extended the SECURITY-POLICY path so an address-SET whose member is a
+feed-backed binding merges that member's live prefixes into the set's
 address-book row (the feed-aware `expandBookNameRecursive`) — a `deny
-<set-containing-a-feed>` enforces the feed portion instead of under-denying it,
-and a DIRECT feed reference now also COMMITS under strict validation (the #2008
-`bookNames` one-liner). #4925 closes the last piece of this parity: the NAT
-path's recursive (feed-member-in-an-address-set) case is no longer a residual —
-`resolveNATAddressNamePrefixes` now resolves a NAT `match
-source-address-name` / `match destination-address-name` reference through the
-SAME `expandBookNameRecursive` expander, so a NAT rule scoped to an address-SET
-whose member is a feed (feed-only OR mixed static+feed) resolves that nested
-member's live feed prefixes exactly as the policy path does. Fail-closed is
-preserved: a set whose only member is a genuinely unresolvable non-feed token
-still yields no match (the raw book-name token keeps the constraint non-empty
-and unmatchable) rather than widening to match-any.
+<set-containing-a-feed>` enforces the feed portion instead of under-denying it.
+#4925 gives the NAT path the same feed-aware expander for a ready nested feed
+member, which contributes its live prefixes alongside static members.
+
+Any member not resolved by either a static book entry or a ready feed overlay
+(for example, a dangling reference without a ready feed, an empty unbound nested
+set, an unusable static address without a ready feed value, or an unready
+binding) poisons the entire closure rather than publishing the surviving
+subset. The raw-name fallback keeps the NAT constraint non-empty: an ordinary
+name matches nothing, but a CIDR-shaped book name can parse as a literal prefix.
+Making the fallback unparseable by construction is tracked by #12626. A
+feed-bound name that is also a static set with a dangling member is accepted by
+the policy path but rejected by NAT; this parity gap is tracked by #12627.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
