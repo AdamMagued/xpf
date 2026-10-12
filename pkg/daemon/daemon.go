@@ -89,6 +89,13 @@ type Daemon struct {
 	opts  Options
 	store *configstore.Store
 
+	// feedHistoryMu fences history callbacks across zeroize. Once a wipe has
+	// succeeded, feedHistoryWipeSucceeded keeps the fence sticky even if a
+	// later same-process reset attempt fails before daemon shutdown.
+	feedHistoryMu            sync.Mutex
+	feedHistoryFenced        bool
+	feedHistoryWipeSucceeded bool
+
 	// pendingRenameApplies is keyed by the monotonic promoted active
 	// generation. A failed apply keeps its exact ancestry available for retry;
 	// a later promotion has a different key even if its text is identical.

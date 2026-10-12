@@ -348,6 +348,7 @@ func TestFactoryResetFailsWhenStateTempsReappear10769(t *testing.T) {
 	temps := []string{
 		filepath.Join(filepath.Dir(resetDDNSLeaseStatePath), "."+filepath.Base(resetDDNSLeaseStatePath)+".tmp-1"),
 		filepath.Join(filepath.Dir(resetIPsecStatePath), "."+filepath.Base(resetIPsecStatePath)+".tmp-1"),
+		filepath.Join(filepath.Dir(feedShrinkHistoryPath), "."+filepath.Base(feedShrinkHistoryPath)+".tmp-1"),
 	}
 	d := &Daemon{applySem: semaphore.NewWeighted(1)}
 	err := d.factoryReset(context.Background(), func() error {
@@ -361,8 +362,8 @@ func TestFactoryResetFailsWhenStateTempsReappear10769(t *testing.T) {
 		}
 		return nil
 	})
-	if err == nil || !strings.Contains(err.Error(), "reappeared") {
-		t.Fatalf("recreated temps must fail the reset, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "reappeared") || !strings.Contains(err.Error(), temps[2]) {
+		t.Fatalf("recreated feed-history temp must be named in reset failure, got %v", err)
 	}
 	for _, temp := range temps {
 		if _, serr := os.Lstat(temp); !os.IsNotExist(serr) {

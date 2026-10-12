@@ -1,11 +1,13 @@
-package configstore
+package configstore_test
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/feeds"
 )
 
@@ -43,7 +45,7 @@ func TestShrinkGuardInvalidCompactTailsFailStrictValidation11059(t *testing.T) {
 					if err := config.SchemaValidate(tree, nil); err == nil || !strings.Contains(err.Error(), tc.leaf) {
 						t.Errorf("SchemaValidate error = %v, want rejection naming %s", err, tc.leaf)
 					}
-					if _, err := CheckText(text, -1); err == nil || !strings.Contains(err.Error(), tc.leaf) {
+					if _, err := configstore.CheckText(text, -1); err == nil || !strings.Contains(err.Error(), tc.leaf) {
 						t.Errorf("CheckText error = %v, want strict rejection naming %s", err, tc.leaf)
 					}
 				})
@@ -65,14 +67,17 @@ func TestShrinkGuardNestedLenientTailWarnsAndFallsBack11059(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.leaf, func(t *testing.T) {
 			text := shrinkGuardConfigText11059("nested", tc.leaf, tc.value)
-			tree, parseErrs := config.NewParser(text).Parse()
+			_, parseErrs := config.NewParser(text).Parse()
 			if len(parseErrs) != 0 {
 				t.Fatalf("invalid-threshold fixture failed to parse: %v", parseErrs)
 			}
-			store := &Store{nodeID: -1}
-			cfg, err := store.compileTreeLenient(tree)
+			store, err := configstore.New(filepath.Join(t.TempDir(), "config"))
 			if err != nil {
-				t.Fatalf("lenient compile rejected tolerated nested tail: %v", err)
+				t.Fatalf("New: %v", err)
+			}
+			cfg, err := store.SyncApply(text, nil)
+			if err != nil {
+				t.Fatalf("lenient sync apply rejected tolerated nested tail: %v", err)
 			}
 			warning := strings.Join(cfg.Warnings, "\n")
 			if !strings.Contains(warning, config.ToleratedTypedLeafWarningPrefix) || !strings.Contains(warning, tc.leaf) {
