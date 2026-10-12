@@ -631,6 +631,9 @@ type OSPFInterface struct {
 	BFD           bool   // enable BFD on this interface
 	BFDInterval   int    // BFD minimum-interval in ms (0 = default)
 	BFDMultiplier int    // BFD detect-multiplier (0 = default)
+	// AuthMD5Keys retains every configured key ID during rollover. AuthKey and
+	// AuthKeyID remain the legacy single-key view for existing consumers.
+	AuthMD5Keys []OSPFMD5Key12186
 }
 
 // BGPConfig holds BGP routing configuration.

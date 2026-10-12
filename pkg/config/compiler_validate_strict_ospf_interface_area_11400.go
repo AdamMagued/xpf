@@ -9,8 +9,10 @@ import (
 )
 
 type ospfInterfaceArea11400 struct {
-	areaKey string
-	areaID  string
+	areaKey    string
+	areaID     string
+	settingsV2 OSPFInterfaceUnion12186
+	settingsV3 OSPFv3InterfaceUnion12186
 }
 
 // ospfAreaIdentity11400 normalizes FRR's dotted-quad and integer spellings of
@@ -38,20 +40,32 @@ func validateOSPFAreaInterfaceReuse11400(cfg *Config) error {
 		return nil
 	}
 	tunnelNames := cfg.TunnelNameMap()
-	check := func(scope, protocol string, seen map[string]ospfInterfaceArea11400, areaID, authoredName string) error {
+	check := func(scope, protocol string, seen map[string]ospfInterfaceArea11400, areaID, authoredName string, v2 *OSPFInterface, v3 *OSPFv3Interface) error {
 		resolvedName := cfg.resolveKernelIfNameWith(authoredName, tunnelNames)
 		if resolvedName == "" {
 			return nil
 		}
 		areaKey := ospfAreaIdentity11400(areaID)
-		if first, ok := seen[resolvedName]; ok {
-			if first.areaKey != areaKey {
-				return fmt.Errorf("%s %s interface %q resolves to Linux device %q and is configured in multiple areas (%q and %q); FRR supports one area per interface (#11400)",
-					scope, protocol, authoredName, resolvedName, first.areaID, areaID)
-			}
-			return nil
+		state, ok := seen[resolvedName]
+		if ok && state.areaKey != areaKey {
+			return fmt.Errorf("%s %s interface %q resolves to Linux device %q and is configured in multiple areas (%q and %q); FRR supports one area per interface (#11400)",
+				scope, protocol, authoredName, resolvedName, state.areaID, areaID)
 		}
-		seen[resolvedName] = ospfInterfaceArea11400{areaKey: areaKey, areaID: areaID}
+		if !ok {
+			state.areaKey = areaKey
+			state.areaID = areaID
+		}
+		var conflicts []string
+		if v2 != nil {
+			conflicts = state.settingsV2.Merge(v2)
+		} else {
+			conflicts = state.settingsV3.Merge(v3)
+		}
+		if len(conflicts) > 0 {
+			return fmt.Errorf("%s %s interface %q resolves to Linux device %q in area %q has conflicting settings: %s (#12186)",
+				scope, protocol, authoredName, resolvedName, state.areaID, strings.Join(conflicts, ", "))
+		}
+		seen[resolvedName] = state
 		return nil
 	}
 	checkV2 := func(scope string, ospf *OSPFConfig) error {
@@ -67,7 +81,7 @@ func validateOSPFAreaInterfaceReuse11400(cfg *Config) error {
 				if iface == nil {
 					continue
 				}
-				if err := check(scope, "OSPF", seen, area.ID, iface.Name); err != nil {
+				if err := check(scope, "OSPF", seen, area.ID, iface.Name, iface, nil); err != nil {
 					return err
 				}
 			}
@@ -87,7 +101,7 @@ func validateOSPFAreaInterfaceReuse11400(cfg *Config) error {
 				if iface == nil {
 					continue
 				}
-				if err := check(scope, "OSPFv3", seen, area.ID, iface.Name); err != nil {
+				if err := check(scope, "OSPFv3", seen, area.ID, iface.Name, nil, iface); err != nil {
 					return err
 				}
 			}
