@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -433,6 +434,35 @@ func defaultValidateSudoersFile(path string) error {
 // removed" case still revokes stale grants.
 func (d *Daemon) reconcileSudoers(cfg *config.Config) (err error) {
 	fail := func(e error) { err = errors.Join(err, e) }
+	var releaseApply func()
+	defer func() {
+		if releaseApply != nil {
+			releaseApply()
+		}
+	}()
+	acquireApply := func() error {
+		if releaseApply != nil || d == nil || d.applySem == nil {
+			return nil
+		}
+		// A normal apply holds applySem and runs cfg == live, so a desired
+		// grant is in this call's desired set and cannot reach this restore.
+		// Only a stale owner blocks here; it cannot re-enter the permit.
+		if err := d.applySem.Acquire(context.Background(), 1); err != nil {
+			return err
+		}
+		releaseApply = func() { d.applySem.Release(1) }
+		return nil
+	}
+	restoreLiveSudoersGrant := func(user string) error {
+		if err := acquireApply(); err != nil {
+			return err
+		}
+		live := d.liveConfig12169()
+		if live == nil || !d.liveDesiredSudoersGrant12169(user) {
+			return nil
+		}
+		return d.reconcileSudoers(live)
+	}
 	// Desired: an xpf-<user> drop-in for each current super-user account.
 	desired := make(map[string]struct{})
 	if cfg.System.Login != nil {
@@ -505,12 +535,10 @@ func (d *Daemon) reconcileSudoers(cfg *config.Config) (err error) {
 		} else if err == nil {
 			slog.Info("revoked stale super-user sudo grant", "file", name)
 			// Close the check/unlink race: a promotion that landed during
-			// os.Remove must have its grant restored before this owner ends.
+			// os.Remove must restore its grant while serialized against commits.
 			if d.liveDesiredSudoersGrant12169(user) {
 				staleRevocationSuperseded12169("repair-sudoers-grant", user)
-				if live := d.liveConfig12169(); live != nil {
-					fail(d.reconcileSudoers(live))
-				}
+				fail(restoreLiveSudoersGrant(user))
 			}
 		}
 	}
@@ -1092,6 +1120,36 @@ func buildSSHDConfig(ssh *config.SSHServiceConfig) string {
 // stanza still absent re-locks nothing (the shadow field is already "!") and
 // removes nothing (the key file is already gone).
 func (d *Daemon) applyRootAuth(cfg *config.Config) (retErr error) {
+	var releaseApply func()
+	defer func() {
+		if releaseApply != nil {
+			releaseApply()
+		}
+	}()
+	acquireApply := func() error {
+		if releaseApply != nil || d == nil || d.applySem == nil {
+			return nil
+		}
+		// A normal apply holds applySem and runs cfg == live, so configured
+		// root keys take the write path above this restore. Only a stale
+		// owner reaches this branch with live keys desired.
+		if err := d.applySem.Acquire(context.Background(), 1); err != nil {
+			return err
+		}
+		releaseApply = func() { d.applySem.Release(1) }
+		return nil
+	}
+	restoreLiveRootAuth := func() error {
+		if err := acquireApply(); err != nil {
+			return err
+		}
+		live := d.liveConfig12169()
+		if live == nil || live.System.RootAuthentication == nil ||
+			len(live.System.RootAuthentication.SSHKeys) == 0 {
+			return nil
+		}
+		return d.applyRootAuth(live)
+	}
 	fail := func(e error) { retErr = errors.Join(retErr, e) }
 	ra := cfg.System.RootAuthentication
 
@@ -1188,9 +1246,7 @@ func (d *Daemon) applyRootAuth(cfg *config.Config) (retErr error) {
 		liveRootAuth := d.liveDesiredRootAuth12169()
 		if liveRootAuth != nil && len(liveRootAuth.SSHKeys) > 0 {
 			staleRevocationSuperseded12169("remove-root-keys", "root")
-			if live := d.liveConfig12169(); live != nil {
-				fail(d.applyRootAuth(live))
-			}
+			fail(restoreLiveRootAuth())
 		} else {
 			keysFile := rootAuthorizedKeysPath()
 			switch err := os.Remove(keysFile); {
@@ -1205,18 +1261,14 @@ func (d *Daemon) applyRootAuth(cfg *config.Config) (retErr error) {
 			}
 			if current := d.liveDesiredRootAuth12169(); current != nil && len(current.SSHKeys) > 0 {
 				staleRevocationSuperseded12169("repair-root-keys", "root")
-				if live := d.liveConfig12169(); live != nil {
-					fail(d.applyRootAuth(live))
-				}
+				fail(restoreLiveRootAuth())
 			} else {
 				fail(removeProvenanceMarker(provisionedKeysDir(), "root"))
 				// A promotion can race the key-marker unlink itself. Re-run
-				// root auth to restore the live key and ownership claim.
+				// root auth under applySem to restore live keys and ownership.
 				if current := d.liveDesiredRootAuth12169(); current != nil && len(current.SSHKeys) > 0 {
 					staleRevocationSuperseded12169("restore-root-keys-after-marker-cleanup", "root")
-					if live := d.liveConfig12169(); live != nil {
-						fail(d.applyRootAuth(live))
-					}
+					fail(restoreLiveRootAuth())
 				}
 			}
 		}

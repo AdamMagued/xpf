@@ -751,8 +751,15 @@ func (d *Daemon) deprovisionLoginUser(name string) (retErr error) {
 		if liveDesired && liveUser.EncryptedPassword.Reveal() != "" {
 			staleRevocationSuperseded12169("lock-password", name)
 			repairedHash := liveUser.EncryptedPassword.Reveal()
-			repairErr := d.reconcileUserPassword(&liveUser)
-			latest, liveNow, release, fenceErr := d.settleStaleLoginPassword12169(name, curUID, repairedHash)
+			preRepair, preOK := currentShadowHash(name)
+			var preReadErr error
+			if !preOK {
+				preReadErr = fmt.Errorf("read shadow before stale repair for %s", name)
+				slog.Warn("stale repair cannot verify pre-repair shadow; settlement will not reclaim provenance",
+					"user", name)
+			}
+			repairErr := errors.Join(preReadErr, d.reconcileUserPassword(&liveUser))
+			latest, liveNow, release, fenceErr := d.settleStaleLoginPassword12169(name, curUID, repairedHash, preRepair, preOK)
 			if release != nil {
 				releaseApply = release
 			}
@@ -769,8 +776,15 @@ func (d *Daemon) deprovisionLoginUser(name string) (retErr error) {
 				current.EncryptedPassword.Reveal() != "" {
 				staleRevocationSuperseded12169("lock-password", name)
 				repairedHash := current.EncryptedPassword.Reveal()
-				repairErr := d.reconcileUserPassword(&current)
-				latest, liveNow, release, fenceErr := d.settleStaleLoginPassword12169(name, curUID, repairedHash)
+				preRepair, preOK := currentShadowHash(name)
+				var preReadErr error
+				if !preOK {
+					preReadErr = fmt.Errorf("read shadow before stale repair for %s", name)
+					slog.Warn("stale repair cannot verify pre-repair shadow; settlement will not reclaim provenance",
+						"user", name)
+				}
+				repairErr := errors.Join(preReadErr, d.reconcileUserPassword(&current))
+				latest, liveNow, release, fenceErr := d.settleStaleLoginPassword12169(name, curUID, repairedHash, preRepair, preOK)
 				if release != nil {
 					releaseApply = release
 				}
@@ -799,8 +813,15 @@ func (d *Daemon) deprovisionLoginUser(name string) (retErr error) {
 					current.EncryptedPassword.Reveal() != "" {
 					staleRevocationSuperseded12169("repair-password", name)
 					repairedHash := current.EncryptedPassword.Reveal()
-					repairErr := d.reconcileUserPassword(&current)
-					latest, liveNow, release, fenceErr := d.settleStaleLoginPassword12169(name, curUID, repairedHash)
+					preRepair, preOK := currentShadowHash(name)
+					var preReadErr error
+					if !preOK {
+						preReadErr = fmt.Errorf("read shadow before stale repair for %s", name)
+						slog.Warn("stale repair cannot verify pre-repair shadow; settlement will not reclaim provenance",
+							"user", name)
+					}
+					repairErr := errors.Join(preReadErr, d.reconcileUserPassword(&current))
+					latest, liveNow, release, fenceErr := d.settleStaleLoginPassword12169(name, curUID, repairedHash, preRepair, preOK)
 					if release != nil {
 						releaseApply = release
 					}
@@ -881,12 +902,17 @@ func (d *Daemon) deprovisionLoginUser(name string) (retErr error) {
 }
 
 // settleStaleLoginPassword12169 revalidates a stale owner's password repair.
-// repairedHash identifies the hash this owner may have written, allowing a
-// password-less re-add to reclaim provenance before the D2 lock.
-// Only an abandoned owner can reach it; normal appliers holding applySem
-// cannot deprovision a user their active config desires. The caller retains
-// the returned permit through provenance cleanup.
-func (d *Daemon) settleStaleLoginPassword12169(name string, uid int, repairedHash string) (config.LoginUser, bool, func(), error) {
+// repairedHash identifies the hash this owner may have written; preRepair is
+// the shadow hash observed immediately before the repair (preOK false when
+// that read failed). A same-password or password-less re-add lands while the
+// repair is blocked, sees shadow == desired, and claims nothing — so whenever
+// this owner's chpasswd actually ran (preRepair != repairedHash) and shadow
+// still holds the repaired hash, settlement reclaims provenance whatever live
+// desires. An identical operator-set hash (preRepair == repairedHash, owner
+// pwNoop) is never claimed. Only an abandoned owner can reach it; normal
+// appliers holding applySem cannot deprovision a user their active config
+// desires. The caller retains the returned permit through provenance cleanup.
+func (d *Daemon) settleStaleLoginPassword12169(name string, uid int, repairedHash string, preRepair string, preOK bool) (config.LoginUser, bool, func(), error) {
 	var release func()
 	if d != nil && d.applySem != nil {
 		if err := d.applySem.Acquire(context.Background(), 1); err != nil {
@@ -897,8 +923,8 @@ func (d *Daemon) settleStaleLoginPassword12169(name string, uid int, repairedHas
 
 	live, desired := d.liveDesiredLoginUser12169(name)
 	if desired {
-		if hash, ok := currentShadowHash(name); ok &&
-			hash == repairedHash && live.EncryptedPassword.Reveal() != repairedHash {
+		if hash, ok := currentShadowHash(name); ok && preOK &&
+			preRepair != repairedHash && hash == repairedHash {
 			if err := errors.Join(markProvisioned(name, uid), markPasswordProvisioned(name, uid)); err != nil {
 				return live, true, release, fmt.Errorf(
 					"restore password provenance for stale repair of %s: %w", name, err)

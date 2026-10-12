@@ -38,10 +38,10 @@ import (
 //     settle under applySem; the direct pre-lock root repair retains markers
 //     for a later apply rather than providing that settlement guarantee.
 //
-// Under applySem the passed config IS the live config, so checks are a no-op
-// on the healthy path (one RLock + slice scan). Stale-owner restores and
-// settlements acquire or retain the permit across the mutation, preventing
-// promotion from changing the intent until the owner returns or cleans up.
+// Under applySem the passed config IS the live config, so stale restore checks
+// are no-ops on the healthy path. Login-tail restores, password settlements,
+// root-key restores, and sudoers repairs acquire or retain the permit through
+// their mutation, preventing promotion from changing intent during repair.
 // All helpers are nil-safe: a nil Daemon or nil store (unit tests driving
 // reconcilers directly) disables the fence and preserves stand-alone behavior.
 
