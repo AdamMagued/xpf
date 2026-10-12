@@ -1667,10 +1667,10 @@ poison-recovery arm is shared with the crate-wide pattern, not the
 
 ## RG-activation prewarm dedup is O(N+M) (#4069)
 
-`prewarm_reverse_synced_sessions_for_owner_rgs` runs on RG activation —
-i.e. on the failover critical path (~60ms/~130ms budget). It unions the
-forward owner-RG session keys (M) with the narrower reverse-prewarm keys
-(N) before restoring forward entries and synthesizing reverse companions.
+`prewarm_reverse_synced_sessions_for_owner_rgs` runs on the failover critical
+path during RG activation. It unions the forward owner-RG session keys (M)
+with the narrower reverse-prewarm keys (N) before restoring forward entries
+and synthesizing reverse companions.
 That union is deduplicated by `merge_owner_rg_candidate_keys`, which seeds
 a `FastSet<SessionKey>` from the forward keys once (O(M)) and then probes
 each reverse key in O(1) — O(N+M) total. The prior inline dedup used

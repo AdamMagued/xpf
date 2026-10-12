@@ -2,7 +2,13 @@
 
 ## Problem
 
-In the HA cluster, RETH interfaces use VRRP on physical member interfaces (no bond devices). Each node has a different physical MAC on its RETH member interface, causing problems during failover:
+RETH is bondless: VIPs are attached to physical-member interfaces, with no
+Linux bond device. Compiler-default private-RG election owns them directly
+and suppresses RETH VRRP; only legacy VRRP-backed mode (`no-private-rg-election`,
+unless `no-reth-vrrp`) runs VRRP on those physical members
+(`pkg/config/compiler_system.go:3132-3137`;
+`pkg/vrrp/vrrp.go:153-166`). Each node has a different physical MAC on its
+RETH member interface, causing problems during failover:
 
 1. **IPv6 link-local addresses differ** -- EUI-64 link-local (`fe80::...`) is derived from MAC. After failover, the new primary has a different link-local address, breaking neighbor caches on LAN hosts.
 2. **Neighbor cache invalidation** -- Clients must update both VIP->MAC and gateway link-local->MAC mappings. Unsolicited NA only covers the VIP.

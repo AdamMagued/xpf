@@ -69,7 +69,7 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 
 ### Chassis Cluster (HA)
 - **State machine:** StateSecondary(0), StatePrimary(1), SecondaryHold(2), Lost(3), Disabled(4); weight-based election
-- **VRRP-backed RETH (bondless):** native Go VRRPv3 (`pkg/vrrp/`), 30ms interval (configurable), per-node/per-RETH MAC `02:bf:72:CC:RR:(2*index+node)`
+- **Bondless RETH**: physical-member mapping rather than Linux bonding; legacy VRRP-backed mode runs native Go VRRPv3 (`pkg/vrrp/`) on those members (`no-private-rg-election`, unless `no-reth-vrrp`), but compiler-default private-RG election suppresses RETH VRRP. Per-node, per-RETH virtual MAC `02:bf:72:CC:RR:(2*index+node)` (`pkg/config/compiler_system.go:3132-3137`; `pkg/vrrp/vrrp.go:153-166`; `pkg/vrrp/README.md:950-964`)
 - **Sync:** TCP RTO on fabric link — 11 msg types (sessions, config, IPsec SA, failover, fence); incremental 1s sweep + GC delete callbacks; `writeMu` serializes ALL conn.Write paths
 - **Sync hardening (#69-#73):** connection-specific disconnect (stale goroutine guard), per-RG BulkSync filtering, stale session reconciliation on BulkEnd, peer fencing (`syncMsgFence`), hard-crash test (`make test-ha-crash`)
 - **Sync race fixes (#76-#80):** writeMu + single-buffer writeMsg, sync-hold 30s+reason, config authority, fast fabric_fwd ARP probe, fresh config per tick
@@ -80,7 +80,35 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - **Fabric IPVLAN fixes (#127-#130):** Address reconciliation on restart (not just create), stale overlay cleanup wired in, neighbor probe on overlay not parent, compiler dual-fabric auto-detect
 - **Fabric interface recovery:** compiler reads bootstrap `.link` file `OriginalName=` to find unrenamed kernel interfaces (chicken-and-egg fix for first boot)
 - **Per-RG:** active/active per-RG primary, per-RG service/session management
-- **Timing:** Failover ~60ms (30ms VRRP, masterDown ~97ms); planned shutdown near-instant (priority-0 burst); failback ~130ms; heartbeat 200ms/threshold 5
+- **Timing**: compiler-default private-RG election uses heartbeat staleness
+  (`set chassis cluster heartbeat-interval <ms>` ×
+  `set chassis cluster heartbeat-threshold <n>`): 100ms × 5 = 500ms at
+  runtime defaults, 200ms × 5 = 1s in the deployed lab. If sync remains
+  connected with peer traffic ≤2s old, the guard suppresses heartbeat timeout
+  (5s continuous-suppression cap). Silent node death takes
+  max(threshold, remaining sync-recency window) plus up to one tick:
+  0.5–2.1s at defaults and 1.0–2.2s in the lab, phase-dependent. Process exit
+  that closes sync or idle sync falls through at the raw threshold, subject to
+  startup/restart grace. Legacy VRRP-backed RETH uses a 30ms default advert
+  and >90ms/<120ms steady-state master-down timer; only a non-preempting
+  BACKUP arms a 3s deafness shield. Planned legacy VRRP shutdown emits three
+  priority-0 adverts and arms a 1ms backup timer (test constraint <50ms, not
+  SLA). Ordinary
+  private-RG shutdown sends no resign/transfer; after `rg_active` clears the
+  peer promotes through heartbeat-loss detection, no earlier than the
+  heartbeat threshold and possibly later under the sync guard. No end-to-end
+  restoration/failback number is asserted
+  (`pkg/config/compiler_system.go:3132-3137`;
+  `pkg/cluster/heartbeat.go:61-98,1916-1960`;
+  `pkg/cluster/heartbeat_manager.go:790-832`;
+  `pkg/daemon/daemon_ha_sync.go:170-206`;
+  `pkg/vrrp/vrrp.go:153-166`;
+  `pkg/vrrp/instance_timing.go:11-41,112-128`;
+  `pkg/vrrp/instance.go:770-807`;
+  `pkg/vrrp/instance_rx.go:155-173`;
+  `pkg/vrrp/instance_prio0_run_test.go:143-149`;
+  `pkg/daemon/daemon_run_shutdown.go:418-428`;
+  `pkg/cluster/manager.go:1026-1077`).
 - **Dual-inactive window fix:** During manual failover, old code had ~25ms where BOTH nodes had `rg_active=false` → all RG traffic XDP_DROP'd → TCP stream death. Fix: Primary sets `rg_active=true` immediately (brief benign dual-active overlap); Secondary defers `rg_active=false` until VRRP BACKUP event
 - **zone_ct_update RST guard:** `zone_ct_update_v4/v6()` in xdp_zone.c is the PRIMARY established-session path (fast-path FIB cache hit). Must have same RST→CLOSED suppression as xdp_conntrack
 - **Fabric txqueuelen:** virtio-net TX ring max 256 entries; set `txqueuelen=10000` on fabric interface to avoid `bpf_redirect_map` drops under bidirectional load
@@ -171,7 +199,9 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 ## Performance
 - **bpf_printk:** NEVER leave in production (55%+ CPU)
 - **Throughput:** 25+ Gbps native XDP, 15.6 Gbps virtio-net
-- **Cluster failover:** ~60ms (VRRP 30ms, masterDown ~97ms); planned shutdown near-instant; failback ~130ms; reboot→MASTER ~6s
+- **Cluster failover:** mode-specific heartbeat/sync-guard, VRRP timers, and
+  shutdown behavior are summarized in the HA section above; none is an
+  end-to-end restoration bound.
 - **Manual failover bug (`6d63020`):** `ManualFailover()` MUST set `rg.Weight=0` — without it, peer stays secondary (sees high weight in heartbeat). `ResetFailover()` uses `recalcWeight()` to restore
 - Per-interface XDP: `redirect_capable` map; iavf lacks native XDP, use PF passthrough
 - **Profiling:** See `profiling.md` — perf record/report via incus exec; cluster traffic must originate from `cluster-lan-host` (not fw itself)

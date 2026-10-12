@@ -239,28 +239,71 @@ See the deploy backing table in
 
 ## Chassis cluster (HA)
 
-- **Failover timing**: ~60ms with 30ms VRRP intervals
-  (`masterDownInterval` ~97ms); configurable via
-  `set chassis cluster reth-advertise-interval <ms>`.
-- **Planned shutdown**: burst of 3× priority-0 adverts; peer takes over
-  in ~1ms.
-- **VRRP advertisement**: RETH instances default 30ms; `AdvertiseInterval`
-  is milliseconds internally, centiseconds on wire per RFC 5798.
-- **Deafness windows and the extended master-down timer (#7579)**: a BACKUP
-  promotes when its master-down timer expires, and that arm is deliberately
-  UNGATED by `preempt` — RFC 5798's preempt governs displacing a master you can
-  HEAR, not filling an apparent vacancy. So in any window where the node is
-  deaf, the ~97ms timer a 30ms RETH interval produces is the only thing between
-  a healthy peer and a second MASTER claiming its VIPs. TWO such windows exist
-  and both arm `deafMasterDownInterval` (3s) when `preempt=false`:
-  **process start**, before the AF_PACKET receiver is capturing; and
-  **sync-hold release**, which fires as bulk session sync completes — when a
-  just-rebooted node is installing synced sessions and about to do VIP work, so
-  a ~97ms scheduling gap on the receiver is unremarkable. Missing the second one
-  produced an observed ~12.9s window in which BOTH nodes held RG0 and had GARP'd
-  for the same RETH VIPs. Self-limiting in both cases: `handleBackupRx` resets
-  to the short interval on the FIRST advert heard, so a peer that is actually
-  alive costs nothing and normal ~60ms failover timing is unchanged.
+- **Unplanned peer loss — compiler-default private-RG election**: RETH VRRP is
+  suppressed (`pkg/config/compiler_system.go:3132-3137`; see the ownership-mode
+  table in `pkg/vrrp/README.md:950-964`). The heartbeat staleness threshold is
+  interval × threshold: 100ms × 5 = 500ms at runtime defaults, or 200ms × 5 =
+  1s in the deployed lab config. These are `set chassis cluster
+  heartbeat-interval <ms>` and `heartbeat-threshold <n>`
+  (`pkg/cluster/heartbeat.go:61-65,1916-1960`;
+  `docs/ha-cluster-userspace.conf:71-72`). The threshold is not always the
+  declaration time: while sync is connected and last peer traffic is ≤2s old,
+  `shouldSuppressPeerHeartbeatTimeout` defers loss; continuous suppression is
+  capped at 5s. A silent death/partition with ESTABLISHED sync can therefore
+  take max(threshold, remaining sync-recency window) plus up to one heartbeat
+  tick: 0.5–2.1s from peer death at defaults or 1.0–2.2s in the lab.
+  Process exit that closes sync or sync idle >2s falls through at the heartbeat
+  threshold, subject to startup/restart grace
+  (`pkg/daemon/daemon_ha_sync.go:170-206`;
+  `pkg/cluster/heartbeat_manager.go:790-832`).
+- **Separate interface/IP monitor detection**: polls run each second; 3
+  consecutive failed polls mark a monitor down, followed by a 5s hold-down
+  before another state transition. IP sweeps use up to 16 concurrent probes
+  with 800ms read deadlines, so >16 targets add 800ms probe waves
+  (`pkg/cluster/monitor.go:28-32,44-57,260-276,386-397,585-600`).
+- **Unplanned peer loss — legacy VRRP-backed RETH** (`no-private-rg-election`,
+  unless `no-reth-vrrp` is also set): only this mode uses the 30ms default RETH
+  advertisement; configure it with `set chassis cluster
+  reth-advertise-interval <ms>`. The steady-state master-down timer is
+  `3×advertised interval + priority skew`; at 30ms and priorities 1–255 it is
+  >90ms and <120ms, a detection timer rather than an end-to-end restoration
+  measurement (`pkg/vrrp/vrrp.go:153-166`;
+  `pkg/vrrp/instance_timing.go:112-128`;
+  `pkg/vrrp/README.md:950-964`).
+- **Planned shutdown**: legacy VRRP-backed shutdown sends three priority-0
+  advertisements; the BACKUP arms a 1ms timer, and a run-loop test requires
+  MASTER advertisement within 50ms (test constraint, not an SLA)
+  (`pkg/vrrp/instance.go:770-807`; `pkg/vrrp/instance_rx.go:155-173`;
+  `pkg/vrrp/instance_prio0_run_test.go:143-149`). Private-RG operator failover
+  is an explicit transfer/resignation path
+  (`pkg/cluster/failover.go:447-450`;
+  `pkg/cluster/election.go:1021-1042`). Private-RG planned shutdown without
+  explicit transfer sends no resign frame; after `rg_active` clears, the peer
+  promotes through heartbeat loss no earlier than the heartbeat staleness
+  threshold, and the sync-recency guard can further defer it
+  (`pkg/daemon/daemon_run_shutdown.go:418-428`;
+  `pkg/cluster/manager.go:1026-1077`;
+  `pkg/daemon/daemon_ha_sync.go:170-206`).
+- **VRRP advertisement**: the 30ms default applies only to VRRP-backed RETH
+  instances; `AdvertiseInterval` is milliseconds internally, centiseconds on
+  wire per RFC 5798 (`pkg/vrrp/vrrp.go:153-166`).
+- **Event debounce**: the 500ms cluster-event → VRRP-priority coalesce is used
+  only in legacy VRRP-backed mode; direct/private-RG mode skips it
+  (`pkg/daemon/daemon_ha.go:782-824`).
+- **Deafness windows and the extended master-down timer (#7579)**: in legacy
+  VRRP-backed mode a BACKUP promotes when its master-down timer expires; that
+  arm is deliberately UNGATED by `preempt` — RFC 5798's preempt governs
+  displacing a master it can HEAR, not filling an apparent vacancy. The normal
+  30ms-advert master-down timer is >90ms and <120ms across priorities 1–255.
+  When `preempt=false`, the implementation extends this deafness window to 3s
+  in TWO places: **process start**, before the AF_PACKET receiver is capturing,
+  and **sync-hold release**, when a rejoining node is installing synced
+  sessions and about to do VIP work. Missing the second extension produced an
+  observed ~12.9s dual-owner window. `handleBackupRx` resets to the normal
+  master-down timer on the first advert, so a heard peer does not pay the 3s
+  floor (`pkg/vrrp/instance.go:71-93`;
+  `pkg/vrrp/instance_timing.go:11-41`;
+  `pkg/vrrp/instance_rx.go:151-173`).
 - **Async GARP**: `becomeMaster()` runs GARP in a goroutine; critical
   path is addVIPs → sendAdvert → emitEvent (sync), then
   `go sendGARP(false)`. `sendGARP(force)` has two gates — per-epoch dedup
@@ -286,16 +329,16 @@ See the deploy backing table in
     that can supersede it is `becomeBackup`, which always follows with a full,
     surfaced removal.
 
-  The clean success
-  path is unchanged (the `vipMu` lock is uncontended), so ~60ms failover timing
-  is preserved. A monotonic **ownership generation** (`ownerGen`, bumped by
-  `setState` on every real transition) is captured before the netlink add and
-  revalidated after: `ReconcileVIPs` re-adds VIPs and forces GARP only if the
-  instance is STILL the current-generation MASTER after the add, closing the
-  check-then-act TOCTOU where a superior advert demoting to BACKUP could
-  interleave and re-add VIPs + force GARP while BACKUP (duplicate address,
-  split routing). `vipMu` serializes the add/remove + revalidation across the
-  run-loop and the manager's `ReconcileVIPs`.
+  The clean success path is unchanged (`vipMu` is uncontended). This fix makes
+  no claim about cross-mode detection or traffic-restoration timing. A monotonic
+  **ownership generation** (`ownerGen`, bumped by `setState` on every real
+  transition) is captured before the netlink add and revalidated after:
+  `ReconcileVIPs` re-adds VIPs and forces GARP only if the instance is STILL the
+  current-generation MASTER after the add, closing the check-then-act TOCTOU
+  where a superior advert demoting to BACKUP could interleave and re-add VIPs +
+  force GARP while BACKUP (duplicate address, split routing). `vipMu` serializes
+  the add/remove + revalidation across the run-loop and the manager's
+  `ReconcileVIPs`.
 - **Fabric forwarding**: the userspace dataplane redirects packets for
   peer-owned synced sessions over the fabric link
   (`resolve_fabric_redirect()` / `ingress_is_fabric()` in
@@ -304,20 +347,30 @@ See the deploy backing table in
 - **RETH virtual MAC**: per-node, per-RETH `02:bf:72:CC:RR:(2*index+node)`; `programRethMAC()`
   does link DOWN → set MAC → link UP, then `ReconcileVIPs()` re-adds
   VRRP VIPs.
-- **Sync hold**: VRRP starts with `preempt=false`, released after bulk
-  session sync (or 10s timeout); `preemptNowCh` triggers instant
-  preemption.
 - **Address owner always preempts (#4116)**: an instance whose *configured*
   priority is 255 (the IP address owner) preempts a lower-priority master
   irrespective of the `no-preempt` flag or sync-hold suppression (RFC 5798
   §6.1). `getPreempt()` and `shouldPreemptObservedMaster()` OR-in
-  `cfg.Priority == 255`, so an owner hearing a lower advert does NOT reset
-  its master-down timer (`handleBackupRx`) — the timer expires and the owner
-  reclaims MASTER. Keyed on the configured priority, this composes with the
-  owner-255 track-demotion exemption (`getPriority`, which never demotes 255)
-  and is a no-op for every non-owner (weight-based RETH priorities < 255), so
-  the #2082 sync-hold gate and ~60ms failover timing are unchanged.
-- **Heartbeat**: 200ms interval, threshold 5 (1s detection).
+  `cfg.Priority == 255`, so an owner hearing a lower advert does NOT reset its
+  master-down timer (`handleBackupRx`) — the timer expires and the owner
+  reclaims MASTER. Keyed on configured priority, this composes with the
+  owner-255 track-demotion exemption (`getPriority`, which never demotes 255).
+  These are VRRP-instance election rules, not a timing claim for the default
+  private-RG mode.
+- **Sync hold**: VRRP starts with `preempt=false`; both VRRP and the
+  no-RETH/private-RG startup paths use a 30s safety timeout (released early
+  when bulk sync completes), not 10s. `preemptNowCh` triggers VRRP preemption
+  when sync completes early (`pkg/daemon/daemon_run_bringup.go:260-273`;
+  `pkg/daemon/daemon_ha_noreth_hold.go:42-53`;
+  `pkg/vrrp/manager.go:355-379`).
+- **Heartbeat**: 100ms × threshold 5 (500ms staleness threshold) at runtime
+  defaults, 200ms × 5 (1s) in the deployed lab. The knob names are
+  `set chassis cluster heartbeat-interval <ms>` and
+  `set chassis cluster heartbeat-threshold <n>`; the sync-recency guard and
+  startup/restart grace can defer peer-loss declaration
+  (`pkg/cluster/heartbeat.go:61-98,1916-1960`;
+  `pkg/daemon/daemon_ha_sync.go:170-206`;
+  `docs/ha-cluster-userspace.conf:71-72`).
 
 ## Shutdown
 

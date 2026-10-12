@@ -156,41 +156,93 @@ Switching to macvtap, routed, or tc-redirect could eliminate this entirely.
 - Verify guest csum offload is enabled end-to-end
 - SR-IOV passthrough (already used for WAN) bypasses this entirely
 
-## Cluster Failover Timing (Implemented, `ff7821c`, updated `ae1a717`)
+## Cluster Failover Timing (mode-specific; historical measurements)
 
-### Sub-100ms VRRP advertisement interval (`ae1a717`)
-- **Impact:** Failover from ~0.8s → **~60ms** (measured 6 lost pings at 10ms interval)
-- RETH instances: **30ms interval** (was 250ms, was 1s); configurable via `set chassis cluster reth-advertise-interval <ms>`
-- masterDownInterval: 3 × 30ms + 56/256 × 30ms = **~97ms** (was 805ms, was 3.219s)
-- **Planned shutdown (priority-0):** burst of 3× priority-0 adverts; peer immediate takeover in ~1ms (was ~55ms skew)
-- **Async GARP:** `becomeMaster()` sends advert first (sync), GARP in background goroutine (was blocking ~200ms)
-- **Burst GARP:** `SendGratuitousARPBurst()` sends first pair <1ms, remaining at 50ms intervals in background
-- `AdvertiseInterval` field in milliseconds internally; wire format in centiseconds per RFC 5798
-- Per-RG `GratuitousARPCount` wired through to VRRP instances
+The `ae1a717` VRRP measurements below describe the legacy VRRP-backed RETH
+path, not the compiler-default private-RG election mode. The latter uses
+heartbeat detection; a connected sync stream with peer traffic ≤2s old can
+suppress heartbeat timeout until traffic ages out (with a 5s continuous
+suppression cap). Runtime heartbeat defaults are 100ms × 5 = 500ms; the
+deployed lab config is 200ms × 5 = 1s. Silent death with an established sync
+connection takes max(threshold, remaining sync-recency window) plus up to one
+heartbeat tick: about 0.5–2.1s at defaults, 1.0–2.2s in the lab,
+phase-dependent. A process crash that closes sync falls through at the raw
+heartbeat threshold. These are detection estimates, not end-to-end
+forwarding-restoration SLAs
+(`pkg/config/compiler_system.go:3132-3137`;
+`pkg/cluster/heartbeat.go:61-65,1916-1960`;
+`pkg/cluster/heartbeat_manager.go:790-832`;
+`pkg/daemon/daemon_ha_sync.go:170-206`;
+`docs/ha-cluster-userspace.conf:71-72`).
 
-### Session sync connect optimization
-- **Impact:** Failback sync from 5-10s → 1-2s
-- Immediate first dial attempt (was 5s wait before first attempt)
-- 1s retry interval (was 5s)
+### Legacy VRRP-backed RETH mode (`no-private-rg-election`)
+- The 30ms advertisement default is configurable with
+  `set chassis cluster reth-advertise-interval <ms>`; the master-down timer is
+  `3 × advertised interval + priority skew` (>90ms and <120ms at 30ms for
+  priorities 1–255). This is a detection timer, not an end-to-end restoration
+  measurement (`pkg/config/compiler_system.go:3119-3122`;
+  `pkg/vrrp/vrrp.go:153-166`; `pkg/vrrp/instance_timing.go:112-128`).
+- The historical test note recorded ~60ms in the legacy VRRP path; it is not
+  a current-default promise.
+- Planned legacy shutdown sends three priority-0 adverts and arms a 1ms backup
+  timer; the run-loop test requires takeover within 50ms (test constraint, not
+  SLA) (`pkg/vrrp/instance.go:770-807`;
+  `pkg/vrrp/instance_rx.go:155-173`;
+  `pkg/vrrp/instance_prio0_run_test.go:143-149`).
+- `becomeMaster()` sends the advertisement synchronously and GARP in a
+  background goroutine (the prior blocking path cost about 200ms).
+- `SendGratuitousARPBurst()` sends the first pair <1ms, then remaining at 50ms
+  intervals in the background.
+- `AdvertiseInterval` is milliseconds internally and centiseconds on wire;
+  per-RG `GratuitousARPCount` is wired through to VRRP instances.
+- A non-preempting legacy VRRP BACKUP has the 3s deafness window at process
+  start and sync-hold release, reset by the first peer advert
+  (`pkg/vrrp/instance.go:71-93`;
+  `pkg/vrrp/instance_timing.go:17-41`;
+  `pkg/vrrp/instance_rx.go:151-173`).
+- Event debounce is 500ms before priority updates only in legacy VRRP-backed
+  mode (was 2s; `pkg/daemon/daemon_ha.go:782-824`).
 
-### Event debounce reduction
-- **Impact:** VRRP priority update 1.5s faster
-- `watchClusterEvents()` debounce: 500ms (was 2s)
+### Current mode and related timers
+- Heartbeat staleness uses `set chassis cluster heartbeat-interval <ms>` and
+  `set chassis cluster heartbeat-threshold <n>`; startup/restart grace also
+  applies (`pkg/cluster/heartbeat.go:61-98,1916-1960`).
+- Interface/IP monitoring is separate: polls every 1s, requires three
+  consecutive failed polls, and has a default 5s state-change hold-down. IP
+  probes run 16 at a time with 800ms per-target deadlines and 500ms cycle
+  slack; more than 16 targets add 800ms waves
+  (`pkg/cluster/monitor.go:28-57,242-276,383-398,585-600`).
+- Ordinary private-RG shutdown sends no resign frame; after `rg_active`
+  clears, the peer promotes no sooner than the heartbeat threshold and may be
+  deferred further by the sync-recency guard. Operator-initiated private-RG
+  failover is a distinct explicit peer-transfer path
+  (`pkg/daemon/daemon_run_shutdown.go:418-428`;
+  `pkg/cluster/manager.go:1026-1077`;
+  `pkg/cluster/heartbeat.go:61-65,1916-1960`;
+  `pkg/daemon/daemon_ha_sync.go:170-206`;
+  `pkg/cluster/failover.go:447-450`;
+  `pkg/cluster/election.go:1021-1042`).
+- Sync hold is 30s in both the VRRP and no-RETH startup paths (released early
+  when bulk sync completes), not 10s
+  (`pkg/daemon/daemon_run_bringup.go:260-273`;
+  `pkg/daemon/daemon_ha_noreth_hold.go:42-53`;
+  `pkg/vrrp/manager.go:355-379`).
 
-### Sync hold timeout reduction
-- 10s timeout (was 30s) — safety net if bulk sync never completes
+### Other historical optimization notes
+- Session-sync reconnect makes its first dial immediately and retries at a
+  1s cadence; this is a reconnect interval, not a failback completion bound
+  (`pkg/cluster/sync_conn.go:1379-1414`).
+- `test/incus/xpfd.service` uses `RestartSec=1`
+  (`test/incus/xpfd.service:9-11`).
 
-### Heartbeat timer tuning
-- 200ms interval, threshold 5 → 1s detection (was 1000ms interval, threshold 3 → 3s)
-
-### systemd RestartSec
-- 1s (was 5s) — faster crash recovery restart
-
-### Measured Failover/Failback Times
+### Historical measured failover/failback times (legacy test records)
 | Scenario | Original | `ff7821c` | `ae1a717` |
 |----------|----------|-----------|-----------|
-| Failover (daemon dies → peer takes over) | ~3.2s | ~0.8s | **~60ms** |
-| Clean stop (priority-0 → peer skew) | ~219ms | ~55ms | **~1ms** |
-| Failback (daemon returns → preempts) | ~5-6s | ~2-3s | **~130ms** |
+| Failover (daemon dies → peer takes over) | ~3.2s | ~0.8s | ~60ms |
+| Clean stop (priority-0 → peer skew) | ~219ms | ~55ms | Historical result not source-backed |
+| Failback (daemon returns → preempts) | ~5-6s | ~2-3s | Not source-backed |
 | Single node reboot → MASTER | N/A | ~6s | ~6s |
 | Simultaneous reboot → converge | N/A | ~10s | ~10s |
+
+The table is retained as historical test data only; its old clean-stop and
+failback rows are not current-default end-to-end bounds.

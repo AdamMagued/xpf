@@ -3670,14 +3670,55 @@ outside the monitor loop:
 
 `config`, `dataplane`.
 
-## Failover timing (CLAUDE.md authoritative)
+## Failover timing by mode and event (CLAUDE.md authoritative)
 
-- ~60 ms with default 30 ms VRRP advertisements (masterDownInterval ~97 ms).
-- Planned shutdown: burst of 3× priority-0 advertisements; peer takes over
-  in ~1 ms.
-- Failback: ~130 ms (daemon startup + BPF load + sync hold release).
-- Heartbeat: 200 ms interval, threshold 5 (1 s detection).
-- Event debounce 500 ms before priority updates fire.
+- Default compiler mode is private-RG election over the control link, with RETH VRRP suppressed (`pkg/config/compiler_system.go:3134-3137`; `pkg/vrrp/README.md:950-964`).
+- Heartbeat staleness is interval × threshold: runtime defaults are 100ms × 5
+  = 500ms, and the deployed lab config is 200ms × 5 = 1s. Those raw thresholds
+  do not describe silent-node-death detection while session sync stays
+  connected: `shouldSuppressPeerHeartbeatTimeout` suppresses a timeout when
+  last peer sync traffic is ≤2s old, capped at 5s continuous suppression.
+  Silent death with an established sync connection is approximately
+  max(threshold, remaining sync-recency window) plus up to one heartbeat tick:
+  0.5–2.1s from peer death at defaults and 1.0–2.2s in the lab, phase-dependent.
+  A process crash that closes sync, or an idle sync connection already >2s,
+  falls back to the raw heartbeat threshold. Startup/restart grace can also
+  defer handling. These are detection times, not end-to-end restoration SLAs
+  (`pkg/cluster/heartbeat.go:61-65,1916-1960`;
+  `pkg/cluster/heartbeat_manager.go:790-832`;
+  `pkg/daemon/daemon_ha_sync.go:170-206`;
+  `docs/ha-cluster-userspace.conf:71-72`).
+- Interface/IP monitoring is separate: a 1s poll requires 3 consecutive
+  failed checks to mark down, with a default 5s hold-down after a state
+  change. IP probes run at most 16 at once, each with an 800ms read deadline
+  and 500ms cycle slack; larger target sets need additional 800ms probe waves,
+  so this path can stretch beyond the heartbeat timing
+  (`pkg/cluster/monitor.go:28-57,242-276,383-398,585-600`).
+- Only legacy VRRP-backed mode (`no-private-rg-election`, unless
+  `no-reth-vrrp` is also set) uses RETH VRRP's configurable
+  `reth-advertise-interval` (30ms default). For a 30ms learned/current
+  advertisement, the steady-state master-down timer is 3×advertisement +
+  priority skew (>90ms and <120ms for priorities 1–255); only a
+  non-preempting BACKUP starts with the 3s deaf interval. These are detection
+  timers, not measured end-to-end failover times (`pkg/vrrp/vrrp.go:153-166`;
+  `pkg/vrrp/instance_timing.go:17-41,112-128`;
+  `pkg/vrrp/README.md:950-964`).
+- Planned legacy VRRP shutdown sends three priority-0 advertisements; the
+  backup arms a 1ms timer, and the run-loop test requires takeover within
+  50ms (test constraint, not SLA). Ordinary private-RG shutdown sends no
+  resign/transfer frame: after `rg_active` clears, the peer promotes through
+  heartbeat-loss detection, no sooner than its heartbeat threshold and
+  potentially later under the sync-recency guard. Private-RG operator
+  failover is a separate explicit peer-transfer/resignation path
+  (`pkg/vrrp/instance.go:804-806`;
+  `pkg/vrrp/instance_rx.go:155-174`;
+  `pkg/vrrp/instance_prio0_run_test.go:143-149`;
+  `pkg/daemon/daemon_run_shutdown.go:418-428`;
+  `pkg/cluster/manager.go:1026-1077`;
+  `pkg/cluster/failover.go:447-450`;
+  `pkg/cluster/election.go:1022-1042`).
+- The 500ms event debounce before priority updates is legacy VRRP-only
+  (`pkg/daemon/daemon_ha.go:782-824`).
 
 ## Gotchas
 

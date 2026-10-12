@@ -207,17 +207,40 @@ the userspace dataplane admission boundary is in
 
 ## High availability
 
-- **Chassis cluster** with ~60ms failover (30ms VRRP intervals).
-- **Native VRRPv3**: Go state machine, AF_PACKET, per-instance sockets,
-  IPv6 NODAD, 30ms RETH advertisements, async GARP burst, single-interface
-  tracking (nested `track-interface <if> priority-cost <n>`). Tracking
-  follows the configured interface NAME (Junos semantics) and is robust to a
-  runtime kernel rename: the link watcher keys rename detection on the stable
-  ifindex, so when the tracked name is renamed away (a single `RTM_NEWLINK`
-  with the same ifindex but a new name, no `RTM_DELLINK`) the instance demotes
-  rather than holding stale "up" state (#2944). The IP address owner (priority
-  255) always preempts a lower-priority master irrespective of the `no-preempt`
-  flag (RFC 5798 §6.1, #4116) and is exempt from track-down demotion.
+- **Chassis cluster**: compiler default is private-RG election over the control
+  link; RETH VRRP is suppressed (`pkg/config/compiler_system.go:3132-3137`;
+  `pkg/vrrp/vrrp.go:153-156`). Heartbeat staleness is interval × threshold,
+  configured with `set chassis cluster heartbeat-interval <ms>` and
+  `set chassis cluster heartbeat-threshold <n>`: 100ms × 5 = 500ms at runtime
+  defaults or 200ms × 5 = 1s in the deployed lab config. While sync is
+  connected and last peer traffic is ≤2s old, the guard suppresses the heartbeat
+  timeout with a 5s continuous-suppression cap. Silent death with established
+  sync therefore takes max(threshold, remaining sync-recency window) plus up
+  to one heartbeat tick: 0.5–2.1s at defaults and 1.0–2.2s in the lab,
+  phase-dependent; a process crash that closes sync or already-idle sync
+  falls through at the raw threshold, subject to startup/restart grace. These
+  are detection estimates, not end-to-end traffic-restoration SLAs
+  (`pkg/cluster/heartbeat.go:61-98,1916-1960`;
+  `pkg/cluster/heartbeat_manager.go:790-832`;
+  `pkg/daemon/daemon_ha_sync.go:170-206`;
+  `docs/ha-cluster-userspace.conf:71-72`).
+- **Legacy VRRP-backed RETH mode** (`no-private-rg-election`, unless
+  `no-reth-vrrp` is also set): the 30ms default advertisement yields a
+  >90ms/<120ms steady-state master-down timer for priorities 1–255; timer
+  formula, not measured end-to-end restoration (`pkg/vrrp/vrrp.go:153-166`;
+  `pkg/vrrp/instance_timing.go:112-128`).
+- **Native VRRPv3**: Go state machine, AF_PACKET, per-instance sockets, IPv6
+  NODAD; the 30ms RETH advertisement default applies only in legacy
+  VRRP-backed mode. Async GARP burst is independent of single-interface
+  tracking, which uses nested `track-interface <if> priority-cost <n>`.
+  Tracking follows the configured interface NAME (Junos semantics) and is
+  robust to a runtime kernel rename: the link watcher keys rename detection
+  on the stable ifindex, so when the tracked name is renamed away (a single
+  `RTM_NEWLINK` with the same ifindex with a new name, no `RTM_DELLINK`) the
+  instance demotes rather than holding stale "up" state (#2944). The IP
+  address owner (priority 255) always preempts a lower-priority master
+  irrespective of the `no-preempt` flag (RFC 5798 §6.1, #4116) and is exempt
+  from track-down demotion.
   **VRRP `authentication-type` / `authentication-key` are REJECTED at commit**
   (#4288): RFC 5798 VRRPv3 removed authentication (VRRPv2 had it), so the
   native dataplane cannot authenticate adverts. Accepting the auth config
@@ -284,8 +307,18 @@ the userspace dataplane admission boundary is in
   sweep, and a cycle that exceeds its deadline records
   `IPMonitorCycleOverruns` and defers (never fails) its unfinished targets
   (#5301). `pkg/cluster/monitor.go`.
-- **Bondless RETH**: VRRP on physical member interfaces, per-node/per-RETH
-  MAC (`02:bf:72:CC:RR:(2*reth-index+node-id)`), no Linux bonding required.
+- Monitors poll every 1s, require 3 consecutive failures to mark down (and
+  3 successes to recover), and use a default 5s hold-down after a state
+  change. Probe-cycle budget is `ceil(targets/16) × 800ms + 500ms` slack;
+  >16 targets add waves (for example, 64 unreachable targets have a 3.7s
+  cycle budget, not a sub-second bound) (`pkg/cluster/monitor.go:28-57,
+  242-276,383-398,585-600`).
+- **Bondless RETH**: RETH uses physical-member mapping rather than Linux
+  bonding. In legacy VRRP-backed mode, VRRP runs on those physical members;
+  private-RG election is the compiler default and suppresses RETH VRRP
+  (`pkg/vrrp/vrrp.go:153-166`; `pkg/config/compiler_system.go:3132-3137`).
+  The virtual MAC is per-node, per-RETH
+  (`02:bf:72:CC:RR:(2*reth-index+node-id)`).
 - **VRRP L2 identity is a deliberate deviation from RFC 5798 (#5091).** The RFC
   specifies a *shared* virtual-router MAC — `00-00-5E-00-01-{VRID}` for IPv4 and
   `00-00-5E-00-02-{VRID}` for IPv6 — which both routers use, so the virtual
@@ -353,8 +386,18 @@ the userspace dataplane admission boundary is in
   config-only mode until updated.
 - **Readiness gate**: per-RG readiness (interfaces + VRRP) + hold timer
   gates election.
-- **Planned shutdown**: near-instant takeover (priority-0 burst);
-  failback ~130ms.
+- **Planned shutdown**: legacy VRRP-backed mode sends three priority-0
+  advertisements and arms a 1ms backup timer; the run-loop test requires
+  MASTER advertisement within 50ms (test constraint, not SLA)
+  (`pkg/vrrp/instance.go:770-807`; `pkg/vrrp/instance_rx.go:155-173`;
+  `pkg/vrrp/instance_prio0_run_test.go:143-149`). Default private-RG
+  shutdown sends no resign frame; after `rg_active` clears, the peer waits at
+  least the heartbeat threshold (500ms runtime defaults / 1s lab config), and
+  the sync-recency guard can extend that gap. No end-to-end restoration bound
+  is asserted (`pkg/daemon/daemon_run_shutdown.go:418-428`;
+  `pkg/cluster/manager.go:1026-1077`;
+  `pkg/cluster/heartbeat.go:61-65,1916-1960`;
+  `pkg/daemon/daemon_ha_sync.go:170-206`).
 - **ISSU**: in-service software upgrade with rolling deploy.
 - **RA lifecycle**: goodbye RAs (lifetime=0) on failover/startup to
   prevent stale IPv6 ECMP routes.

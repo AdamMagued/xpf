@@ -1118,8 +1118,13 @@ reconcile above (extend it only for maps whose loss is truly safe).
   child held in xpfd memory; a fresh xpfd spawns a NEW helper and clears
   the XSKMAP. Standalone cut-over is a bounded, MEASURED multi-second gap
   (the ~3s NAPI bootstrap window is the floor). True zero-gap
-  (decoupled-helper re-attach) is future M-mech-2. The HA path masks the
-  gap with a single ~60ms VRRP failover per node.
+  (decoupled-helper re-attach) is future M-mech-2. The HA rolling path uses a
+  planned drain rather than heartbeat-loss detection: it runs
+  `ForceSecondary()` then waits for `DrainComplete()` (peer PRIMARY, local
+  VRRP BACKUP/no-VIPs, `rg_active` false, sync clean) before the cut. After the
+  staged node restarts, it waits for sync to re-establish before resetting
+  failover and rejoining. This is not an unplanned-failover timing promise
+  (`pkg/upgrade/rolling.go:92-108,366-375`).
 - Kernel/OS upgrades are #1930; a signed/hosted apt repo is #1924.
 
 ## LANE-1 HA kernel roll (#1930 INC-2)
