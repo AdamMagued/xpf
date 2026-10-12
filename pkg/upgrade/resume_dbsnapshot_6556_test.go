@@ -93,23 +93,25 @@ func TestRun_ResumedCutRetakesDBSnapshot6556(t *testing.T) {
 	}
 }
 
-// TestRun_ResumedCutPastStoppedKeepsOriginalSnapshot6556 binds the FLOOR, and
-// it is the half that stops the fix from becoming a new bug.
+// TestRun_ResumedCutPastStoppedKeepsOriginalSnapshot6556 pins the
+// post-STOPPED snapshot rule, and prevents a new rollback-defeating bug.
 //
-// "Always re-snapshot on resume" is the obvious reading of the issue and it is
-// WRONG from STOPPED onward. At STOPPED the daemon is down, so no commit can
-// have landed and there is nothing to re-capture. At FLIPPED,
-// versions/current already points at the NEW binary, which may have started
-// and migrated the config-DB envelope — re-snapshotting there would capture
-// POST-upgrade state under the name "pre-upgrade snapshot" and defeat rollback
-// entirely, which is strictly worse than the bug being fixed.
+// A STOPPED resume has its own state-aware path: it refreshes the snapshot when
+// current still names PreviousVersion, or current names the target while
+// either loaded ExecStart or MainPID still identifies previous. A target
+// ExecStart with an old MainPID remains an old-process case because
+// daemon-reload does not replace the process; on snapshot failure, restore and
+// reload the previous ExecStart before restarting it. Unknown paths and
+// contradictory combinations refuse. If neither execution signal identifies
+// previous, the target may have migrated the DB, so the original snapshot is
+// preserved. A later FLIPPED journal state likewise keeps it.
 //
-// So this asserts the inverse: a resume at FLIPPED must restore the ORIGINAL
-// snapshot even though the file changed underneath it.
+// This cell resumes at FLIPPED and requires rollback to restore the original
+// content even after the live file changes to an envelope the old binary
+// cannot read.
 //
-// RED-on-revert: drop the `!j.State.atLeast(StateStopped)` condition (i.e.
-// re-snapshot on every resume) and the rollback here returns the post-flip
-// content instead of the pre-upgrade one.
+// RED-on-revert: re-snapshot unconditionally at FLIPPED and rollback restores
+// post-flip content instead of the pre-upgrade DB.
 func TestRun_ResumedCutPastStoppedKeepsOriginalSnapshot6556(t *testing.T) {
 	fs := newFakeSystem(t, "1.0.0")
 	r, cfg := testEnv(t, fs)

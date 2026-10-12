@@ -192,3 +192,34 @@ func TestEnvelopeReaderVersion_RefusesMalformedProbe(t *testing.T) {
 		})
 	}
 }
+
+func TestUnitExecStartReadsLoadedSystemdProperty(t *testing.T) {
+	dir := t.TempDir()
+	out := "{ path=/var/lib/xpf/versions/2.0.0/xpfd ; argv[]=/var/lib/xpf/versions/2.0.0/xpfd ; ignore_errors=no }\n"
+	writeFakeVersionBin(t, filepath.Join(dir, "systemctl"), out, 0)
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+
+	s := &realSystem{unit: "xpfd"}
+	got, err := s.UnitExecStart("xpfd")
+	if err != nil {
+		t.Fatalf("UnitExecStart: %v", err)
+	}
+	if got != strings.TrimSpace(out) {
+		t.Fatalf("UnitExecStart = %q, want %q", got, strings.TrimSpace(out))
+	}
+}
+
+func TestRunningUnitExeAcceptsInactiveUnit(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeVersionBin(t, filepath.Join(dir, "systemctl"), "0\n", 0)
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+
+	s := &realSystem{unit: "xpfd"}
+	got, err := s.RunningUnitExe("xpfd")
+	if err != nil {
+		t.Fatalf("RunningUnitExe: %v", err)
+	}
+	if got != "" {
+		t.Fatalf("RunningUnitExe = %q, want empty for MainPID 0", got)
+	}
+}

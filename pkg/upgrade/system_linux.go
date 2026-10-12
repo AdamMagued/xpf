@@ -70,6 +70,38 @@ func (s *realSystem) WriteUnitDropin(unit, name, content string) error {
 	return fsatomic.WriteFileDurable(filepath.Join(dir, name), []byte(content), 0644)
 }
 
+func (s *realSystem) UnitExecStart(unit string) (string, error) {
+	out, err := captureCmdTimeout(5*time.Second, "systemctl", "show",
+		"--property=ExecStart", "--value", unit+".service")
+	if err != nil {
+		return "", fmt.Errorf("show loaded ExecStart for %s: %w", unit, err)
+	}
+	return strings.TrimSpace(out), nil
+}
+
+func (s *realSystem) RunningUnitExe(unit string) (string, error) {
+	out, err := captureCmdTimeout(5*time.Second, "systemctl", "show",
+		"--property=MainPID", "--value", unit+".service")
+	if err != nil {
+		return "", fmt.Errorf("show MainPID for %s: %w", unit, err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(out))
+	if err != nil {
+		return "", fmt.Errorf("parse MainPID for %s from %q: %w", unit, out, err)
+	}
+	if pid < 0 {
+		return "", fmt.Errorf("parse MainPID for %s from %q: negative pid", unit, out)
+	}
+	if pid == 0 {
+		return "", nil
+	}
+	exe, err := os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "exe"))
+	if err != nil {
+		return "", fmt.Errorf("resolve executable for %s MainPID %d: %w", unit, pid, err)
+	}
+	return exe, nil
+}
+
 func (s *realSystem) FreeBytes(path string) (uint64, error) {
 	var st unix.Statfs_t
 	// Stat the nearest existing ancestor so a not-yet-created versions dir

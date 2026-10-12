@@ -1,36 +1,13 @@
-// #12174: a same-version resume from STOPPED FLIPs under a LIVE old daemon
-// and the auto-rollback then deletes commits made after it restarted.
+// #12174: a STOPPED journal does not prove the unit stayed down, and neither
+// current nor loaded ExecStart alone identifies the process that could commit.
+// A restart between FLIP 6a and successful 6c reload can run the old binary;
+// a reload also leaves an already-running old process untouched. Its commits
+// must survive auto-rollback. Conversely, a target process may have migrated
+// the DB, so that snapshot must not be replaced.
 //
-// The preflight resume gate re-snapshots only below STOPPED, on the rationale
-// "From STOPPED onward the daemon is DOWN" (cutover.go:562-603). That is
-// unenforced: at >= STOPPED both the STOP and the cut-boundary snapshot are
-// skipped (cutover.go:725-754), while nothing verifies the daemon actually
-// stayed down across the interruption. If the cut is interrupted after the
-// durable STOPPED journal write but before FLIP, and the enabled old unit
-// starts again (reboot / postinst restart of an inactive unit after a failed
-// cut / operator action), the operator can commit against the live old
-// daemon — and does not know a cut is pending, since the upgrade lock is NOT
-// held across the interruption. On resume:
-//
-//   - FLIP runs under the live old daemon (the STOP-before-FLIP structural
-//     race closure is bypassed),
-//   - START is a no-op because the old daemon is already running
-//     (systemctl start on an active unit returns success), so the running
-//     binary is still the OLD version,
-//   - the production version-bound health gate (HelperHealthProbe wired via
-//     NewSystemWithHelperHealth) FAILS because the armed helper executes the
-//     old version dir, not the target's, and
-//   - the standalone auto-rollback restores the cut-boundary DB snapshot taken
-//     at the ORIGINAL stop — silently reverting every commit made after the
-//     old daemon restarted.
-//
-// The resume must either STOP the live old unit plus take a fresh snapshot
-// before FLIP, or refuse safely while preserving the post-restart commits.
-//
-// FAIL-ON-REVERT: omit the STOPPED-resume re-stop or fresh snapshot and
-// TestRun_StoppedResumeLiveOldUnitPreservesCommits12174 goes RED — the
-// auto-rollback restores the pre-restart snapshot. The two controls stay
-// green either way, proving the main cell discriminates the live-unit state.
+// FAIL-ON-REVERT: omitting the re-stop or fresh snapshot makes the
+// live-old-process cells restore pre-restart content. Re-snapshotting after a
+// target process ran restores a migrated envelope and fails rollback.
 package upgrade
 
 import (
@@ -170,56 +147,279 @@ func TestRun_StoppedResumeLiveOldUnitPreservesCommits12174(t *testing.T) {
 		t.Fatalf("STOP must happen before FLIP on the STOPPED resume; calls=%v", resumeCalls)
 	}
 }
-
-// TestRun_StoppedResumeUnitStillDownProceeds12174 is the stopped-unit control:
-// the same interrupted-STOPPED same-version resume with the unit still down
-// must complete the cut exactly as before (the fix must not refuse or disturb
-// the already-correct path).
-func TestRun_StoppedResumeUnitStillDownProceeds12174(t *testing.T) {
+func TestRun_Stopped6aOnlyResumePreservesCommits12174(t *testing.T) {
 	fs := newFakeSystem(t, "1.0.0")
-	const boundaryContent = "#xpf-config-envelope v=1\n{\"gen\":\"cut-boundary-unit-down\"}"
-	r, cfg, dbFile := seedStoppedSameVersionCut(t, fs, boundaryContent)
+	const boundary = "#xpf-config-envelope v=1\n{\"gen\":\"boundary\"}"
+	r, cfg, dbFile := seedStoppedSameVersionCut(t, fs, boundary)
+	must(t, r.repointSymlink(r.currentPath(), "2.0.0"))
+	must(t, fs.StartUnit(cfg.Unit))
+	const committed = "#xpf-config-envelope v=1\n{\"gen\":\"old-unit-commit-after-6a\"}"
+	mkfile(t, dbFile, committed)
+	fs.healthFailVersions["2.0.0"] = true
 
-	// Control: the unit stays stopped across the interruption. No commit can
-	// land while the daemon is down.
-	if fs.unitRunning {
-		t.Fatal("seed left the unit running; the stopped-unit control requires it down")
+	resumeOffset := len(fs.calls)
+	err := r.Run(Options{})
+	got, readErr := os.ReadFile(dbFile)
+	if readErr != nil {
+		t.Fatalf("read config DB after rollback: %v", readErr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "rolled back") {
+		t.Fatalf("resume must reach target-health rollback, got %v", err)
+	}
+	if string(got) != committed {
+		t.Fatalf("6a-only resume lost old-unit commit: got %q want %q", got, committed)
+	}
+	assertResumeStopBeforeFlip12174(t, fs.calls[resumeOffset:])
+}
+
+func TestRun_Stopped6cWrittenBeforeReloadUsesLoadedExecStart12174(t *testing.T) {
+	fs := newFakeSystem(t, "1.0.0")
+	const boundary = "#xpf-config-envelope v=1\n{\"gen\":\"boundary\"}"
+	r, cfg, dbFile := seedStoppedSameVersionCut(t, fs, boundary)
+	must(t, r.repointSymlink(r.currentPath(), "2.0.0"))
+	must(t, r.writeUnitDropin("2.0.0")) // 6c persisted; crash before daemon-reload
+	must(t, fs.StartUnit(cfg.Unit))     // systemd still has the old loaded ExecStart
+	const committed = "#xpf-config-envelope v=1\n{\"gen\":\"old-unit-commit-before-reload\"}"
+	mkfile(t, dbFile, committed)
+	fs.healthFailVersions["2.0.0"] = true
+
+	err := r.Run(Options{})
+	got, readErr := os.ReadFile(dbFile)
+	if readErr != nil {
+		t.Fatalf("read config DB after rollback: %v", readErr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "rolled back") {
+		t.Fatalf("resume must reach target-health rollback, got %v", err)
+	}
+	if string(got) != committed {
+		t.Fatalf("resume trusted the on-disk drop-in instead of systemd's loaded ExecStart: got %q want %q",
+			got, committed)
+	}
+}
+
+func TestRun_StoppedResumeOldProcessSurvivesSuccessfulReload12174(t *testing.T) {
+	fs := newFakeSystem(t, "1.0.0")
+	const boundary = "#xpf-config-envelope v=1\n{\"gen\":\"boundary\"}"
+	r, cfg, dbFile := seedStoppedSameVersionCut(t, fs, boundary)
+	must(t, r.repointSymlink(r.currentPath(), "2.0.0"))
+	must(t, fs.StartUnit(cfg.Unit))
+	oldExe := filepath.Join(r.versionDir("1.0.0"), "xpfd")
+	if fs.runningUnitExe != oldExe {
+		t.Fatalf("fixture running exe = %q, want old binary %q", fs.runningUnitExe, oldExe)
+	}
+	must(t, r.writeUnitDropin("2.0.0"))
+	must(t, fs.DaemonReload()) // loaded ExecStart is target; old process survives
+	if fs.runningUnitExe != oldExe {
+		t.Fatalf("daemon-reload replaced the running process: got %q want %q",
+			fs.runningUnitExe, oldExe)
+	}
+	const committed = "#xpf-config-envelope v=1\n{\"gen\":\"old-process-after-reload\"}"
+	mkfile(t, dbFile, committed)
+	originalStat := statConfigDBDir
+	statConfigDBDir = func(string) (os.FileInfo, error) {
+		return nil, errors.New("injected snapshot EIO")
+	}
+	t.Cleanup(func() { statConfigDBDir = originalStat })
+
+	err := r.Run(Options{})
+	if err == nil || !strings.Contains(err.Error(), "fresh cut-boundary snapshot config DB") {
+		t.Fatalf("Run error = %v, want fresh snapshot failure", err)
+	}
+	if !fs.unitRunning || fs.runningUnitExe != oldExe {
+		t.Fatalf("snapshot failure did not safely restart old binary: running=%v exe=%q want=%q",
+			fs.unitRunning, fs.runningUnitExe, oldExe)
+	}
+	if fs.loadedExecStart != fakeSystemdExecStart(oldExe) {
+		t.Fatalf("snapshot failure left target ExecStart loaded: %q", fs.loadedExecStart)
+	}
+	current, readErr := r.readCurrentVersion()
+	if readErr != nil || current != "2.0.0" {
+		t.Fatalf("current after failed resume = %q, err=%v; want target still selected", current, readErr)
+	}
+}
+
+func TestRun_Stopped6aOnlyHealthyTargetPreservesCommits12174(t *testing.T) {
+	fs := newFakeSystem(t, "1.0.0")
+	const boundary = "#xpf-config-envelope v=1\n{\"gen\":\"boundary\"}"
+	r, cfg, dbFile := seedStoppedSameVersionCut(t, fs, boundary)
+	must(t, r.repointSymlink(r.currentPath(), "2.0.0"))
+	must(t, fs.StartUnit(cfg.Unit))
+	const committed = "#xpf-config-envelope v=1\n{\"gen\":\"healthy-old-unit-commit\"}"
+	mkfile(t, dbFile, committed)
+	oldStopped := false
+	fs.stopHook = func() { oldStopped = true }
+	fs.healthProbe = func(ver string, _ time.Duration) error {
+		if ver == "2.0.0" && !oldStopped {
+			return errors.New("loaded ExecStart still runs old binary")
+		}
+		return nil
 	}
 
 	if err := r.Run(Options{}); err != nil {
-		t.Fatalf("resumed STOPPED cut with the unit still down must complete: %v", err)
-	}
-	cur, _ := os.Readlink(filepath.Join(cfg.VersionsDir, currentLink))
-	if filepath.Base(cur) != "2.0.0" {
-		t.Fatalf("current = %q after the stopped-unit resume, want 2.0.0", cur)
+		t.Fatalf("healthy target resume failed: %v", err)
 	}
 	got, err := os.ReadFile(dbFile)
 	if err != nil {
 		t.Fatalf("read config DB after resume: %v", err)
 	}
-	if string(got) != boundaryContent {
-		t.Fatalf("stopped-unit resume changed the config DB: got %q want %q", got, boundaryContent)
+	if string(got) != committed {
+		t.Fatalf("healthy 6a-only resume changed the old-unit commit: got %q want %q", got, committed)
 	}
 }
 
-// TestRun_StoppedResumeDifferentStagedVersionRecovers12174 is the
-// different-staged-version control: a superseding version still takes the
-// stale-STOPPED recovery branch (restart known-good + fresh cut), unchanged
-// by the same-version resume fix.
-func TestRun_StoppedResumeDifferentStagedVersionRecovers12174(t *testing.T) {
-	fs := newFakeSystem(t, "2.0.0")
-	r, cfg, _ := seedStaleStoppedSupersede(t, fs)
-
-	// The enabled old unit stopped with the stale cut, then restarted during
-	// the interruption; recovery's StartUnit must be a harmless active no-op.
-	must(t, fs.StopUnit(cfg.Unit))
+func TestRun_StoppedFullFlipKeepsOriginalSnapshot12174(t *testing.T) {
+	fs := newFakeSystem(t, "1.0.0")
+	const boundary = "#xpf-config-envelope v=1\n{\"gen\":\"pre-upgrade-boundary\"}"
+	r, cfg, dbFile := seedStoppedSameVersionCut(t, fs, boundary)
+	must(t, r.flip("2.0.0"))
 	must(t, fs.StartUnit(cfg.Unit))
+	const migrated = "#xpf-config-envelope v=1 min-reader=99\n{}"
+	mkfile(t, dbFile, migrated)
+	fs.healthFailVersions["2.0.0"] = true
 
-	if err := r.Run(Options{}); err != nil {
-		t.Fatalf("stale-STOPPED recovery with a superseding version must proceed: %v", err)
+	resumeOffset := len(fs.calls)
+	err := r.Run(Options{})
+	got, readErr := os.ReadFile(dbFile)
+	if readErr != nil {
+		t.Fatalf("read config DB after rollback: %v", readErr)
 	}
-	cur, _ := os.Readlink(filepath.Join(cfg.VersionsDir, currentLink))
-	if filepath.Base(cur) != "3.0.0" {
-		t.Fatalf("current = %q after stale-STOPPED recovery, want 3.0.0 (fresh cut proceeded)", cur)
+	if err == nil || !strings.Contains(err.Error(), "rolled back") {
+		t.Fatalf("full-flip resume must reach target-health rollback, got %v", err)
 	}
+	if string(got) != boundary {
+		t.Fatalf("full-flip resume replaced the original rollback snapshot: got %q want %q",
+			got, boundary)
+	}
+	assertResumeStopBeforeFlip12174(t, fs.calls[resumeOffset:])
+}
+
+func TestRun_StoppedNeitherVersionRefusesWithRecoveryHint12174(t *testing.T) {
+	fs := newFakeSystem(t, "1.0.0")
+	const boundary = "#xpf-config-envelope v=1\n{\"gen\":\"boundary\"}"
+	r, _, _ := seedStoppedSameVersionCut(t, fs, boundary)
+	if _, err := copyTree(r.versionDir("1.0.0"), r.versionDir("1.5.0")); err != nil {
+		t.Fatalf("seed alternate version: %v", err)
+	}
+	must(t, r.repointSymlink(r.currentPath(), "1.5.0"))
+
+	resumeOffset := len(fs.calls)
+	err := r.Run(Options{})
+	if err == nil || !strings.Contains(err.Error(), "inspect versions/current") ||
+		!strings.Contains(err.Error(), "without deleting the journal or snapshot") {
+		t.Fatalf("neither-version refusal lacks recovery guidance: %v", err)
+	}
+	if fs.unitRunning {
+		t.Fatal("neither-version refusal unexpectedly started the unit")
+	}
+	for _, call := range fs.calls[resumeOffset:] {
+		if call == "stop" || call == "dropin" || call == "start" {
+			t.Fatalf("live mutation %q happened on refusal: calls=%v", call, fs.calls[resumeOffset:])
+		}
+	}
+}
+
+func TestRun_StoppedResumeSnapshotPersistFailureRestartsDaemon12174(t *testing.T) {
+	fs := newFakeSystem(t, "1.0.0")
+	const boundary = "#xpf-config-envelope v=1\n{\"gen\":\"boundary\"}"
+	r, _, _ := seedStoppedSameVersionCut(t, fs, boundary)
+	previousWriter := writeUpgradeJournal
+	writeUpgradeJournal = func(string, []byte, os.FileMode) error {
+		return errors.New("injected journal EIO")
+	}
+	t.Cleanup(func() { writeUpgradeJournal = previousWriter })
+
+	resumeOffset := len(fs.calls)
+	err := r.Run(Options{})
+	if err == nil {
+		t.Fatal("Run succeeded after fresh-snapshot journal persistence failure")
+	}
+	for _, call := range fs.calls[resumeOffset:] {
+		if call == "dropin" {
+			t.Fatalf("FLIP ran after snapshot persistence failure: calls=%v", fs.calls[resumeOffset:])
+		}
+	}
+	if !strings.Contains(err.Error(), "persist fresh cut-boundary snapshot") {
+		t.Fatalf("Run error = %v, want fresh-snapshot journal persistence failure", err)
+	}
+	if !fs.unitRunning {
+		t.Fatal("old daemon remained stopped after journal persistence failure")
+	}
+}
+
+func TestRun_StoppedResumeSnapshotFailureRestartsDaemon12174(t *testing.T) {
+	fs := newFakeSystem(t, "1.0.0")
+	const boundary = "#xpf-config-envelope v=1\n{\"gen\":\"boundary\"}"
+	r, _, _ := seedStoppedSameVersionCut(t, fs, boundary)
+	originalStat := statConfigDBDir
+	statConfigDBDir = func(string) (os.FileInfo, error) {
+		return nil, errors.New("injected snapshot EIO")
+	}
+	t.Cleanup(func() { statConfigDBDir = originalStat })
+
+	resumeOffset := len(fs.calls)
+	err := r.Run(Options{})
+	if err == nil || !strings.Contains(err.Error(), "fresh cut-boundary snapshot config DB") {
+		t.Fatalf("Run error = %v, want fresh snapshot failure", err)
+	}
+	if !fs.unitRunning {
+		t.Fatal("old daemon remained stopped after fresh snapshot failure")
+	}
+	if !containsCall12174(fs.calls[resumeOffset:], "start") {
+		t.Fatalf("old daemon restart missing after fresh snapshot failure: %v", fs.calls[resumeOffset:])
+	}
+	for _, call := range fs.calls[resumeOffset:] {
+		if call == "dropin" {
+			t.Fatalf("FLIP ran after fresh snapshot failure: calls=%v", fs.calls[resumeOffset:])
+		}
+	}
+}
+
+func TestRun_StoppedResumeCallerOwnedStoppedUnitRemainsDown12174(t *testing.T) {
+	fs := newFakeSystem(t, "1.0.0")
+	const boundary = "#xpf-config-envelope v=1\n{\"gen\":\"boundary\"}"
+	r, _, _ := seedStoppedSameVersionCut(t, fs, boundary)
+	originalStat := statConfigDBDir
+	statConfigDBDir = func(string) (os.FileInfo, error) {
+		return nil, errors.New("injected snapshot EIO")
+	}
+	t.Cleanup(func() { statConfigDBDir = originalStat })
+
+	resumeOffset := len(fs.calls)
+	err := r.Run(Options{UnitAlreadyStopped: true})
+	if err == nil || !strings.Contains(err.Error(), "fresh cut-boundary snapshot config DB") {
+		t.Fatalf("Run error = %v, want fresh snapshot failure", err)
+	}
+	if fs.unitRunning {
+		t.Fatal("caller-owned stopped unit was restarted after snapshot failure")
+	}
+	for _, call := range fs.calls[resumeOffset:] {
+		if call == "stop" || call == "start" {
+			t.Fatalf("caller-owned unit lifecycle was changed by Run: calls=%v", fs.calls[resumeOffset:])
+		}
+	}
+}
+
+func assertResumeStopBeforeFlip12174(t *testing.T, calls []string) {
+	t.Helper()
+	stop, flip := -1, -1
+	for i, call := range calls {
+		if call == "stop" && stop < 0 {
+			stop = i
+		}
+		if call == "dropin" && flip < 0 {
+			flip = i
+		}
+	}
+	if stop < 0 || flip < 0 || stop >= flip {
+		t.Fatalf("STOP must precede FLIP on a STOPPED resume; calls=%v", calls)
+	}
+}
+
+func containsCall12174(calls []string, want string) bool {
+	for _, call := range calls {
+		if call == want {
+			return true
+		}
+	}
+	return false
 }

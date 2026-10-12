@@ -88,6 +88,17 @@ type System interface {
 	// ExecStart/ExecStartPre to the concrete versioned xpfd path, then the
 	// caller must DaemonReload. content is the full drop-in file body.
 	WriteUnitDropin(unit, name, content string) error
+	// UnitExecStart returns systemd's loaded ExecStart for unit. STOPPED-resume
+	// pairs it with RunningUnitExe: this identifies a 6a-only flip where current
+	// names the target but the old ExecStart is still loaded, and a successful
+	// 6c reload that left an already-running old process untouched. It returns
+	// systemd's rendered property value, not the drop-in file on disk.
+	UnitExecStart(unit string) (string, error)
+	// RunningUnitExe returns the executable resolved for the unit's MainPID,
+	// or an empty string when the unit has no MainPID. A successful reload
+	// changes loaded ExecStart but does not replace an already-running old
+	// daemon, so STOPPED recovery checks both signals.
+	RunningUnitExe(unit string) (string, error)
 	// FreeBytes reports available bytes on the filesystem backing path.
 	FreeBytes(path string) (uint64, error)
 	// VerifyDataplane runs `<bin> verify-dataplane` and reports whether it
@@ -499,6 +510,13 @@ func (r *Runner) loadJournal() (*Journal, error) {
 	return j, nil
 }
 
+// writeUpgradeJournal is the durable writer seam used to exercise persistence
+// failures on STOPPED resumes. Production always uses fsatomic's durable
+// replace.
+var writeUpgradeJournal = func(path string, data []byte, mode os.FileMode) error {
+	return fsatomic.WriteFileDurable(path, data, mode)
+}
+
 // saveJournal persists j durably (temp+fsync+rename+dir fsync). Every
 // state transition routes through here so a crash leaves a consistent,
 // resumable record.
@@ -510,7 +528,7 @@ func (r *Runner) saveJournal(j *Journal) error {
 	if err := fsatomic.MkdirAllDurable(filepath.Dir(r.cfg.JournalPath), 0755); err != nil {
 		return fmt.Errorf("create journal dir: %w", err)
 	}
-	if err := fsatomic.WriteFileDurable(r.cfg.JournalPath, data, 0644); err != nil {
+	if err := writeUpgradeJournal(r.cfg.JournalPath, data, 0644); err != nil {
 		return fmt.Errorf("persist upgrade journal: %w", err)
 	}
 	return nil

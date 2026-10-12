@@ -105,14 +105,29 @@ drain paths (#5845).
   already makes for its own sibling case (#1967/#1981), with a crash in
   place of a verify failure.
 
-  The re-snapshot is FLOORED at STOPPED, and that floor is load-bearing
-  rather than cautious. From STOPPED the daemon is down, so no commit can
-  have landed and there is nothing to re-capture; and re-snapshotting at
-  FLIPPED would be actively WRONG — `versions/current` already points at
-  the new binary, which may have started and migrated the DB envelope, so
-  the "pre-upgrade" snapshot would capture POST-upgrade state and defeat
-  rollback entirely. The exposed span is exactly
-  `{PREFLIGHT, COPIED, VERIFIED}`.
+  A STOPPED journal is not itself a snapshot floor: the daemon may restart
+  during an interruption. Run resolves `versions/current`, systemd's
+  **loaded** `ExecStart`, and the executable of the unit's `MainPID`. FLIP 6a
+  repoints `current` before 6c's `daemon-reload`; if `current` names the target
+  while systemd still loads the previous binary, or the running process still
+  executes it after a successful reload, the old daemon may have accepted
+  commits. Run stops it again and refreshes the rollback snapshot. This uses
+  loaded systemd/process state rather than the drop-in file on disk, which
+  can already contain the target path before `daemon-reload` succeeds.
+
+  When `current` already names target and neither loaded `ExecStart` nor the
+  live `MainPID` identifies previous, the original snapshot is preserved: the
+  target may already have started and migrated the DB envelope, so
+  re-snapshotting would defeat rollback.
+  Unknown executable paths and contradictory combinations refuse with recovery
+  guidance rather than guessing. For example, current may still name previous
+  while loaded or running execution names target, or current and MainPID may
+  name target while loaded ExecStart still names previous. A target ExecStart
+  with a previous MainPID is not contradictory: daemon-reload does not restart
+  that process, so the old-process snapshot path still applies. Later `FLIPPED`
+  journal resumes also preserve the original snapshot. The preflight-resume
+  re-snapshot span remains `{PREFLIGHT, COPIED, VERIFIED}`; the STOPPED branch
+  separately handles an old loaded/running binary.
 
   The snapshot writer (`snapshotConfigDB`, extracted from `preflight` so
   the resume path shares one implementation) also changed its ORDERING
