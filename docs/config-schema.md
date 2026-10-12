@@ -11307,6 +11307,9 @@ reserved for whole-dataplane selection where a rewrite shim
     untagged VID-0 ingress resolves to the logical unit whose `vlan-id`
     matches the configured native VLAN. If that unit is absent or ambiguous,
     VID 0 is rejected rather than assigned the parent/unit-0 zone (#11434).
+    `commit` and `commit check` warn, naming the interface and VLAN, when
+    no unit or more than one unit has that `vlan-id`; the configuration is
+    still accepted (#12248).
   - `gratuitous-arp-reply` / `no-gratuitous-arp-request`
     (interface-level flags) — map to per-interface ARP sysctls the interface
     apply path does not write yet.
@@ -11319,7 +11322,9 @@ reserved for whole-dataplane selection where a rewrite shim
   `InterfaceUnit.{UnnumberedInet,TargetedBroadcast}`; their advisory is
   covered by `pkg/config/interface_parity_4308_test.go`. Native mapping
   coverage is in `pkg/dataplane/userspace/native_vlan_11434_test.go` and
-  `userspace-dp/src/afxdp/forwarding_build/tests.rs`.
+  `userspace-dp/src/afxdp/forwarding_build/tests.rs`; the #12248 commit
+  advisory is covered by `pkg/config/compiler_native_vlan_12248_test.go`
+  and `pkg/cli/commit_native_vlan_12248_test.go`.
 - **#4309 (DHCP relay overrides, fable-review-167 I-4):** the dhcp-relay
   `overrides` block modeled only `always-broadcast`; three standard
   relay knobs were silently dropped. Added under group `overrides`:
