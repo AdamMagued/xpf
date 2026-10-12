@@ -6259,6 +6259,7 @@ fn forwarding_with_fabric_dmz_10507() -> ForwardingState {
         state: "reachable".to_string(),
         router: true,
         link_local: false,
+        ..Default::default()
     });
 
     // The test destination itself is on-link (same /24 as the DMZ
@@ -6275,6 +6276,7 @@ fn forwarding_with_fabric_dmz_10507() -> ForwardingState {
         state: "reachable".to_string(),
         router: false,
         link_local: false,
+        ..Default::default()
     });
     build_forwarding_state(&snapshot)
 }
@@ -6632,6 +6634,7 @@ fn forwarding_with_fabric_dmz_armed_10507() -> ForwardingState {
         state: "reachable".to_string(),
         router: true,
         link_local: false,
+        ..Default::default()
     });
     snapshot.neighbors.push(NeighborSnapshot {
         interface: "ge-0-0-2".to_string(),
@@ -6642,6 +6645,7 @@ fn forwarding_with_fabric_dmz_armed_10507() -> ForwardingState {
         state: "reachable".to_string(),
         router: false,
         link_local: false,
+        ..Default::default()
     });
     snapshot.policies.push(junos_icmp_ping_permit());
     build_forwarding_state(&snapshot)
@@ -8246,6 +8250,7 @@ fn refresh_skips_hainactive_preserving_recorded_10507() {
             state: "reachable".to_string(),
             router: true,
             link_local: false,
+            ..Default::default()
         });
         snapshot.neighbors.push(NeighborSnapshot {
             interface: "ge-0-0-2".to_string(),
@@ -8256,6 +8261,7 @@ fn refresh_skips_hainactive_preserving_recorded_10507() {
             state: "reachable".to_string(),
             router: false,
             link_local: false,
+            ..Default::default()
         });
         build_forwarding_state(&snapshot)
     };
