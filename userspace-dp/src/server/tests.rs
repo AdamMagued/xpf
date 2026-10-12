@@ -3638,21 +3638,27 @@ fn apply_snapshot_refuses_reused_generation_without_a_digest_9520() {
 }
 
 /// #9520: a partial update that changes content the helper enforces stops the
-/// installed digest vouching for a retry. `update_fabrics` rewrites the stored
-/// snapshot's fabrics and `update_neighbors` changes the coordinator's
-/// neighbours; after either, the full apply the digest came from must not be
-/// accepted again at the same generation. The identical retry BEFORE the partial
-/// update is the positive control: it is ACKed, so the later refusal is the
-/// update's doing.
+/// installed digest vouching for a retry. The fabrics arm changes stored
+/// fabrics; neighbor-replace changes the reconcile set, and neighbor-additive
+/// changes manager state without replacing that stored set. Any arm must refuse
+/// a same-generation replay. The identical retry before a partial update is the
+/// positive control: it is ACKed, so the later refusal is the update's doing.
 ///
-/// RED-on-revert: drop either `content_digest.clear()` and that arm's retry is
-/// ACKed.
+/// RED-on-revert: drop any of the three `content_digest.clear()` calls and
+/// that arm's retry is ACKed (fabrics, neighbor-replace, neighbor-additive).
 #[test]
 fn a_partial_update_stops_the_installed_digest_vouching_for_a_retry_9520() {
     use crate::{
         ConfigSnapshot, FabricSnapshot, NeighborSnapshot, CONFIG_SNAPSHOT_PROTOCOL_VERSION,
         SNAPSHOT_CONTENT_CONFLICT_PREFIX,
     };
+    let initial_neighbors = vec![NeighborSnapshot {
+        ifindex: 5,
+        ip: "10.0.61.1".to_string(),
+        mac: "02:00:00:00:00:01".to_string(),
+        state: "reachable".to_string(),
+        ..NeighborSnapshot::default()
+    }];
     let full_apply = || {
         let mut request = req("apply_snapshot");
         request.snapshot = Some(ConfigSnapshot {
@@ -3661,11 +3667,16 @@ fn a_partial_update_stops_the_installed_digest_vouching_for_a_retry_9520() {
             fib_generation: 5,
             generated_at: chrono::Utc::now(),
             content_digest: "digest-a".to_string(),
+            neighbors: initial_neighbors.clone(),
             ..ConfigSnapshot::default()
         });
         request
     };
-    for arm in ["update_fabrics", "update_neighbors"] {
+    for arm in [
+        "update_fabrics",
+        "update_neighbors_replace",
+        "update_neighbors_additive",
+    ] {
         let state = new_state(ProcessStatus::default());
         let baseline = run_request(state.clone(), full_apply());
         assert!(baseline.ok, "{arm}: baseline apply: {}", baseline.error);
@@ -3676,21 +3687,38 @@ fn a_partial_update_stops_the_installed_digest_vouching_for_a_retry_9520() {
             control.error
         );
 
-        let mut partial = req(arm);
+        let mut partial = req(if arm == "update_fabrics" {
+            "update_fabrics"
+        } else {
+            "update_neighbors"
+        });
         if arm == "update_fabrics" {
             partial.fabrics = Some(vec![FabricSnapshot::default()]);
         } else {
             partial.neighbors = Some(vec![NeighborSnapshot {
                 ifindex: 5,
-                ip: "10.0.61.2".to_string(),
-                mac: "02:00:00:00:00:02".to_string(),
+                ip: if arm == "update_neighbors_replace" {
+                    "10.0.61.2"
+                } else {
+                    "10.0.61.3"
+                }
+                .to_string(),
+                mac: if arm == "update_neighbors_replace" {
+                    "02:00:00:00:00:02"
+                } else {
+                    "02:00:00:00:00:03"
+                }
+                .to_string(),
                 state: "reachable".to_string(),
                 ..NeighborSnapshot::default()
             }]);
-            partial.neighbor_replace = true;
-            partial.neighbor_generation = 1;
+            partial.neighbor_replace = arm == "update_neighbors_replace";
+            if partial.neighbor_replace {
+                partial.neighbor_generation = 1;
+            }
         }
-        let _ = run_request(state.clone(), partial);
+        let response = run_request(state.clone(), partial);
+        assert!(response.ok, "{arm}: partial update: {}", response.error);
         {
             let guard = state.lock().expect("state");
             assert_eq!(
@@ -3698,6 +3726,13 @@ fn a_partial_update_stops_the_installed_digest_vouching_for_a_retry_9520() {
                 Some(""),
                 "{arm}: the partial update must clear the installed digest"
             );
+            if arm == "update_neighbors_additive" {
+                assert_eq!(
+                    guard.snapshot.as_ref().map(|s| s.neighbors.as_slice()),
+                    Some(initial_neighbors.as_slice()),
+                    "additive updates must leave the stored neighbor set unchanged"
+                );
+            }
         }
 
         let replay = run_request(state.clone(), full_apply());
@@ -5508,9 +5543,9 @@ fn update_neighbors_unchanged_set_does_not_rewrite_state_file_12195() {
 }
 
 /// #3771 (M11): a replace must not fold the Go IPv4-mapped IPv6 sampler row
-/// (`family=inet6`, dotted-quad IP) into the stored reconcile snapshot. The
-/// family check in the forwarding build would reject that snapshot and make
-/// every rebind fail closed.
+/// (`family=inet6`, dotted-quad IP) into the stored reconcile snapshot, even
+/// alongside a valid neighbor. The family check in the forwarding build would
+/// reject that snapshot and make every rebind fail closed.
 #[test]
 fn update_neighbors_replace_skips_family_mismatch_and_clears_digest_3771_9520() {
     use crate::{
@@ -5537,20 +5572,32 @@ fn update_neighbors_replace_skips_family_mismatch_and_clears_digest_3771_9520() 
     // #10694 test seam: keep this reconcile proof independent of monitor privileges.
     state.lock().expect("state").afxdp.force_ipsec_sa_ready = true;
 
-    // Exact family/address mismatch emitted when net.IP.String() formats an
-    // IPv4-mapped IPv6 neighbor as a dotted quad.
+    // A valid row changes the filtered set, exercising the store arm as well as
+    // buildability and rebind after the mapped row is excluded.
+    let valid = NeighborSnapshot {
+        interface: "ge-0-0-1".to_string(),
+        ifindex: 7,
+        family: "inet".to_string(),
+        ip: "10.0.0.1".to_string(),
+        mac: "02:00:00:00:00:01".to_string(),
+        state: "reachable".to_string(),
+        ..NeighborSnapshot::default()
+    };
     let mut replace = req("update_neighbors");
     replace.neighbor_replace = true;
     replace.neighbor_generation = 1;
-    replace.neighbors = Some(vec![NeighborSnapshot {
-        interface: "ge-0-0-1".to_string(),
-        ifindex: 7,
-        family: "inet6".to_string(),
-        ip: "192.0.2.1".to_string(),
-        mac: "02:00:00:00:00:01".to_string(),
-        state: "permanent".to_string(),
-        ..NeighborSnapshot::default()
-    }]);
+    replace.neighbors = Some(vec![
+        valid.clone(),
+        NeighborSnapshot {
+            interface: "ge-0-0-1".to_string(),
+            ifindex: 7,
+            family: "inet6".to_string(),
+            ip: "192.0.2.1".to_string(),
+            mac: "02:00:00:00:00:01".to_string(),
+            state: "permanent".to_string(),
+            ..NeighborSnapshot::default()
+        },
+    ]);
     let response = run_request(state.clone(), replace);
     assert!(response.ok, "replace failed: {}", response.error);
 
@@ -5561,12 +5608,16 @@ fn update_neighbors_replace_skips_family_mismatch_and_clears_digest_3771_9520() 
             stored.content_digest.is_empty(),
             "an applied replace with filtered rows must not retain the stale digest"
         );
-        assert!(
-            stored.neighbors.is_empty(),
-            "a family-mismatched replace row must not enter the reconcile snapshot"
+        assert_eq!(
+            stored.neighbors,
+            vec![valid],
+            "only the valid replace row may enter the reconcile snapshot"
         );
         assert!(
-            guard.afxdp.validate_snapshot_buildable(Some(stored)).is_ok(),
+            guard
+                .afxdp
+                .validate_snapshot_buildable(Some(stored))
+                .is_ok(),
             "the folded snapshot must remain buildable"
         );
     }
@@ -5595,9 +5646,52 @@ fn update_neighbors_replace_skips_family_mismatch_and_clears_digest_3771_9520() 
     assert!(rebind.ok, "rebind failed: {}", rebind.error);
 }
 
+/// #3771 (M11): a mapped-only replace with an empty digest and an empty stored
+/// neighbor set changes neither the reconcile input nor the digest, so it must
+/// not cause a state-file write.
+#[test]
+fn update_neighbors_mismatched_replace_with_empty_digest_does_not_write_12195() {
+    use crate::{ConfigSnapshot, NeighborSnapshot, CONFIG_SNAPSHOT_PROTOCOL_VERSION};
+    let state = new_state(ProcessStatus {
+        forwarding_armed: true,
+        last_snapshot_generation: 1,
+        last_fib_generation: 1,
+        capabilities: forwarding_caps(),
+        ..ProcessStatus::default()
+    });
+    state.lock().expect("state").snapshot = Some(ConfigSnapshot {
+        version: CONFIG_SNAPSHOT_PROTOCOL_VERSION,
+        generation: 1,
+        fib_generation: 1,
+        generated_at: chrono::Utc::now(),
+        content_digest: String::new(),
+        map_pins: ok_map_pins(),
+        ..ConfigSnapshot::default()
+    });
 
+    let state_file = unique_state_file("neighbor-mismatch-nochurn");
+    let _ = std::fs::remove_file(&state_file);
+    let mut replace = req("update_neighbors");
+    replace.neighbor_replace = true;
+    replace.neighbor_generation = 1;
+    replace.neighbors = Some(vec![NeighborSnapshot {
+        interface: "ge-0-0-1".to_string(),
+        ifindex: 7,
+        family: "inet6".to_string(),
+        ip: "192.0.2.1".to_string(),
+        mac: "02:00:00:00:00:01".to_string(),
+        state: "permanent".to_string(),
+        ..NeighborSnapshot::default()
+    }]);
+    let response = run_request_on_file(state, replace, &state_file);
+    assert!(response.ok, "replace failed: {}", response.error);
+    assert!(
+        !std::path::Path::new(&state_file).exists(),
+        "an empty digest and unchanged filtered set must not write state"
+    );
+    let _ = std::fs::remove_file(&state_file);
+}
 
-/// #9803: an `update_fabrics` carrying a new fabric parent ifindex, followed by
 /// a full apply with the same rows, must end with the fabric bindings replanned.
 /// The helper's `update_fabrics` arm stores the rows in its retained snapshot
 /// without replanning, so the next full apply compares same-plan (stored and
