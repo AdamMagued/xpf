@@ -536,11 +536,9 @@ func (d *Daemon) loadAndBootstrapConfig() (bool, error) {
 // rather than tearing the runtime out from under the teardown (#5807).
 // replayFirstCommitHostAuthCloseout12169 resumes a first-commit rollback's
 // durable host-auth retirement obligation after a process crash. The store
-// writes that obligation before PromoteRollback; an empty never-committed
-// active config plus no pending confirm therefore identifies exactly the
-// bootstrap state whose owners may have been interrupted. A newer active
-// config is already reconciled by the ordinary boot apply and supersedes the
-// old obligation, so it is cleared rather than replayed against live users.
+// writes that obligation before PromoteRollback; replay retires every owner
+// and re-drives sshd reload before discharging it, since the record does not
+// encode which closeout step had completed before the crash.
 func (d *Daemon) replayFirstCommitHostAuthCloseout12169() error {
 	if d.store == nil {
 		return nil
@@ -570,6 +568,18 @@ func (d *Daemon) replayFirstCommitHostAuthCloseout12169() error {
 		// turn visible degradation into permanent credential residue.
 		slog.Error("bootstrap replay of first-commit host-auth closeout is DEGRADED; retirement will retry on next boot",
 			"generation", record.Generation, "err", err)
+		return nil
+	}
+	// The record has no per-owner progress marker. A crash can happen after the
+	// drop-in unlink but before sshd reload, so every successful replay must
+	// reload sshd before it can clear the only durable obligation. Repeated
+	// reloads are idempotent and cover the unlink/reload crash boundary.
+	out, reloadErr := sshdReloadCmd()
+	d.noteSSHDReloadResult(reloadErr)
+	if reloadErr != nil {
+		slog.Error("bootstrap replay could not reload sshd; retirement will retry on next boot",
+			"generation", record.Generation, "err", reloadErr,
+			"output", strings.TrimSpace(string(out)))
 		return nil
 	}
 	if err := d.store.CompleteFirstCommitHostAuthCloseout(record.Generation); err != nil {

@@ -91,6 +91,8 @@ func TestFirstCommitRollbackCrashMidCloseoutReplaysOnRestart12169(t *testing.T) 
 		t.Fatal(err)
 	}
 	d := &Daemon{store: restarted, applySem: semaphore.NewWeighted(1), opts: Options{ConfigFile: s.ConfigPath(), NoDataplane: true}}
+	sshdReloads := 0
+	sshdReloadCmd = func() ([]byte, error) { sshdReloads++; return nil, nil }
 	oldNodeID := hasNodeIDFileFn
 	hasNodeIDFileFn = func() bool { return false }
 	t.Cleanup(func() { hasNodeIDFileFn = oldNodeID })
@@ -103,6 +105,9 @@ func TestFirstCommitRollbackCrashMidCloseoutReplaysOnRestart12169(t *testing.T) 
 	d.applyBodyForTest = func(*config.Config) { applies++ }
 	if err := d.setupDataplaneAndInitialConfig(); err != nil {
 		t.Fatal(err)
+	}
+	if sshdReloads != 1 {
+		t.Fatalf("bootstrap retirement replay sshd reloads=%d, want exactly one reload before clearing the record", sshdReloads)
 	}
 	if applies != 0 {
 		t.Fatalf("bootstrap retirement replay unexpectedly invoked ordinary config apply %d times", applies)
