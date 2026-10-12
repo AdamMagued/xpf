@@ -150,7 +150,7 @@ type Manager struct {
 	// episodes, oldest-first; helperCrashEpisodesTotal counts those episodes
 	// independently of the ring. helperCrashUnexpectedExitsTotal is the
 	// monotonic daemon-lifetime count exported by the crash counter, incremented
-	// for every unexpected exit even while an episode remains open.
+	// when a helper that reached readiness exits unexpectedly.
 	helperCrashEpisodes             []HelperCrashEpisode
 	helperCrashEpisodesTotal        int
 	helperCrashUnexpectedExitsTotal int

@@ -696,10 +696,14 @@ would blackhole every flow handed to it.
   still attached. A fast restart reopens transit without changing RG weight.
   When restart backoff reaches its cap, a dedicated full-cost monitor debt
   takes a DATA RG's local weight to 0 so even a non-preempt incumbent yields.
-  RG0 is excluded: keeping the config-authority group primary preserves the
-  lone-node write path because RG0 does not preempt. A landed supervisor retry
-  clears live HA debt while its episode remains visible until the quiet window
-  expires; ordinary Compile recovery closes the episode immediately.
+  RG0 is excluded: it is the config-authority group with no data VIP, and
+  assigning it full debt would trigger the read-only lock and pending-commit
+  auto-confirm on demotion. That can lock a lone node with no owner anywhere.
+  RG0 stays primary and writable so an operator can repair the loop in-band;
+  data RGs still resign.
+  A landed supervisor retry clears live HA debt while its episode remains
+  visible until the quiet window expires; ordinary Compile recovery closes the
+  episode immediately.
 - **Operator surface (#7250).** `show chassis forwarding` renders the
   crash block, via `pkg/fwdstatus` so the in-process CLI and the remote
   `cli` binary share one implementation. It was chosen over the other
@@ -762,8 +766,10 @@ together, and the completed episode is added to the bounded history ring.
 History across episodes is available independently of the live record:
 `HelperCrashHistory` returns the retained completed episodes and their
 unbounded episode total. The `xpf_dataplane_helper_crash_episodes_total`
-Prometheus counter instead increments on every unexpected exit, so a sustained
-crash loop remains visible even when no quiet window completes an episode.
+Prometheus counter instead increments when a helper that reached readiness
+exits unexpectedly, so a sustained crash loop remains visible even when no
+quiet window completes an episode. Pre-readiness failures are excluded; their
+failed restart attempts remain represented in the helper's restart state.
 These are separate operator views: the ring provides recent episode details;
 the counter provides the monotonic alert signal.
 

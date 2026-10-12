@@ -1,6 +1,12 @@
 package daemon
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+	"unsafe"
+
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+)
 
 // #8397: the accessor that feeds xpf_dataplane_helper_crash_episodes_total.
 //
@@ -37,5 +43,35 @@ func TestHelperCrashEpisodesAccessorIsSafeOnANilDaemon8397(t *testing.T) {
 	var d *Daemon
 	if got := d.helperCrashEpisodes(); got != 0 {
 		t.Errorf("helperCrashEpisodes on a nil daemon = %d, want 0", got)
+	}
+}
+
+func TestHelperCrashEpisodesTracksPublishedAdapterExitCount12159(t *testing.T) {
+	// A real Manager process requires loading the privileged BPF shim. This
+	// wiring test seeds its in-memory exit counter instead; helper supervisor
+	// lifecycle is covered in pkg/dataplane/userspace. There are no Manager
+	// goroutines here, so the isolated counter write cannot race a reader.
+	mgr := dpuserspace.New()
+	adapter := dpuserspace.NewLegacyDataPlaneAdapter(mgr)
+	var d Daemon
+	d.dpCell.Store(&dpSlot{v: adapter})
+
+	counter := reflect.ValueOf(mgr).Elem().FieldByName("helperCrashUnexpectedExitsTotal")
+	if !counter.IsValid() || counter.Kind() != reflect.Int || !counter.CanAddr() {
+		t.Fatal("Manager exit-counter fixture no longer matches its field")
+	}
+	counter = reflect.NewAt(counter.Type(), unsafe.Pointer(counter.UnsafeAddr())).Elem()
+
+	for _, want := range []int{9, 13} {
+		counter.SetInt(int64(want))
+		if got := mgr.HelperCrashExitCount(); got != want {
+			t.Fatalf("Manager exit count=%d after fixture set, want %d", got, want)
+		}
+		if got := d.helperCrashEpisodes(); got != want {
+			t.Fatalf("daemon metric accessor=%d, want published Manager exit count %d", got, want)
+		}
+	}
+	if _, recovered := mgr.HelperCrashHistory(); recovered != 0 {
+		t.Fatalf("fixture has %d completed history episodes, want 0 to distinguish the exit counter", recovered)
 	}
 }

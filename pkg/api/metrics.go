@@ -2092,9 +2092,9 @@ func sortedKeys6800[V any](m map[string]V) []string {
 // xpf_dataplane_helper_crash_episodes_total.
 // Extracted from Collect rather than left inline so it can be driven on its
 // own. The behaviour worth binding is a three-way distinction: a positive
-// unexpected-exit count emits its value, 0 unexpected exits emits 0, and NO
-// SOURCE emits nothing at all — because a daemon with no dataplane accessor
-// knows "unknown", not "never crashed".
+// readiness-reached-helper exit count emits its value, 0 such exits emits 0,
+// and NO SOURCE emits nothing at all — because a daemon with no dataplane
+// accessor knows "unknown", not "never crashed".
 func (c *xpfCollector) collectHelperCrashEpisodes(ch chan<- prometheus.Metric) {
 	if c.srv == nil || c.srv.helperCrashEpisodesFn == nil {
 		return

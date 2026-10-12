@@ -441,11 +441,17 @@ func TestSustainedPostReadyCrashLoopIncrementsCounter12159(t *testing.T) {
 	_, episodes := m.HelperCrashHistory()
 	t.Logf("8s sustained post-ready loop: starts=%d unexpected exits=%d completed episodes=%d mid-run exits=%d",
 		starts, exits, episodes, midCount)
-	if starts < 16 {
-		t.Fatalf("premise: only %d helper starts, want at least 16", starts)
+	// RB1: relational assertions only — no absolute wall-clock count. Each
+	// crash-restart cycle costs the backoff delay plus ~100ms of readiness
+	// polling, so the expected starts in 8s sits within one cycle of any
+	// fixed threshold and millisecond drift reds it (starts=15 vs 16).
+	// Eight starts still proves the loop ran well past the 640ms backoff
+	// cap (~2.7s expected) with several capped cycles behind it.
+	if starts < 8 {
+		t.Fatalf("premise: only %d helper starts, want at least 8", starts)
 	}
-	if exits < 15 || exits < starts-1 {
-		t.Fatalf("unexpected exits=%d for %d starts, want 15+ and all but at most the final live child",
+	if exits < starts-1 {
+		t.Fatalf("unexpected exits=%d for %d starts, want all but at most the final live child",
 			exits, starts)
 	}
 	if exits > starts {

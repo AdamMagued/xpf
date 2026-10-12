@@ -256,16 +256,18 @@ func (c *xpfCollector) initControlPlaneDescriptors() {
 			"is `show system services`, which is reached OVER the gRPC listener.",
 		[]string{"surface", "address", "state"}, nil,
 	)
-	// #8397: a COUNTER of unexpected userspace-helper exits. It is deliberately
-	// independent of the bounded completed-episode ring: a sustained crash loop
-	// may never remain quiet long enough to close an episode.
+	// #8397: a COUNTER of unexpected exits by userspace helpers that reached
+	// readiness. It is deliberately independent of the bounded completed-
+	// episode ring: a sustained crash loop may never remain quiet long enough
+	// to close an episode.
 	c.helperCrashEpisodesTotal = prometheus.NewDesc(
 		"xpf_dataplane_helper_crash_episodes_total",
-		"Total unexpected userspace-dataplane-helper exits observed by this "+
-			"daemon (#8397). Monotonic within a daemon lifetime and reset by a "+
-			"daemon restart. It increments on every unexpected exit, including "+
-			"during a sustained crash loop before any recovery episode is "+
-			"journaled. Per-episode detail is on `show chassis forwarding`.",
+		"Total unexpected exits of readiness-reached userspace-dataplane "+
+			"helpers observed by this daemon (#8397). Monotonic within a daemon "+
+			"lifetime and reset by a daemon restart. It increments on each "+
+			"unexpected exit after readiness, including during a sustained crash "+
+			"loop before any recovery episode is journaled. Pre-readiness failures "+
+			"are excluded. Per-episode detail is on `show chassis forwarding`.",
 		nil, nil,
 	)
 	// #8447: whether the userspace dataplane is FORWARDING at all.

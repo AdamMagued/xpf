@@ -64,9 +64,10 @@ Three things about it are easy to break:
   `RestartPending` guard, unlike the next-restart deadline: a past attempt is a
   fact, a future deadline is a promise.
 - The Prometheus counter `xpf_dataplane_helper_crash_episodes_total` counts
-  unexpected exits immediately, including a sustained loop whose quiet window
-  has not completed an episode. The bounded history ring separately provides
-  completed-episode detail.
+  unexpected exits of helpers that reached readiness, including a sustained
+  loop whose quiet window has not completed an episode. Pre-readiness failures
+  are excluded. The bounded history ring separately provides completed-episode
+  detail.
 - The headline has five named states: four combinations of (`RestartPending` x
   `CrashLooping`), plus the recovered-running state. The retry state wins while
   the helper is running; for the other four, `RestartPending` picks the

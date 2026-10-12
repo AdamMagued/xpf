@@ -9,9 +9,10 @@ import (
 
 // #8397: xpf_dataplane_helper_crash_episodes_total.
 //
-// This is a COUNTER of unexpected exits, not a gauge of the open episode or
-// the bounded recovery ring. A persistent loop must remain visible even when
-// no quiet window has completed an episode.
+// This is a COUNTER of unexpected exits of readiness-reached helpers, not a
+// gauge of the open episode or the bounded recovery ring. A sustained loop
+// after readiness must remain visible even when no quiet window has completed
+// an episode; failures before readiness are excluded.
 
 func collectCrashEpisodes8397(t *testing.T, c *xpfCollector) (float64, bool) {
 	t.Helper()

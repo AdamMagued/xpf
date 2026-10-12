@@ -3,10 +3,10 @@ package userspace
 import "time"
 
 // #8397 keeps two distinct views: a bounded ring of completed recovery
-// episodes for the operator, and a monotonic counter of every unexpected
-// helper exit for Prometheus. A persistent crash loop may not complete an
-// episode during its quiet window, so the metric must not be derived from the
-// ring.
+// episodes for the operator, and a monotonic counter of unexpected exits of
+// helpers that reached readiness for Prometheus. A persistent crash loop may
+// not complete an episode during its quiet window, so the metric must not be
+// derived from the ring.
 
 // WHY A SEPARATE STORE AND NOT MORE FIELDS ON THE RECORD. The live record's
 // contract is "the current crash episode"; its fields are all cleared together
@@ -19,13 +19,14 @@ import "time"
 //
 //   - WHERE IT LIVES: both are on the Manager and reset on daemon restart.
 //     The completed-episode ring is diagnostic detail; the cumulative exit
-//     counter is the alert signal and increments immediately on every
-//     unexpected helper exit.
+//     counter is the alert signal and increments when a readiness-reached
+//     helper exits unexpectedly.
 //   - RENDERED OR QUERYABLE: BOTH, but minimally. `show chassis forwarding` is
 //     already dense, so the history contributes ONE summary row: the number of
 //     completed episodes and the age of the oldest retained one. Prometheus
-//     observes the cumulative exit counter, including while a sustained loop
-//     has not yet completed a quiet window.
+//     observes the cumulative counter, including during a post-readiness
+//     sustained loop before any episode is completed. Pre-readiness failures
+//     are excluded.
 
 // helperCrashHistoryDepth bounds retained episode details. A flapping helper
 // must not grow this without limit; the separate episode total and unexpected-
