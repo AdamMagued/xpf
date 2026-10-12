@@ -22,24 +22,28 @@ import (
 // still blocked, and the in-flight process holds state only it can repair),
 // so the fence lives IN the revocation operations themselves:
 //
-//   - PRE-mutation: re-read the LIVE active config; if it desires the
-//     credential, abstain (skip the revocation, retain markers). The live
-//     applier owns convergence; the stale owner merely must not destroy it.
+//   - PRE-mutation: re-read the LIVE active config before revoking a
+//     credential; if it desires the credential, abstain and retain markers.
+//     A stale deprovision owner's live-login restore instead acquires
+//     applySem before applying, re-reads live intent under the permit, and
+//     keeps the permit through owner return.
 //   - POST-mutation (blocking mutations only — `chpasswd`, sshd reload): the
 //     process may have been spawned pre-promotion and resumed
-//     post-promotion. Re-read live and synchronously converge before dropping
-//     markers or returning. Every live-password repair in login deprovision
-//     reacquires applySem and revalidates before provenance cleanup, relocking
-//     a removed account. Root repairs via repairStalePasswordLock12169 also
+//     post-promotion. Password repairs made before settlement can therefore
+//     write stale state; settlement reacquires applySem, compares with live
+//     intent, and repairs or relocks before provenance cleanup. It retains the
+//     permit through cleanup. If a stale password write lands after removal
+//     and a password-less re-add, settlement restores provenance before the
+//     declarative D2 lock. Root repairs via repairStalePasswordLock12169 also
 //     settle under applySem; the direct pre-lock root repair retains markers
 //     for a later apply rather than providing that settlement guarantee.
 //
-// Under applySem the passed config IS the live config, so every check below
-// is a no-op on the healthy path (one RLock + slice scan); the fence only
-// bites for a stale owner running without the semaphore after its rollback
-// returned. All helpers are nil-safe: a nil Daemon or nil store (unit tests
-// driving reconcilers directly) disables the fence and preserves the legacy
-// stand-alone behavior.
+// Under applySem the passed config IS the live config, so checks are a no-op
+// on the healthy path (one RLock + slice scan). Stale-owner restores and
+// settlements acquire or retain the permit across the mutation, preventing
+// promotion from changing the intent until the owner returns or cleans up.
+// All helpers are nil-safe: a nil Daemon or nil store (unit tests driving
+// reconcilers directly) disables the fence and preserves stand-alone behavior.
 
 // liveConfig12169 returns the current live active config, or nil when there
 // is no store to read it from (nil-safe for direct reconciler tests).

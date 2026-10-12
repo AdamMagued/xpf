@@ -632,6 +632,40 @@ func (d *Daemon) reconcileAbsentLoginUsers(cfg *config.Config) (retErr error) {
 // commit result too, so a failed revocation fails the commit.
 func (d *Daemon) deprovisionLoginUser(name string) (retErr error) {
 	fail := func(e error) { retErr = errors.Join(retErr, e) }
+	var releaseApply func()
+	defer func() {
+		if releaseApply != nil {
+			releaseApply()
+		}
+	}()
+	acquireApply := func() error {
+		if releaseApply != nil || d == nil || d.applySem == nil {
+			return nil
+		}
+		// A normal applier already holds applySem and never deprovisions a
+		// user its active config desires. Only a stale owner can reach this
+		// restore branch, so this acquisition cannot re-enter the semaphore.
+		if err := d.applySem.Acquire(context.Background(), 1); err != nil {
+			return err
+		}
+		releaseApply = func() { d.applySem.Release(1) }
+		return nil
+	}
+	restoreLiveLogin := func() error {
+		if err := acquireApply(); err != nil {
+			return err
+		}
+		live := d.liveConfig12169()
+		if live == nil || live.System.Login == nil {
+			return nil
+		}
+		for _, user := range live.System.Login.Users {
+			if user != nil && user.Name == name {
+				return d.applySystemLogin(live)
+			}
+		}
+		return nil
+	}
 	curUID, found, err := lookupUIDErr(name)
 	if err != nil {
 		// /etc/passwd could not be READ (transient mount/permission/I/O
@@ -657,17 +691,18 @@ func (d *Daemon) deprovisionLoginUser(name string) (retErr error) {
 		// revoke. A concurrent commit may be creating this same live account,
 		// so fence marker cleanup too and converge the re-presented account.
 		if _, stillDesired := d.liveDesiredLoginUser12169(name); stillDesired {
-			if live := d.liveConfig12169(); live != nil {
-				fail(d.applySystemLogin(live))
+			if err := restoreLiveLogin(); err != nil {
+				fail(err)
 			}
 			return retErr
 		}
 		_ = forgetProvenance(name)
 		if _, stillDesired := d.liveDesiredLoginUser12169(name); stillDesired {
 			staleRevocationSuperseded12169("restore-user-after-marker-cleanup", name)
-			if live := d.liveConfig12169(); live != nil {
-				fail(d.applySystemLogin(live))
+			if err := restoreLiveLogin(); err != nil {
+				fail(err)
 			}
+			return retErr
 		}
 		return retErr
 	}
@@ -700,13 +735,10 @@ func (d *Daemon) deprovisionLoginUser(name string) (retErr error) {
 	}
 
 	// The timed-out first-commit closeout owner can resume after a later
-	// commit has promoted the same account. Re-read the live intent before
-	// revoking and after the blocking chpasswd operation: if the live config
-	// owns this account, keep/re-apply its password and retain its markers.
-	// Each live-password repair belongs to a stale owner: normal appliers
-	// hold applySem and never deprovision a user their active config desires.
-	// Even an errored repair may write shadow, so always settle under applySem
-	// afterward and retain it through marker cleanup.
+	// commit has promoted the same account. Re-read live intent before
+	// revoking. Live-login restores acquire applySem before applying and keep
+	// it through owner return; password repairs already in flight settle under
+	// applySem afterward, retaining the permit through provenance cleanup.
 	liveUser, liveDesired := d.liveDesiredLoginUser12169(name)
 	if ownsPassword {
 		cur, ok := currentShadowHash(name)
@@ -718,10 +750,11 @@ func (d *Daemon) deprovisionLoginUser(name string) (retErr error) {
 		}
 		if liveDesired && liveUser.EncryptedPassword.Reveal() != "" {
 			staleRevocationSuperseded12169("lock-password", name)
+			repairedHash := liveUser.EncryptedPassword.Reveal()
 			repairErr := d.reconcileUserPassword(&liveUser)
-			latest, liveNow, release, fenceErr := d.settleStaleLoginPassword12169(name, curUID)
+			latest, liveNow, release, fenceErr := d.settleStaleLoginPassword12169(name, curUID, repairedHash)
 			if release != nil {
-				defer release()
+				releaseApply = release
 			}
 			fail(repairErr)
 			fail(fenceErr)
@@ -735,10 +768,11 @@ func (d *Daemon) deprovisionLoginUser(name string) (retErr error) {
 			if current, stillDesired := d.liveDesiredLoginUser12169(name); stillDesired &&
 				current.EncryptedPassword.Reveal() != "" {
 				staleRevocationSuperseded12169("lock-password", name)
+				repairedHash := current.EncryptedPassword.Reveal()
 				repairErr := d.reconcileUserPassword(&current)
-				latest, liveNow, release, fenceErr := d.settleStaleLoginPassword12169(name, curUID)
+				latest, liveNow, release, fenceErr := d.settleStaleLoginPassword12169(name, curUID, repairedHash)
 				if release != nil {
-					defer release()
+					releaseApply = release
 				}
 				fail(repairErr)
 				fail(fenceErr)
@@ -764,10 +798,11 @@ func (d *Daemon) deprovisionLoginUser(name string) (retErr error) {
 				if current, stillDesired := d.liveDesiredLoginUser12169(name); stillDesired &&
 					current.EncryptedPassword.Reveal() != "" {
 					staleRevocationSuperseded12169("repair-password", name)
+					repairedHash := current.EncryptedPassword.Reveal()
 					repairErr := d.reconcileUserPassword(&current)
-					latest, liveNow, release, fenceErr := d.settleStaleLoginPassword12169(name, curUID)
+					latest, liveNow, release, fenceErr := d.settleStaleLoginPassword12169(name, curUID, repairedHash)
 					if release != nil {
-						defer release()
+						releaseApply = release
 					}
 					fail(repairErr)
 					fail(fenceErr)
@@ -805,14 +840,11 @@ func (d *Daemon) deprovisionLoginUser(name string) (retErr error) {
 			// allowing this owner to complete.
 			if current, stillDesired := d.liveDesiredLoginUser12169(name); stillDesired &&
 				len(current.SSHKeys) > 0 {
-				staleRevocationSuperseded12169("repair-user-keys", name)
-				if live := d.liveConfig12169(); live != nil {
-					if err := d.applySystemLogin(live); err != nil {
-						fail(err)
-						return
-					}
+				if err := restoreLiveLogin(); err != nil {
+					fail(err)
+					return
 				}
-				liveUser, liveDesired = current, true
+				liveUser, liveDesired = d.liveDesiredLoginUser12169(name)
 			} else if err := removeProvenanceMarker(provisionedKeysDir(), name); err != nil {
 				fail(err)
 				return
@@ -825,10 +857,9 @@ func (d *Daemon) deprovisionLoginUser(name string) (retErr error) {
 	// now-empty key list drops the independent key marker.
 	if _, stillDesired := d.liveDesiredLoginUser12169(name); stillDesired {
 		// A promotion can race marker cleanup after the credential checks.
-		// Re-apply the whole live login state so a credential and its
-		// provenance are restored together before this owner returns.
-		if live := d.liveConfig12169(); live != nil {
-			fail(d.applySystemLogin(live))
+		// Re-apply the live login under applySem before this owner returns.
+		if err := restoreLiveLogin(); err != nil {
+			fail(err)
 		}
 		return retErr
 	}
@@ -839,8 +870,8 @@ func (d *Daemon) deprovisionLoginUser(name string) (retErr error) {
 	fail(forgetProvenance(name))
 	if _, stillDesired := d.liveDesiredLoginUser12169(name); stillDesired {
 		staleRevocationSuperseded12169("restore-user-after-marker-cleanup", name)
-		if live := d.liveConfig12169(); live != nil {
-			fail(d.applySystemLogin(live))
+		if err := restoreLiveLogin(); err != nil {
+			fail(err)
 		}
 		return retErr
 	}
@@ -850,10 +881,12 @@ func (d *Daemon) deprovisionLoginUser(name string) (retErr error) {
 }
 
 // settleStaleLoginPassword12169 revalidates a stale owner's password repair.
-// Only an abandoned owner can reach it; a normal applier already holding
-// applySem never repairs a removed user to a conflicting live password.
-// The caller must retain the returned permit through provenance cleanup.
-func (d *Daemon) settleStaleLoginPassword12169(name string, uid int) (config.LoginUser, bool, func(), error) {
+// repairedHash identifies the hash this owner may have written, allowing a
+// password-less re-add to reclaim provenance before the D2 lock.
+// Only an abandoned owner can reach it; normal appliers holding applySem
+// cannot deprovision a user their active config desires. The caller retains
+// the returned permit through provenance cleanup.
+func (d *Daemon) settleStaleLoginPassword12169(name string, uid int, repairedHash string) (config.LoginUser, bool, func(), error) {
 	var release func()
 	if d != nil && d.applySem != nil {
 		if err := d.applySem.Acquire(context.Background(), 1); err != nil {
@@ -864,6 +897,13 @@ func (d *Daemon) settleStaleLoginPassword12169(name string, uid int) (config.Log
 
 	live, desired := d.liveDesiredLoginUser12169(name)
 	if desired {
+		if hash, ok := currentShadowHash(name); ok &&
+			hash == repairedHash && live.EncryptedPassword.Reveal() != repairedHash {
+			if err := errors.Join(markProvisioned(name, uid), markPasswordProvisioned(name, uid)); err != nil {
+				return live, true, release, fmt.Errorf(
+					"restore password provenance for stale repair of %s: %w", name, err)
+			}
+		}
 		return live, true, release, d.reconcileUserPassword(&live)
 	}
 
