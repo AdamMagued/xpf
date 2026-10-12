@@ -860,27 +860,48 @@ per-path:
   or the previous hash while the candidate is not yet durable; unrelated hashes
   are stale and dropped. An already-expired deadline rolls back to the prev
   tree (including the Item 1b committed=0 marker on a first-commit target);
-  a future deadline re-arms the timer for its remaining duration.
-  Each arm also persists the wall time and `/proc/sys/kernel/random/boot_id`
-  captured at arm. During recovery the daemon samples the clock-skew alarm
-  against the loaded config; an active alarm makes recovery roll back to the
-  previous config instead of re-arming a wall-clock deadline that may have
-  shifted during downtime. The boot ID and wall timestamp are diagnostic
-  provenance, not a monotonic deadline that can survive reboot.
-  Every confirmation path (`clearPendingConfirmLocked` — plain commit / HA sync /
-  explicit confirm / demotion) and timeout rollback (`PromoteRollback`) remove
-  `confirm.json`; a nested `commit confirmed` replaces it with the extended
-  deadline. Removal is a **durable transition** too (#4864): `DeleteConfirm`
-  unlinks `confirm.json` and fsyncs the parent directory
-  (`fsatomic.SyncDir`), matching `WriteConfirm` — a bare `os.Remove` is not
-  durable, so a crash before the dirent removal flushes could replay a stale
-  record and revert an already-confirmed config. The unlink and dir fsync route
-  through package durability seams (`rbRemove`/`rbSyncDir`) so a dropped dir
-  sync fails a test RED. A clean restart inside the window keeps the hatch
-  (Junos parity: the pending confirm persists across reboot and rolls back if
-  not confirmed); the former `writeActive`-to-record loss window is closed
-  (#10696).
+  a future deadline re-arms the timer for its remaining duration, bounded by
+  the original duration recorded at arm time. Each arm also persists the wall
+  time and `/proc/sys/kernel/random/boot_id` captured at arm. During recovery,
+  the daemon's active clock-skew alarm still causes rollback; independently,
+  when the current wall clock precedes a non-zero `ArmedAt`, recovery treats
+  that as a backward step and rolls back even on standalone nodes. Downtime
+  elapsed with an untrusted clock cannot be reconstructed, so this fails
+  closed instead of trusting or extending the wall-clock deadline. Older
+  records without `ArmedAt` are capped at the maximum accepted confirm window.
+  The boot ID remains diagnostic provenance; neither value is a monotonic
+  deadline that can survive reboot.
 
+  Before a FIRST rollback writes the never-committed active marker (#12167),
+  it first persists `confirm.json` with a past-deadline sentinel. If the
+  subsequent teardown-marker write fails or the process exits, the retained
+  record still proves the rollback across clock correction or a cleared
+  #10875 alarm. A failed sentinel write does not abort recovery: the store
+  rolls back in memory, marks persistence degraded and teardown owed, and
+  retains the original active marker until retry writes the sentinel before
+  the active rollback marker. Retries start after 1 second and back off
+  exponentially to a 60-second cap.
+
+  If `commit confirmed` runs while the sentinel is still owed, its provisional
+  `PreviousDeadline` binds to the in-memory past-dated intent, not the original
+  future deadline still on disk. A restart with the clock still behind thus
+  completes the owed rollback instead of re-arming the abandoned FIRST config
+  for roughly 720 hours. Once a newer `commit confirmed` is promoted, a sync
+  durably applies its replacement, or a timeout rollback is durably written,
+  the old intent is cleared so retry cannot overwrite a newer confirm record.
+  Every confirmation path
+  (`clearPendingConfirmLocked` — plain commit / HA sync / explicit confirm /
+  demotion) and timeout rollback (`PromoteRollback`) remove `confirm.json`;
+  a nested `commit confirmed` replaces it with the extended deadline.
+  Removal is a **durable transition** too (#4864): `DeleteConfirm` unlinks
+  `confirm.json` and fsyncs the parent directory (`fsatomic.SyncDir`),
+  matching `WriteConfirm` — a bare `os.Remove` is not durable, so a crash
+  before the dirent removal flushes could replay a stale record and revert an
+  already-confirmed config. The unlink and dir fsync route through package
+  durability seams (`rbRemove`/`rbSyncDir`) so a dropped dir sync fails a
+  test RED. A clean restart inside the window keeps the hatch (Junos parity:
+  the pending confirm persists across reboot and rolls back if not confirmed);
+  the former `writeActive`-to-record loss window is closed (#10696).
   **The re-armed timer dispatches into a HALF-BUILT daemon (#6739).**
   `recoverPendingConfirmLocked` runs at the tail of `Load`, which the daemon
   calls in startup **phase 1**; the daemon's managers are not constructed until
@@ -925,12 +946,13 @@ per-path:
   policy-absent (fail-OPEN) on boot. `ReadConfirm` therefore (1) rejects a
   null/array/scalar decrypted body via `requireJSONObject` BEFORE
   decoding, and (2) rejects a decoded record with a zero `Deadline` or a
-  nil `PrevTree` — an object check alone still accepts `{}`. A
-  legitimately-written record always carries a real future deadline
-  (`time.Now().Add(window)`) and a non-nil `PrevTree`
-  (`confirmPrevTree = s.active.Clone()`, non-nil even for a first commit —
-  `FirstCommit` distinguishes the empty-bootstrap case), so valid records
-  round-trip unchanged. A rejected read is fail-CLOSED:
+  nil `PrevTree` — an object check alone still accepts `{}`. Every
+  valid record has a non-zero deadline (ordinary arms use
+  `time.Now().Add(window)`; #12167 rollback recovery intentionally writes a
+  past sentinel) and a non-nil `PrevTree` (`confirmPrevTree =
+  s.active.Clone()`, non-nil even for a first commit — `FirstCommit`
+  distinguishes the empty-bootstrap case), so valid records round-trip
+  unchanged. A rejected read is fail-CLOSED:
   `recoverPendingConfirmLocked` already logs the read error and skips
   restoration (keeping the loaded active config, never panicking), so a
   degenerate record can no longer drive a bogus empty rollback. A

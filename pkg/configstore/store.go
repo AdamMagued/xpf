@@ -239,6 +239,10 @@ type Store struct {
 	// superseding commit/sync — via clearConfirmResolutionPendingLocked. Default
 	// false; only the degrade-not-fail resolution paths set it.
 	confirmResolvePendingPersist bool
+	// firstCommitRecoveryIntent retains the past-deadline FIRST rollback
+	// sentinel when its initial write failed. The retry publishes it before
+	// the active marker; clear it when newer durable state supersedes rollback.
+	firstCommitRecoveryIntent *confirmRecord
 
 	// firstCommitTeardownOwed records that a FIRST commit-confirmed window
 	// expired during daemon downtime and its daemon-side takeover teardown is
@@ -1195,6 +1199,8 @@ func (s *Store) SyncApply(content string, chassisPreserve func(*config.ConfigTre
 			// convergence — so consume any stale defer without a second
 			// attempt (and second confirm_remove_error journal) for it.
 			s.confirmResolvePendingPersist = false
+			// The synced replacement is durable; clear the older FIRST intent as defense in depth.
+			s.firstCommitRecoveryIntent = nil
 		} else {
 			// Finalize any removal deferred by an EARLIER failed resolution
 			// write (e.g. a prior rollback whose persist failed): the synced

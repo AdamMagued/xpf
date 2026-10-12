@@ -591,8 +591,14 @@ func (s *Store) commitConfirmedLocked(minutes int, principal string) (*config.Co
 		// A prior rollback may still be owed. Bind both generations to their
 		// own deadlines: the new arm's provisional deadline belongs to the
 		// candidate, while the old record's effective deadline belongs to the
-		// currently active file.
-		previous, err := s.db.ReadConfirm()
+		// currently active file. If a failed FIRST sentinel write left an
+		// in-memory recovery intent, it is newer than the untouched on-disk
+		// record and carries the past deadline that must remain bound here.
+		previous := s.firstCommitRecoveryIntent
+		var err error
+		if previous == nil {
+			previous, err = s.db.ReadConfirm()
+		}
 		if err != nil || previous == nil {
 			if err == nil {
 				err = fmt.Errorf("pending rollback record is absent")
@@ -674,8 +680,10 @@ func (s *Store) commitConfirmedLocked(minutes int, principal string) (*config.Co
 	runCommitConfirmedCrashHook(commitConfirmedStageActive)
 	// The candidate is active; its provisional record still preserves the old
 	// disk generation as an alias until finalization. This supersedes a deferred
-	// rollback write without deleting the new recovery record.
+	// rollback write. Drop the older in-memory FIRST sentinel as well, so retry
+	// cannot overwrite this newer recovery record.
 	s.confirmResolvePendingPersist = false
+	s.firstCommitRecoveryIntent = nil
 
 	if s.confirmTimer != nil {
 		// Nested confirmed commit: cancel the pending timer but keep
@@ -1002,6 +1010,9 @@ func (s *Store) clearConfirmResolutionPendingLocked() bool {
 			return true
 		}
 	}
+	// The replacement active marker is durable, so this boot-recovery intent
+	// no longer needs replay; do not let it overwrite a later confirm record.
+	s.firstCommitRecoveryIntent = nil
 	s.confirmResolvePendingPersist = false
 	// #5835: the replacement config is durable, so remove the retained record.
 	// A durable-removal failure here retains retry debt (degraded health +
@@ -1309,6 +1320,8 @@ func (s *Store) PromoteRollback(gen uint64) (prevCfg *config.Config, ok bool) {
 		// now-no-op rollback to the already-persisted target).
 		s.persistDegraded = false
 		s.confirmResolvePendingPersist = false
+		// Defense in depth; clearConfirmResolutionPendingLocked is the primary clear.
+		s.firstCommitRecoveryIntent = nil
 		// #5835: removal is durable-or-retry — a failed DeleteConfirm retains
 		// retry debt + degraded health rather than being swallowed, so a crash
 		// before the retry heals cannot leave a stale record that re-reverts.

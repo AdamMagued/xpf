@@ -166,3 +166,71 @@ func TestExpiredFirstCommitBootTearsDownTakeover12155(t *testing.T) {
 		t.Fatalf("durable teardown marker remains after convergence: %v", err)
 	}
 }
+func TestFirstCommitSentinelPermissionFailureBootstraps12167(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("running as root: chmod 0500 does not deny writes")
+	}
+	root := t.TempDir()
+	configPath := filepath.Join(root, "xpf.conf")
+	store, err := configstore.New(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnterConfigure(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetFromInput("system host-name FirstWindow"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CommitConfirmed(10); err != nil {
+		t.Fatalf("CommitConfirmed: %v", err)
+	}
+	store.ExitConfigure()
+	t.Cleanup(func() { store.CancelConfirmTimerForTesting() })
+	store.SetPersistRetryBackoffForTesting(time.Hour, time.Hour)
+
+	confirmPath := filepath.Join(root, ".configdb", "confirm.json")
+	data, err := os.ReadFile(confirmPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nl := bytes.IndexByte(data, '\n')
+	if nl < 0 {
+		t.Fatalf("confirm envelope has no header: %q", data)
+	}
+	var record map[string]json.RawMessage
+	if err := json.Unmarshal(data[nl+1:], &record); err != nil {
+		t.Fatalf("decode confirm body: %v", err)
+	}
+	deadline, _ := json.Marshal(time.Now().Add(-time.Minute))
+	record["deadline"] = deadline
+	body, err := json.MarshalIndent(record, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	backdated := append(append([]byte(nil), data[:nl+1]...), body...)
+	if err := os.WriteFile(confirmPath, backdated, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	dbDir := filepath.Dir(confirmPath)
+	if err := os.Chmod(dbDir, 0o500); err != nil {
+		t.Fatalf("chmod config DB read-only: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dbDir, 0o700) })
+	d := &Daemon{
+		applySem: semaphore.NewWeighted(1),
+		store:    store,
+		opts:     Options{ConfigFile: configPath},
+	}
+	failClosed, err := d.loadAndBootstrapConfig()
+	if err != nil || !failClosed || !d.inBootstrap() {
+		t.Fatalf("loadAndBootstrapConfig = (%v, %v), bootstrap=%v; want true/nil/true",
+			failClosed, err, d.inBootstrap())
+	}
+	if store.ActiveConfig() != nil || !store.FirstCommitTeardownOwed() ||
+		!store.ConfigPersistDegraded() {
+		t.Fatalf("sentinel permission failure state: active=%v teardown=%v degraded=%v; want nil/true/true",
+			store.ActiveConfig(), store.FirstCommitTeardownOwed(), store.ConfigPersistDegraded())
+	}
+}

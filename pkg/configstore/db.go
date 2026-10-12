@@ -298,9 +298,10 @@ type confirmRecord struct {
 	// Deadline is the absolute wall-clock time the confirm window expires.
 	Deadline time.Time `json:"deadline"`
 	// ArmedAt and ArmedBootID identify the wall-clock/OS incarnation at arm
-	// time. They let recovery diagnose a deadline that crossed a reboot or a
-	// wall-clock step; neither value is used as a substitute for a monotonic
-	// deadline, which cannot survive reboot.
+	// time. Recovery treats a current wall clock earlier than ArmedAt as
+	// conclusive backward-step evidence and bounds the re-armed timer by the
+	// original duration. They cannot substitute for a monotonic deadline,
+	// which does not survive reboot.
 	ArmedAt     time.Time `json:"armed_at,omitempty"`
 	ArmedBootID string    `json:"armed_boot_id,omitempty"`
 	// still-unconfirmed commit-confirmed. For a NESTED confirmed commit it
@@ -477,12 +478,13 @@ func (db *DB) ReadConfirm() (*confirmRecord, error) {
 	}
 	// A structurally-valid object can still be semantically degenerate — `{}`
 	// decodes with a zero Deadline and a nil PrevTree. A pending confirm without
-	// a deadline is meaningless (the zero time is always "already expired", so
-	// recovery would immediately roll back), and one without a rollback target
-	// would revert to an empty tree. A legitimately-written record ALWAYS has a
-	// real future deadline (time.Now().Add(window)) and a non-nil PrevTree
+	// a non-zero deadline is meaningless (the zero time is always "already
+	// expired", so recovery would immediately roll back), and one without a
+	// rollback target would revert to an empty tree. A legitimately-written
+	// record has a non-zero deadline (normally time.Now().Add(window), but
+	// #12167 recovery writes a past sentinel) and a non-nil PrevTree
 	// (confirmPrevTree = s.active.Clone(), non-nil even for a first commit —
-	// FirstCommit distinguishes the empty-bootstrap case), so rejecting these
+	// FirstCommit distinguishes the empty bootstrap case), so rejecting these
 	// degenerate shapes never touches a valid record.
 	if rec.Deadline.IsZero() {
 		return nil, fmt.Errorf("parse confirm state: pending commit-confirmed record has no deadline")

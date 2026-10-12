@@ -728,6 +728,28 @@ func (s *Store) SetConfirmRecoveryClockSkewCheck(check func(*config.Config) bool
 	s.db.confirmRecoveryClockSkewCheck = check
 }
 
+// recoveredConfirmDelay bounds the boot timer by the duration recorded at arm
+// time. Records predating ArmedAt still receive the maximum duration accepted
+// by CommitConfirmed rather than an unbounded wall-clock-derived delay.
+func recoveredConfirmDelay(deadline, now, armedAt time.Time) time.Duration {
+	remaining := deadline.Sub(now)
+	if remaining <= 0 {
+		return 0
+	}
+
+	maxDelay := time.Duration(MaxCommitConfirmedMinutes) * time.Minute
+	if !armedAt.IsZero() {
+		originalWindow := deadline.Sub(armedAt)
+		if originalWindow > 0 && originalWindow < maxDelay {
+			maxDelay = originalWindow
+		}
+	}
+	if remaining > maxDelay {
+		return maxDelay
+	}
+	return remaining
+}
+
 // recoverPendingConfirmLocked restores a commit-confirmed window that was
 // still pending when the daemon last stopped (#4577). The in-memory
 // time.AfterFunc rollback timer does not survive a process restart, so without
@@ -739,13 +761,12 @@ func (s *Store) SetConfirmRecoveryClockSkewCheck(check func(*config.Config) bool
 // property.
 //
 // Runs at the tail of Load once active.json is read — on the success path
-// and on the compile-failed path (#9884) — under s.mu. Two outcomes:
-//   - an expired deadline OR active clock-skew alarm -> roll back to the
-//     persisted prev tree NOW, including the #1922 Item 1b first-commit
-//     never-committed marker, then clear the state.
-//   - a future deadline with no active clock-skew alarm -> re-arm the timer
-//     for the REMAINING duration; a clean restart inside the window keeps
-//     the hatch.
+// and on the compile-failed path (#9884) — under s.mu. Recovery rolls back
+// when the deadline has passed, the daemon's clock-skew alarm is active, or
+// the current wall clock precedes a persisted non-zero ArmedAt. Otherwise it
+// re-arms for the lesser of the deadline's remaining duration and the
+// original duration recorded at arm time (or the maximum accepted window
+// for legacy records without ArmedAt).
 //
 // #6538: it returns an error so Load can FAIL CLOSED when the recovery leaves
 // no compiled config. The rollback target here is a previously-committed
@@ -843,9 +864,12 @@ func (s *Store) recoverPendingConfirmLocked() error {
 	// A FIRST rollback may have written the active rollback marker and died
 	// before publishing the teardown marker. The retained expired confirm
 	// record is the recovery evidence; committed=0 plus a different guarded
-	// hash proves the active rollback already landed.
+	// hash proves the active rollback already landed. A backward-clock FIRST
+	// rollback (#12167) lands while the wall clock is still before the
+	// deadline, so a clock still behind ArmedAt is the same evidence.
 	if rec.FirstCommit && !s.everCommitted && rec.GuardedHash != "" &&
-		rec.GuardedHash != activeHash && confirmWallNow().After(rec.Deadline) {
+		rec.GuardedHash != activeHash && (confirmWallNow().After(rec.Deadline) ||
+		(!rec.ArmedAt.IsZero() && confirmWallNow().Before(rec.ArmedAt))) {
 		s.firstCommitTeardownOwed = true
 		s.firstCommitTeardownGeneration = rec.GuardedHash
 		s.firstCommitTeardownRollbackHash = activeHash
@@ -883,13 +907,52 @@ func (s *Store) recoverPendingConfirmLocked() error {
 		prevTree = &config.ConfigTree{}
 	}
 
-	deadlineExpired := confirmWallNow().After(deadline)
-	clockSkewAlarm := !deadlineExpired && s.db.confirmRecoveryClockSkewCheck != nil &&
-		s.db.confirmRecoveryClockSkewCheck(s.compiled)
-	if deadlineExpired || clockSkewAlarm {
+	recoveryNow := confirmWallNow()
+	deadlineExpired := recoveryNow.After(deadline)
+	clockMovedBackward := !rec.ArmedAt.IsZero() && recoveryNow.Before(rec.ArmedAt)
+	clockSkewAlarm := false
+	if !deadlineExpired && !clockMovedBackward && s.db.confirmRecoveryClockSkewCheck != nil {
+		clockSkewAlarm = s.db.confirmRecoveryClockSkewCheck(s.compiled)
+		if !clockSkewAlarm {
+			recoveryNow = confirmWallNow()
+			deadlineExpired = recoveryNow.After(deadline)
+			clockMovedBackward = !rec.ArmedAt.IsZero() && recoveryNow.Before(rec.ArmedAt)
+		}
+	}
+	if deadlineExpired || clockSkewAlarm || clockMovedBackward {
 		// The operator never confirmed, so the unconfirmed config on disk
 		// must NOT stand. Revert to the prev tree with the same persistence
 		// semantics as PromoteRollback.
+		var sentinelErr error
+		if rec.FirstCommit {
+			// #12167: persist a clock-independent rollback intent before the
+			// active rollback write. If marker publication is interrupted, the
+			// next Load must recognize the retained record even if the wall
+			// clock was corrected or a #10875 alarm triggered this rollback.
+			//
+			// A failed sentinel write must not abort recovery before the
+			// in-memory rollback below. Keep the active marker untouched until
+			// retry has durably published the sentinel, so a crash always leaves
+			// the original confirm record as valid recovery evidence.
+			pastDeadline := time.Date(1, 1, 1, 0, 0, 1, 0, time.UTC)
+			rec.Deadline = pastDeadline
+			if !rec.PreviousDeadline.IsZero() {
+				rec.PreviousDeadline = pastDeadline
+			}
+			if err := s.db.WriteConfirm(rec); err != nil {
+				sentinelErr = err
+				s.firstCommitRecoveryIntent = rec
+				s.journalLog(&JournalEntry{
+					Action:    "persist_error",
+					Detail:    fmt.Sprintf("persist FIRST-rollback recovery intent failed; retrying before active rollback: %v", err),
+					Principal: "system:configstore",
+				})
+				slog.Error("failed to persist FIRST-rollback recovery intent; retaining the original active marker and retrying before rollback",
+					"err", err, "issue", "#12167")
+			} else {
+				s.firstCommitRecoveryIntent = nil
+			}
+		}
 		s.active = prevTree
 		var perr error
 		// recoverErr is the #6538 fail-closed signal, returned at the end of
@@ -913,7 +976,13 @@ func (s *Store) recoverPendingConfirmLocked() error {
 			s.publishActiveLocked() // #9905: publish the new active snapshot
 			s.persistMarkerCommitted = false
 			s.everCommitted = false
-			perr = s.writeActiveMarker(prevTree, false)
+			if sentinelErr != nil {
+				// Keep the durable FIRST active marker untouched until retry
+				// has made the clock-independent confirm sentinel durable.
+				perr = sentinelErr
+			} else {
+				perr = s.writeActiveMarker(prevTree, false)
+			}
 		} else {
 			compiled, cerr := s.compileTreeLenient(prevTree)
 			if cerr != nil {
@@ -975,7 +1044,11 @@ func (s *Store) recoverPendingConfirmLocked() error {
 		}
 		detail := "commit-confirmed window expired during daemon downtime; reverted on boot (#4577)"
 		principal := "system:commit-confirmed-timeout"
-		if clockSkewAlarm {
+		switch {
+		case clockMovedBackward:
+			detail = "wall clock precedes persisted commit-confirmed arm time; rolled back pending config on boot (#12167)"
+			principal = "system:commit-confirmed-clock-skew"
+		case clockSkewAlarm:
 			detail = "clock-skew alarm active during confirm recovery; rolled back pending config on boot (#10875)"
 			principal = "system:commit-confirmed-clock-skew"
 		}
@@ -985,7 +1058,13 @@ func (s *Store) recoverPendingConfirmLocked() error {
 			ConfigHash: journalConfigHash(s.active),
 			Principal:  principal,
 		})
-		if clockSkewAlarm {
+		if clockMovedBackward {
+			slog.Warn("wall clock precedes persisted commit-confirmed arm time; "+
+				"configuration rolled back to the pre-confirm state on boot",
+				"armed_at", rec.ArmedAt, "armed_boot_id", rec.ArmedBootID,
+				"current_wall_time", recoveryNow, "current_boot_id", confirmBootID(),
+				"issue", "#12167")
+		} else if clockSkewAlarm {
 			slog.Warn("clock-skew alarm active while recovering a pending commit-confirmed window; "+
 				"configuration rolled back to the pre-confirm state on boot",
 				"armed_at", rec.ArmedAt, "armed_boot_id", rec.ArmedBootID,
@@ -1003,7 +1082,6 @@ func (s *Store) recoverPendingConfirmLocked() error {
 	// rollback target) are restored so a subsequent expiry / plain-commit /
 	// sync resolves correctly. confirm.json is left in place until the window
 	// is resolved.
-	remaining := deadline.Sub(confirmWallNow())
 	s.confirmPrevTree = prevTree
 	// #6538: first-commit-ness comes from the PERSISTED record, which is the
 	// only authority on whether PrevTree is the empty bootstrap tree. It must
@@ -1030,6 +1108,7 @@ func (s *Store) recoverPendingConfirmLocked() error {
 	}
 	s.confirmGen++
 	gen := s.confirmGen
+	remaining := recoveredConfirmDelay(deadline, confirmWallNow(), rec.ArmedAt)
 	s.confirmTimer = time.AfterFunc(remaining, func() {
 		s.fireConfirmTimer(gen)
 	})
@@ -1316,51 +1395,14 @@ func (s *Store) persistRetryLoop(backoff, maxBackoff time.Duration) {
 		if s.persistRefusedTree != nil && s.persistRefusedTree != s.active {
 			s.persistRefusedTree = nil
 		}
-		if s.persistDegraded && s.persistRefusedTree != s.active {
-			// #1922: re-write with the marker the failing path requested
-			// (committed=false only for a first-commit rollback). For every
-			// other path persistMarkerCommitted is true, so this matches the
-			// pre-#1922 committed=1 write exactly.
-			if err := s.writeActiveMarker(s.active, s.persistMarkerCommitted); err == nil {
-				s.persistDegraded = false
-				// #5473: the active config is now durable. If a commit-confirmed
-				// resolution (rollback / boot recovery / sync supersede) deferred
-				// its confirm.json removal because the resolving write failed, that
-				// replacement target is exactly what just landed durably — drop the
-				// crash-recovery record now (via resolveConfirmRemovalLocked, which
-				// re-arms retry debt if the delete itself fails). No-op unless a
-				// removal was deferred.
-				s.clearConfirmResolutionPendingLocked()
-				s.journalLog(&JournalEntry{
-					Action:    "persist_recovered",
-					Detail:    "active config persisted after earlier write failure",
-					Principal: "system:configstore",
-				})
-				slog.Info("active config persisted after earlier write failure", "issue", "#1799")
-			} else if errors.Is(err, ErrPersistExceedsReadCeiling) {
-				// #9617: a size refusal is deterministic for this tree, so
-				// retrying it only re-serializes a >16 MiB config every tick
-				// and warns each time. Record the refused tree and stop
-				// attempting it; persistence stays degraded until a DIFFERENT
-				// active config is written. Every promotion installs a new tree
-				// object, so the pointer compare resumes retries on its own.
-				s.persistRefusedTree = s.active
-				slog.Error("active config cannot be persisted: it serializes past the read ceiling, so no retry can succeed; persistence stays degraded until a smaller config is applied",
-					"err", err, "issue", "#9617")
-			} else {
-				slog.Warn("active config persist retry failed", "err", err, "retry_in", backoff*2)
-			}
-		}
+		s.retryActiveConfigPersistLocked(backoff)
 
 		if s.confirmRemoveDegraded && s.confirmRemovalSupersededLocked() {
 			// #7675: a NEWER `commit confirmed` durably replaced the record this
 			// debt was taken for. WriteConfirm is temp+fsync+rename+dir-fsync, so
 			// the record we owed a removal for is already gone and the debt is
-			// satisfied. Re-driving DeleteConfirm here would delete the LIVE
-			// window's crash-recovery file — measured deterministic on master:
-			// the in-memory timer stays armed so nothing looks wrong, and a
-			// restart before the new deadline then leaves the UNCONFIRMED config
-			// standing with no rollback (#4577).
+			// satisfied by construction: the retry clears the debt instead of
+			// deleting whatever confirm.json now contains.
 			s.confirmRemoveDegraded = false
 			s.confirmRemoveDebtID = ""
 			s.journalLog(&JournalEntry{
@@ -1422,6 +1464,55 @@ func (s *Store) persistRetryLoop(backoff, maxBackoff time.Duration) {
 		backoff *= 2
 		if backoff > maxBackoff {
 			backoff = maxBackoff
+		}
+	}
+}
+
+// retryActiveConfigPersistLocked publishes a deferred FIRST-rollback
+// sentinel before the active marker; a failed sentinel write leaves the intent
+// non-nil, so the marker retry remains blocked. The caller holds s.mu.
+func (s *Store) retryActiveConfigPersistLocked(backoff time.Duration) {
+	if s.persistDegraded && s.persistRefusedTree != s.active &&
+		s.firstCommitRecoveryIntent != nil {
+		if err := s.db.WriteConfirm(s.firstCommitRecoveryIntent); err != nil {
+			slog.Warn("FIRST-rollback recovery intent retry failed", "err", err,
+				"retry_in", backoff*2, "issue", "#12167")
+		} else {
+			s.firstCommitRecoveryIntent = nil
+		}
+	}
+	if s.persistDegraded && s.persistRefusedTree != s.active &&
+		s.firstCommitRecoveryIntent == nil {
+		// #1922: re-write with the marker the failing path requested
+		// (committed=false only for a first-commit rollback). For every
+		// other path persistMarkerCommitted is true, so this matches the
+		// pre-#1922 committed=1 write exactly.
+		if err := s.writeActiveMarker(s.active, s.persistMarkerCommitted); err == nil {
+			s.persistDegraded = false
+			// #5473: the active config is now durable. If a commit-confirmed
+			// resolution (rollback / boot recovery / sync supersede) deferred
+			// its confirm.json removal because the resolving write failed, that
+			// replacement target is exactly what just landed durably — drop the
+			// crash-recovery record now. No-op unless a removal was deferred.
+			s.clearConfirmResolutionPendingLocked()
+			s.journalLog(&JournalEntry{
+				Action:    "persist_recovered",
+				Detail:    "active config persisted after earlier write failure",
+				Principal: "system:configstore",
+			})
+			slog.Info("active config persisted after earlier write failure", "issue", "#1799")
+		} else if errors.Is(err, ErrPersistExceedsReadCeiling) {
+			// #9617: a size refusal is deterministic for this tree, so
+			// retrying it only re-serializes a >16 MiB config every tick
+			// and warns each time. Record the refused tree and stop
+			// attempting it; persistence stays degraded until a DIFFERENT
+			// active config is written. Every promotion installs a new tree
+			// object, so the pointer compare resumes retries on its own.
+			s.persistRefusedTree = s.active
+			slog.Error("active config cannot be persisted: it serializes past the read ceiling, so no retry can succeed; persistence stays degraded until a smaller config is applied",
+				"err", err, "issue", "#9617")
+		} else {
+			slog.Warn("active config persist retry failed", "err", err, "retry_in", backoff*2)
 		}
 	}
 }

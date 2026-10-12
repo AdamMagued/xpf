@@ -103,13 +103,12 @@ func TestReadConfirmRejectsDegenerateRecord_5637(t *testing.T) {
 	}
 }
 
-// TestReadConfirmValidRecordRoundTrips_5637 is the regression guard: a
-// legitimately-written pending-confirm record — real future deadline + non-nil
-// rollback target — must still round-trip through WriteConfirm/ReadConfirm
-// unchanged, in BOTH the plaintext and the encrypted (prev tree declares a
-// master-password) framings, and for the first-commit variant whose PrevTree is
-// a non-nil empty bootstrap tree. This proves the #5637 validation only rejects
-// degenerate shapes and does not widen behavior for valid records.
+// TestReadConfirmValidRecordRoundTrips_5637 is the regression guard: ordinary
+// armed records (future deadline, non-nil rollback target) still round-trip
+// through WriteConfirm/ReadConfirm in plaintext and encrypted forms, including
+// the first-commit variant's non-nil empty PrevTree. This proves the #5637
+// validation rejects degenerate shapes without widening behavior for valid
+// records.
 func TestReadConfirmValidRecordRoundTrips_5637(t *testing.T) {
 	deadline := time.Now().Add(37 * time.Minute).Round(0)
 
