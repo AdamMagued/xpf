@@ -220,6 +220,59 @@ func TestZonesHandlerQuarantinePreservesCounterError10531(t *testing.T) {
 	}
 }
 
+// TestZonesHandlerReportsNodeScopedQuarantine12247 runs zonesHandler on node1's
+// compiled config, where z214 is the only local claimant of the stable ID it
+// shares with node0's z174. The runtime name set quarantines z214 on both
+// nodes, so the REST view must report it quarantined in favour of the peer's
+// z174 and skip the shared-ID counter read, matching the dataplane.
+func TestZonesHandlerReportsNodeScopedQuarantine12247(t *testing.T) {
+	if config.StableZoneID("z174") != config.StableZoneID("z214") {
+		t.Fatal("test premise broken: z174/z214 no longer collide")
+	}
+	tree, errs := config.NewParser(`groups {
+  node0 { security { zones { security-zone z174; } } }
+  node1 { security { zones { security-zone z214; } } }
+}
+apply-groups "${node}";
+security { zones { security-zone trust; } }`).Parse()
+	if len(errs) != 0 {
+		t.Fatalf("parse node-scoped zones: %v", errs)
+	}
+	node1, err := config.CompileConfigForNodeLenient(tree, 1)
+	if err != nil {
+		t.Fatalf("tolerant node1 compile: %v", err)
+	}
+	s, dp, ids := newQuarantineRESTFixture(t, "z214", "trust")
+	cfg := s.store.ActiveConfig()
+	cfg.Security.Zones = node1.Security.Zones
+	cfg.ZoneQuarantineNames = node1.ZoneQuarantineNames
+	setQuarantineRESTCounters(dp, ids["trust"], 5, 500, 6, 600)
+
+	rr := httptest.NewRecorder()
+	s.zonesHandler(rr, httptest.NewRequest(http.MethodGet, "/api/v1/security/zones", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("zonesHandler status = %d, want 200; body=%s", rr.Code, rr.Body.String())
+	}
+	zones, _ := decodeRESTZones10531(t, rr.Body.Bytes())
+	if len(zones) != 2 {
+		t.Fatalf("zonesHandler returned %d zones, want node1's z214 and trust", len(zones))
+	}
+	loser := restZoneByName10531(t, zones, "z214")
+	if loser.Quarantine == nil || loser.Quarantine.State != ZoneQuarantineStateQuarantined || loser.Quarantine.SurvivorZone != "z174" {
+		t.Fatalf("z214 quarantine = %+v, want quarantined in favour of peer survivor z174", loser.Quarantine)
+	}
+	if loser.PerZoneCountersAvailable {
+		t.Fatal("quarantined z214 reported per-zone counters")
+	}
+	if trust := restZoneByName10531(t, zones, "trust"); trust.Quarantine == nil ||
+		trust.Quarantine.State != ZoneQuarantineStateNotQuarantined || trust.IngressPackets != 5 {
+		t.Fatalf("trust = %+v, want not quarantined with its counters", trust)
+	}
+	if dp.reads != 2 {
+		t.Fatalf("ReadZoneCounters calls = %d, want 2 (trust only; quarantined z214 skipped)", dp.reads)
+	}
+}
+
 func TestZonesHandlerQuarantineNoCollision10531(t *testing.T) {
 	s, dp, ids := newQuarantineRESTFixture(t, "trust", "untrust", "dmz")
 	setQuarantineRESTCounters(dp, ids["trust"], 7, 70, 8, 80)
