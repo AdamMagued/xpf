@@ -3046,6 +3046,7 @@ pub(super) fn resolve_flow_session_decision(
         fabric_ingress,
         ha_startup_grace_until_secs,
         worker_id,
+        None,
     )
 }
 
@@ -3084,6 +3085,8 @@ pub(super) fn resolve_flow_session_decision_with_conntrack(
     // in the worker loop. A peer-synced reservation is held by every worker, so
     // a release must drop THIS worker's bit rather than free the port outright.
     worker_id: u32,
+    // Only the unique unstamped-fabric reverse-NAT exception supplies this.
+    prevalidated_forward_nat_match: Option<crate::session::ForwardSessionMatch>,
 ) -> Option<ResolvedFlowSessionDecision> {
     // Bundle the four shared-session refs once per call. `SharedSessionRefs`
     // is `#[derive(Copy)]`, so the three downstream uses below
@@ -3382,15 +3385,40 @@ pub(super) fn resolve_flow_session_decision_with_conntrack(
             None => crate::afxdp::shared_ops::ReverseIngress::Unzoned,
         }
     };
-    let forward_match = lookup_forward_nat_across_scopes_at(
-        sessions,
-        shared_nat_sessions,
-        forwarding,
-        shared_owner_rg_indexes,
-        &flow.forward_key,
-        reverse_ingress,
-        now_ns,
-    )?;
+    let forward_match = if let Some(prevalidated) = prevalidated_forward_nat_match {
+        // Recheck the domain-zero reverse tuple at consumption time. The
+        // caller's proof authorizes this candidate only, not a general
+        // relaxation of reverse-NAT domain admission.
+        let mut unique_reply_key = flow.forward_key.clone();
+        unique_reply_key.routing_domain = 0;
+        let Some(current_match) =
+            sessions.find_unique_established_forward_nat_match_at(&unique_reply_key, now_ns)
+        else {
+            return None;
+        };
+        if current_match.key != prevalidated.key
+            || !crate::afxdp::shared_ops::shared_forward_nat_candidate_is_unique(
+                shared_nat_sessions,
+                shared_owner_rg_indexes,
+                &unique_reply_key,
+                &current_match.key,
+                current_match.decision.nat,
+            )
+        {
+            return None;
+        }
+        current_match
+    } else {
+        lookup_forward_nat_across_scopes_at(
+            sessions,
+            shared_nat_sessions,
+            forwarding,
+            shared_owner_rg_indexes,
+            &flow.forward_key,
+            reverse_ingress,
+            now_ns,
+        )?
+    };
     let (resolved, reverse_installed) = install_reverse_session_from_forward_match(
         sessions,
         session_map,

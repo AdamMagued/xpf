@@ -939,6 +939,7 @@ pub(super) fn poll_binding_process_descriptor_with_injection(
                             },
                         );
                 }
+                let mut unique_unstamped_fabric_nat_match = None;
                 if absent_fabric_ingress_suspect {
                     let Some(flow) = flow.as_mut() else {
                         telemetry.counters.record_unstamped_fabric_ingress_drop();
@@ -965,6 +966,7 @@ pub(super) fn poll_binding_process_descriptor_with_injection(
                         continue;
                     }
                     flow.forward_key.routing_domain = matched.key.routing_domain;
+                    unique_unstamped_fabric_nat_match = Some(matched);
                     fabric_ingress_for_session = true;
                 }
                 // #11332: a packet the interface input filter (including its
@@ -1736,6 +1738,7 @@ pub(super) fn poll_binding_process_descriptor_with_injection(
                             fabric_link_ingress,
                             ha_startup_grace_until_secs,
                             worker_id,
+                            unique_unstamped_fabric_nat_match.take(),
                         )
                     {
                         // #10597 G5: a queued WireGuard record may only enter
