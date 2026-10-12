@@ -224,11 +224,11 @@ func TestPrimaryIPv4_SkipsLinkLocal(t *testing.T) {
 	}
 }
 
-func TestBuildUnsolicitedNA(t *testing.T) {
+func TestBuildVIPUnsolicitedNA(t *testing.T) {
 	mac, _ := net.ParseMAC("de:ad:be:ef:00:01")
 	ip := net.ParseIP("2001:db8::1")
 
-	pkt := buildUnsolicitedNA(mac, ip)
+	pkt := buildVIPUnsolicitedNA(mac, ip)
 
 	if len(pkt) != 86 {
 		t.Fatalf("packet length = %d, want 86", len(pkt))
@@ -332,6 +332,78 @@ func TestBuildUnsolicitedNA(t *testing.T) {
 	}
 }
 
+func TestBuildUnsolicitedProxyNASeparatesSourceFromTarget(t *testing.T) {
+	mac, _ := net.ParseMAC("de:ad:be:ef:00:01")
+	source := net.ParseIP("2001:db8::10")
+	target := net.ParseIP("2001:db8::7")
+	addrs := []net.Addr{
+		&net.IPNet{IP: source, Mask: net.CIDRMask(64, 128)},
+	}
+
+	pkt, err := buildProxyUnsolicitedNA(mac, addrs, target)
+	if err != nil {
+		t.Fatalf("buildProxyUnsolicitedNA() error = %v", err)
+	}
+	gotSource := net.IP(pkt[22:38])
+	if gotSource.Equal(target) {
+		t.Fatalf("IPv6 source equals proxy target %s", target)
+	}
+	if !interfaceHasIPv6Address(addrs, gotSource) {
+		t.Fatalf("IPv6 source %s is not assigned to the outgoing interface", gotSource)
+	}
+	if !gotSource.Equal(source) {
+		t.Errorf("IPv6 source = %s, want assigned interface source %s", gotSource, source)
+	}
+	if gotTarget := net.IP(pkt[62:78]); !gotTarget.Equal(target) {
+		t.Errorf("NA target = %s, want proxy target %s", gotTarget, target)
+	}
+	if pkt[58] != 0x20 {
+		t.Errorf("proxy NA flags = 0x%02x, want Override only and no Solicited flag (0x20)", pkt[58])
+	}
+
+	original := binary.BigEndian.Uint16(pkt[56:58])
+	pkt[56], pkt[57] = 0, 0
+	if got := icmpv6Checksum(pkt[22:38], pkt[38:54], pkt[54:86]); got != original {
+		t.Errorf("checksum = 0x%04x, recomputed with distinct source/target = 0x%04x", original, got)
+	}
+}
+
+func TestBuildProxyUnsolicitedNAExcludesTargetFromSourceSelection(t *testing.T) {
+	mac, _ := net.ParseMAC("de:ad:be:ef:00:01")
+	target := net.ParseIP("2001:db8::7")
+	linkLocal := net.ParseIP("fe80::1234")
+	addrs := []net.Addr{
+		&net.IPNet{IP: target, Mask: net.CIDRMask(64, 128)},
+		&net.IPNet{IP: linkLocal, Mask: net.CIDRMask(64, 128)},
+	}
+
+	pkt, err := buildProxyUnsolicitedNA(mac, addrs, target)
+	if err != nil {
+		t.Fatalf("buildProxyUnsolicitedNA() error = %v", err)
+	}
+	source := net.IP(pkt[22:38])
+	if source.Equal(target) {
+		t.Fatalf("IPv6 source equals proxy target %s", target)
+	}
+	if !interfaceHasIPv6Address(addrs, source) {
+		t.Fatalf("IPv6 source %s is not assigned to the outgoing interface", source)
+	}
+	if !source.Equal(linkLocal) {
+		t.Errorf("IPv6 source = %s, want fallback assigned source %s", source, linkLocal)
+	}
+}
+
+func TestBuildProxyUnsolicitedNARejectsTargetAsOnlyInterfaceAddress(t *testing.T) {
+	mac, _ := net.ParseMAC("de:ad:be:ef:00:01")
+	target := net.ParseIP("2001:db8::7")
+	addrs := []net.Addr{
+		&net.IPNet{IP: target, Mask: net.CIDRMask(64, 128)},
+	}
+	if _, err := buildProxyUnsolicitedNA(mac, addrs, target); err == nil {
+		t.Fatal("buildProxyUnsolicitedNA() succeeded without a distinct assigned source")
+	}
+}
+
 func TestProbeIPv6SourcePrefersGlobal(t *testing.T) {
 	addrs := []net.Addr{
 		&net.IPNet{IP: net.ParseIP("fe80::1"), Mask: net.CIDRMask(64, 128)},
@@ -368,7 +440,7 @@ func TestICMPv6Checksum(t *testing.T) {
 	// Build a known packet and verify checksum validates.
 	mac, _ := net.ParseMAC("de:ad:be:ef:00:01")
 	ip := net.ParseIP("2001:db8::1")
-	pkt := buildUnsolicitedNA(mac, ip)
+	pkt := buildUnsolicitedNA(mac, ip, ip, true)
 
 	// Extract the checksum that was written.
 	originalCsum := binary.BigEndian.Uint16(pkt[56:58])

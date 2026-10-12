@@ -4,12 +4,21 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/psaab/xpf/pkg/cluster"
 )
+
+func TestDirectProxyNABurstFnDefaultsToProxySender12172(t *testing.T) {
+	got := reflect.ValueOf(directProxyNABurstFn).Pointer()
+	want := reflect.ValueOf(cluster.SendProxyGratuitousIPv6BurstGated).Pointer()
+	if got != want {
+		t.Fatalf("directProxyNABurstFn does not default to the proxy-NDP sender")
+	}
+}
 
 // #12172: a new RG owner must ANNOUNCE the IPv6 pool addresses with an
 // unsolicited NA, not merely stop the standby answering for them.
@@ -23,9 +32,10 @@ import (
 // node until NUD expires: on failover the v4 binding is refreshed
 // immediately while the v6 binding goes stale.
 //
-// The solicited path is not the defect: the userspace responder answers NUD
-// probes, so NUD eventually bounds recovery. The defect is the missing
-// failover INVALIDATION — same shape as #8405, same fix shape.
+// The kernel's proxy-NDP path answers solicited Neighbor Solicitations only
+// when its proxy_ndp and FIB conditions match; IPv6 has no userspace responder.
+// Unicast NUD probes forwarded through a default route are tracked in
+// #12611 separately.
 
 // upstreamNeigh12172 models an upstream neighbor cache with NUD expiry.
 // Bindings initially point at the OLD owner's per-node RETH MAC; an
@@ -99,14 +109,14 @@ func captureNA12172(t *testing.T) *[]naCall12172 {
 	t.Helper()
 	var mu sync.Mutex
 	calls := []naCall12172{}
-	prev := directNABurstFn
-	directNABurstFn = func(iface string, ip net.IP, count int, stillValid cluster.BurstStillValid) error {
+	prev := directProxyNABurstFn
+	directProxyNABurstFn = func(iface string, ip net.IP, count int, stillValid cluster.BurstStillValid) error {
 		mu.Lock()
 		defer mu.Unlock()
 		calls = append(calls, naCall12172{iface: iface, ip: ip.String(), count: count})
 		return nil
 	}
-	t.Cleanup(func() { directNABurstFn = prev })
+	t.Cleanup(func() { directProxyNABurstFn = prev })
 	return &calls
 }
 
@@ -254,21 +264,22 @@ func TestPoolAnnounceBoundCoversBothFamilies12172(t *testing.T) {
 		t.Errorf("expected the first v6 address in configured order to be announced; got %v", *nas)
 	}
 }
+
 func TestPoolAnnounceAttemptBoundCoversSendFailures12172(t *testing.T) {
 	// A raw-socket failure still consumed one attempt. It must not let later
 	// addresses expand the per-failover fan-out beyond the same shared bound.
 	var garpAttempts, naAttempts int
-	prevARP, prevNA := directGARPBurstFn, directNABurstFn
+	prevARP, prevNA := directGARPBurstFn, directProxyNABurstFn
 	directGARPBurstFn = func(iface string, ip net.IP, count int, stillValid cluster.BurstStillValid) error {
 		garpAttempts++
 		return errors.New("synthetic send failure")
 	}
-	directNABurstFn = func(iface string, ip net.IP, count int, stillValid cluster.BurstStillValid) error {
+	directProxyNABurstFn = func(iface string, ip net.IP, count int, stillValid cluster.BurstStillValid) error {
 		naAttempts++
 		return errors.New("synthetic send failure")
 	}
 	t.Cleanup(func() {
-		directGARPBurstFn, directNABurstFn = prevARP, prevNA
+		directGARPBurstFn, directProxyNABurstFn = prevARP, prevNA
 	})
 
 	var addrs []string

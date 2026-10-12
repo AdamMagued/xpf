@@ -484,12 +484,12 @@ func (d *Daemon) scheduleDirectAnnounce(rgID int, reason string) {
 
 // directGARPBurstFn and directNABurstFn are seams over the cluster gated burst
 // senders so directSendGARPs' #2898 abdication gate is unit-testable without
-// raw-socket I/O. Production wires them to the cluster gated senders, which send
-// the first (immediate) frame unconditionally and gate only the 50ms follow-up
-// loop on the supplied BurstStillValid predicate.
+// raw-socket I/O. directProxyNABurstFn uses the same gate but selects a valid
+// interface source address distinct from the proxy target.
 var (
-	directGARPBurstFn = cluster.SendGratuitousARPBurstGated
-	directNABurstFn   = cluster.SendGratuitousIPv6BurstGated
+	directGARPBurstFn    = cluster.SendGratuitousARPBurstGated
+	directNABurstFn      = cluster.SendGratuitousIPv6BurstGated
+	directProxyNABurstFn = cluster.SendProxyGratuitousIPv6BurstGated
 )
 
 // directARPProbeFn is the supplementary gateway ARP-probe sender used by
@@ -772,8 +772,10 @@ const proxyARPAnnounceMaxAddresses = 64
 // the request arrived on, so the NTF_PROXY entry and the `proxy_arp` sysctl the
 // daemon installs were both inert there. This announce was therefore the ONLY
 // thing that ever bound the address upstream, and the "recovery" was an ageing
-// timer into a blackhole. The userspace responder
-// (daemon_proxyarp_responder_8621.go) is what makes the assumption hold.
+// timer into a blackhole. The #8621 userspace responder covers IPv4 ARP
+// only; IPv6 proxy-NDP replies come from the kernel when proxy_ndp and FIB
+// conditions match. Forwarded unicast NUD probes with all.proxy_ndp unset
+// are a separate recovery gap tracked in #12611.
 //
 // The RG filter is `proxyARPRedundancyGroupFor`, the SAME predicate #8297's
 // suppression uses. That is deliberate: this announces exactly the set the
@@ -820,7 +822,7 @@ func (d *Daemon) announceProxyARPPoolAddresses(cfg *config.Config, rgID int, sti
 					continue
 				}
 			} else {
-				if err := directNABurstFn(ifName, ip, 1, stillValid); err != nil {
+				if err := directProxyNABurstFn(ifName, ip, 1, stillValid); err != nil {
 					slog.Warn("directSendGARPs: pool proxy-NDP announce failed",
 						"iface", ifName, "ip", ip, "rg", rgID, "err", err)
 					continue
