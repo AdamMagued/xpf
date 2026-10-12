@@ -2,46 +2,34 @@ package userspace
 
 import "time"
 
-// #8397: helper crash HISTORY, kept separately from the current-episode
-// HelperCrashRecord.
-//
-// Nothing retained crash history across a recovery. `restartHelperAfterCrash`
-// wipes the whole record on success — `m.helperCrash = HelperCrashRecord{}` —
-// so Restarts, At, ExitCode, Signal, Detail, NextRestart, LastExitWasCrash and
-// LastRestartAttempt all go to zero together, and a helper that crashed four
-// times in the last hour and is now healthy presents a completely clean crash
-// surface. Nothing else kept it either: there was no crash or restart metric,
-// so the only trace was a journald line an operator has to already suspect a
-// problem to go looking for.
-//
-// WHY A SEPARATE STORE AND NOT MORE FIELDS ON THE RECORD. The wipe is not
-// incidental — the record's contract is "the current crash episode", and that
-// is exactly what makes LastExitWasCrash, RestartPending and CrashLooping()
-// mean what they mean. Keeping some fields across the clear would put two
-// lifetimes in one struct, and every reader would then have to know which
-// fields survive a recovery and which do not. The all-or-nothing wipe avoids
-// that ambiguity and is worth preserving.
-//
-// The two questions #8397 asked to be DECIDED rather than assumed, decided:
-//
-//   - WHERE IT LIVES: on the Manager, so it is lost on daemon restart. A
-//     daemon restart is a far louder event than a helper crash and is already
-//     journalled, and the counter metric below crosses that gap monotonically.
-//     Persisting diagnostic history to disk would add a durability surface for
-//     data whose whole audience is an operator answering "is this recurring?"
-//     in the same session.
-//   - RENDERED OR QUERYABLE: BOTH, but minimally. `show chassis forwarding` is
-//     already dense, so the history contributes ONE summary row rather than a
-//     table — the count and the age of the oldest retained episode, which is
-//     what answers "is this recurring?". The per-episode detail is reachable
-//     through HelperCrashHistory() for a future verb, and the Prometheus
-//     counter is what an alert should key on.
+// #8397 keeps two distinct views: a bounded ring of completed recovery
+// episodes for the operator, and a monotonic counter of every unexpected
+// helper exit for Prometheus. A persistent crash loop may not complete an
+// episode during its quiet window, so the metric must not be derived from the
+// ring.
 
-// helperCrashHistoryDepth bounds the ring. A flapping helper must not be able
-// to grow this without limit, and the question the history answers ("is this
-// recurring?") is answered by a handful of episodes plus the monotonic count —
-// not by every episode since boot. The total is kept separately and is NOT
-// bounded, so a ring that has wrapped still reports honestly.
+// WHY A SEPARATE STORE AND NOT MORE FIELDS ON THE RECORD. The live record's
+// contract is "the current crash episode"; its fields are all cleared together
+// when quiet recovery or an ordinary generation-advancing Compile ends that
+// episode. Keeping some fields across that boundary would mix lifetimes and
+// force every reader to know which fields survive. The separate history ring
+// and exit counter preserve the completed facts without weakening that contract.
+//
+// The history and metric deliberately have different lifetimes:
+//
+//   - WHERE IT LIVES: both are on the Manager and reset on daemon restart.
+//     The completed-episode ring is diagnostic detail; the cumulative exit
+//     counter is the alert signal and increments immediately on every
+//     unexpected helper exit.
+//   - RENDERED OR QUERYABLE: BOTH, but minimally. `show chassis forwarding` is
+//     already dense, so the history contributes ONE summary row: the number of
+//     completed episodes and the age of the oldest retained one. Prometheus
+//     observes the cumulative exit counter, including while a sustained loop
+//     has not yet completed a quiet window.
+
+// helperCrashHistoryDepth bounds retained episode details. A flapping helper
+// must not grow this without limit; the separate episode total and unexpected-
+// exit counter remain unbounded so a wrapped ring still reports honestly.
 const helperCrashHistoryDepth = 8
 
 // HelperCrashEpisode is one COMPLETED crash episode: an unexpected helper exit
@@ -121,4 +109,13 @@ func (m *Manager) HelperCrashHistory() ([]HelperCrashEpisode, int) {
 	out := make([]HelperCrashEpisode, len(m.helperCrashEpisodes))
 	copy(out, m.helperCrashEpisodes)
 	return out, m.helperCrashEpisodesTotal
+}
+
+// HelperCrashExitCount returns the daemon-lifetime count of unexpected helper
+// exits. It is independent of the bounded episode ring and is never reset when
+// an episode recovers.
+func (m *Manager) HelperCrashExitCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.helperCrashUnexpectedExitsTotal
 }

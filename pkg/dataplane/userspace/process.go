@@ -343,6 +343,10 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) (retErr error)
 			// Compile bring-up retires the generation carrying an armed
 			// retry without proving anything about the helper.
 			if restartAttempt && pendingCrashRetry && m.proc == nil {
+				// NM-2: a failed retry is observed helper failure, not quiet
+				// time — refresh the anchor so a run of failures cannot age
+				// the window out and journal the next landing as recovered.
+				m.helperCrashLastAt = time.Now()
 				m.scheduleHelperRestartLocked(m.procGen)
 				m.notifyHelperSupervisorLocked()
 				return

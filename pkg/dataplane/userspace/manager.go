@@ -146,20 +146,21 @@ type Manager struct {
 	// sessionOperationID is monotonic within this Manager/helper lifecycle and
 	// is paired with procGen on every helper-first tuple mutation.
 	sessionOperationID uint64
-	// helperCrashEpisodes is the #8397 bounded history of RECOVERED crash
-	// episodes, oldest-first, and helperCrashEpisodesTotal the unbounded count
-	// of them. Separate from helperCrash because that record is episode-scoped
-	// by contract and wiped on every recovery; see helper_crash_history_8397.go
-	// for why the wipe is worth preserving rather than extending.
-	helperCrashEpisodes      []HelperCrashEpisode
-	helperCrashEpisodesTotal int
+	// helperCrashEpisodes is the #8397 bounded ring of COMPLETED recovery
+	// episodes, oldest-first; helperCrashEpisodesTotal counts those episodes
+	// independently of the ring. helperCrashUnexpectedExitsTotal is the
+	// monotonic daemon-lifetime count exported by the crash counter, incremented
+	// for every unexpected exit even while an episode remains open.
+	helperCrashEpisodes             []HelperCrashEpisode
+	helperCrashEpisodesTotal        int
+	helperCrashUnexpectedExitsTotal int
 
 	// helperCrash records the last UNEXPECTED helper exit for the operator and
 	// drives the restart backoff. Zero value means "no crash on record".
 	helperCrash HelperCrashRecord
-	// helperCrashLastAt anchors the quiet window between unexpected exits.
-	// The status loop closes a recovered episode after >2x max backoff; a
-	// later exit also applies the reset before counting itself.
+	// helperCrashLastAt anchors the quiet window between unexpected exits and
+	// failed supervisor retries. The status loop closes a recovered episode
+	// only after this full interval has passed.
 	helperCrashLastAt time.Time
 	// restartAttemptInProgress distinguishes a supervisor retry from ordinary
 	// Compile bring-up, which is allowed to end a prior crash episode.

@@ -695,10 +695,11 @@ would blackhole every flow handed to it.
   which closes while the helper is down even though the xpfd-owned XDP shim is
   still attached. A fast restart reopens transit without changing RG weight.
   When restart backoff reaches its cap, a dedicated full-cost monitor debt
-  takes the local RG weight to 0 so even a non-preempt incumbent yields. A
-  landed supervisor retry clears live HA debt while its episode record remains
-  visible until the quiet window expires; ordinary Compile recovery closes the
-  episode immediately.
+  takes a DATA RG's local weight to 0 so even a non-preempt incumbent yields.
+  RG0 is excluded: keeping the config-authority group primary preserves the
+  lone-node write path because RG0 does not preempt. A landed supervisor retry
+  clears live HA debt while its episode remains visible until the quiet window
+  expires; ordinary Compile recovery closes the episode immediately.
 - **Operator surface (#7250).** `show chassis forwarding` renders the
   crash block, via `pkg/fwdstatus` so the in-process CLI and the remote
   `cli` binary share one implementation. It was chosen over the other
@@ -752,23 +753,19 @@ satisfied by derivation (above), and the **last-restart timestamp** is backed by
 `HelperCrashRecord.LastRestartAttempt`, set where the attempt is made in
 `restartHelperAfterCrash` and rendered as `Helper last restart attempt`.
 
-This paragraph previously said such a field "cannot be" added, because
-`restartHelperAfterCrash` zeroes the whole record on a successful restart and it
-would be "wiped by the very event it records". **That argument does not survive
-being applied consistently**: the wipe is total, so it clears `Restarts`,
-`NextRestart`, `ExitCode`, `Detail` and `LastExitWasCrash` too — five fields
-that were already shipped and rendered on the same surface. A rejection that
-would equally reject what you have already built is not a reason to withhold
-the sixth. The record is episode-scoped and the new field is episode-scoped
-with it, which is the contract, not a defect.
+The record describes the current open crash episode. A supervisor retry that
+proves READY keeps that episode open until its quiet-window boundary; an
+ordinary generation-advancing Compile closes it immediately. At that boundary
+the episode-scoped fields, including `LastRestartAttempt`, are cleared
+together, and the completed episode is added to the bounded history ring.
 
-What the bullet asked for and what an operator often wants are still different
-things. **History across episodes** — "has this helper crashed before?" — is
-not answerable by any field on a record that is wiped on recovery, and nothing
-retains it today: there is no crash or restart metric either, so journald is
-the only trace. That is a separate requirement, tracked as #8397, and it must
-not be conflated with the bullet — shipping it instead would leave the bullet
-unmet while looking done.
+History across episodes is available independently of the live record:
+`HelperCrashHistory` returns the retained completed episodes and their
+unbounded episode total. The `xpf_dataplane_helper_crash_episodes_total`
+Prometheus counter instead increments on every unexpected exit, so a sustained
+crash loop remains visible even when no quiet window completes an episode.
+These are separate operator views: the ring provides recent episode details;
+the counter provides the monotonic alert signal.
 
 ### A helper that answers nothing is restarted from the Go side (#9651)
 

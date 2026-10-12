@@ -331,6 +331,9 @@ func (m *Manager) resetQuietHelperCrashEpisodeLocked(now time.Time) bool {
 // cluster peer.
 func (m *Manager) handleUnexpectedHelperExitLocked(g *helperGeneration) {
 	now := time.Now()
+	// The Prometheus counter is per unexpected exit, not per completed
+	// episode; otherwise a persistent loop inside the quiet window is silent.
+	m.helperCrashUnexpectedExitsTotal++
 	// A later observation closes the old episode before this exit begins a
 	// fresh one; quiet recovery may also have closed it on the status tick.
 	m.resetQuietHelperCrashEpisodeLocked(now)

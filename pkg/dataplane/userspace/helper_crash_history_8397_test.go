@@ -5,14 +5,12 @@ import (
 	"time"
 )
 
-// #8397: crash HISTORY must survive the recovery that wipes the episode record.
+// #8397: completed crash HISTORY survives episode closure.
 //
-// The defect is a disappearance, not a wrong value, and that is what makes it
-// hard to see: `restartHelperAfterCrash` sets `m.helperCrash =
-// HelperCrashRecord{}` on success, so a helper that crashed four times in the
-// last hour and is healthy now presents a COMPLETELY CLEAN crash surface. A
-// clean surface is also exactly what a healthy helper is supposed to look like,
-// so no assertion about the current record can distinguish the two.
+// A supervisor retry leaves the live record open while stability is still
+// unknown. Quiet-window or Compile recovery closes the episode and clears that
+// record; the completed history must remain after this boundary so a helper
+// that is healthy now does not present a spotless lifetime surface.
 
 func crashedManagerFor8397(at time.Time, pid, code, restarts int, detail string) *Manager {
 	m := &Manager{}
@@ -27,25 +25,24 @@ func crashedManagerFor8397(at time.Time, pid, code, restarts int, detail string)
 	return m
 }
 
-func TestCrashHistorySurvivesTheRecoveryWipe8397(t *testing.T) {
+func TestCrashHistorySurvivesEpisodeClosure8397(t *testing.T) {
 	at := time.Date(2026, 9, 4, 10, 0, 0, 0, time.UTC)
 	m := crashedManagerFor8397(at, 4242, 101, 3, "exit status 101")
 
-	m.recordRecoveredCrashEpisodeLocked(at.Add(2 * time.Second))
-	// The wipe the production path performs immediately after.
-	m.helperCrash = HelperCrashRecord{}
+	m.mu.Lock()
+	m.completeHelperCrashRecoveryLocked(at.Add(2 * time.Second))
+	m.mu.Unlock()
 
-	// CONTROL on the premise. If the record still carried the crash, this test
-	// would pass without the history doing anything, and the whole file would
-	// be measuring the wipe not happening.
+	// CONTROL on the premise. If the current record still carried the crash,
+	// this test would pass without the history doing anything, and the whole
+	// file would be measuring episode closure not happening.
 	if m.helperCrash.LastExitWasCrash || m.helperCrash.Restarts != 0 {
-		t.Fatalf("the episode record must be wiped by recovery — that is the "+
-			"premise of #8397; got %+v", m.helperCrash)
+		t.Fatalf("the episode record must be cleared at recovery — got %+v", m.helperCrash)
 	}
 
 	eps, total := m.HelperCrashHistory()
 	if total != 1 {
-		t.Fatalf("history total = %d, want 1 — the episode did not survive the wipe", total)
+		t.Fatalf("history total = %d, want 1 — the episode did not survive closure", total)
 	}
 	if len(eps) != 1 {
 		t.Fatalf("retained %d episodes, want 1", len(eps))

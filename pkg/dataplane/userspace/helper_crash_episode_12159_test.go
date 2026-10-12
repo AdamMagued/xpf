@@ -1,6 +1,7 @@
 package userspace
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -44,7 +45,11 @@ while True:
 
 func startNMHelper12159(t *testing.T, script string, timer func(time.Duration, func())) *Manager {
 	t.Helper()
-	dir := t.TempDir()
+	dir, err := os.MkdirTemp(os.TempDir(), "nm-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	binary := filepath.Join(dir, "helper")
 	if err := os.WriteFile(binary, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -65,7 +70,7 @@ func startNMHelper12159(t *testing.T, script string, timer func(time.Duration, f
 		EventSocket:   filepath.Join(dir, "e.sock"),
 	}
 	m.mu.Lock()
-	err := m.ensureProcessLocked(cfg)
+	err = m.ensureProcessLocked(cfg)
 	m.mu.Unlock()
 	if err != nil {
 		t.Fatalf("initial real-helper bring-up: %v", err)
@@ -76,6 +81,29 @@ func startNMHelper12159(t *testing.T, script string, timer func(time.Duration, f
 		m.mu.Unlock()
 	})
 	return m
+}
+
+type nmManualRetry12159 struct {
+	mu    sync.Mutex
+	retry func()
+}
+
+func (r *nmManualRetry12159) arm(_ time.Duration, fn func()) {
+	r.mu.Lock()
+	r.retry = fn
+	r.mu.Unlock()
+}
+
+func (r *nmManualRetry12159) fire(t *testing.T) {
+	t.Helper()
+	r.mu.Lock()
+	fn := r.retry
+	r.retry = nil
+	r.mu.Unlock()
+	if fn == nil {
+		t.Fatal("supervisor did not arm a retry callback")
+	}
+	fn()
 }
 
 func waitNMSupervisorRunning12159(t *testing.T, m *Manager) {
@@ -111,13 +139,12 @@ func killNMSupervisedChild12159(t *testing.T, m *Manager) {
 // count episodes. Each crash and retry is a real helper child owned by Manager.
 func TestIsolatedCrashesResetRestartCount12159(t *testing.T) {
 	oldBase, oldMax := helperRestartBackoffBase, helperRestartBackoffMax
-	helperRestartBackoffBase, helperRestartBackoffMax = time.Millisecond, 64*time.Millisecond
+	helperRestartBackoffBase, helperRestartBackoffMax = 10*time.Millisecond, 64*time.Millisecond
 	t.Cleanup(func() {
 		helperRestartBackoffBase, helperRestartBackoffMax = oldBase, oldMax
 	})
-	m := startNMHelper12159(t, nmPersistentHelper12159, func(d time.Duration, fn func()) {
-		time.AfterFunc(d, fn)
-	})
+	retry := &nmManualRetry12159{}
+	m := startNMHelper12159(t, nmPersistentHelper12159, retry.arm)
 
 	for i := 1; i <= 8; i++ {
 		waitNMSupervisorRunning12159(t, m)
@@ -136,7 +163,7 @@ func TestIsolatedCrashesResetRestartCount12159(t *testing.T) {
 			t.Fatalf("isolated crash %d inherited the previous count: Restarts=%d, want 1", i, rec.Restarts)
 		}
 		if i < 8 {
-			waitNMSupervisorRunning12159(t, m)
+			retry.fire(t)
 		}
 	}
 	_, recovered := m.HelperCrashHistory()
@@ -211,16 +238,15 @@ func TestSupervisorRetryRecoveryState12159(t *testing.T) {
 // periodic status loop after the quiet window, without requiring another crash.
 func TestRecoveredEpisodeJournalsAfterQuietWindowWithoutSecondCrash12159(t *testing.T) {
 	oldBase, oldMax, oldInterval := helperRestartBackoffBase, helperRestartBackoffMax, statusLoopInterval
-	helperRestartBackoffBase, helperRestartBackoffMax = time.Millisecond, 64*time.Millisecond
+	helperRestartBackoffBase, helperRestartBackoffMax = 10*time.Millisecond, 64*time.Millisecond
 	statusLoopInterval = 10 * time.Millisecond
 	t.Cleanup(func() {
 		helperRestartBackoffBase, helperRestartBackoffMax, statusLoopInterval = oldBase, oldMax, oldInterval
 	})
-
-	m := startNMHelper12159(t, nmPersistentHelper12159, func(d time.Duration, fn func()) {
-		time.AfterFunc(d, fn)
-	})
+	retry := &nmManualRetry12159{}
+	m := startNMHelper12159(t, nmPersistentHelper12159, retry.arm)
 	killNMSupervisedChild12159(t, m)
+	retry.fire(t)
 	waitNMSupervisorRunning12159(t, m)
 
 	recovered := m.HelperCrashState()
@@ -251,4 +277,185 @@ func TestRecoveredEpisodeJournalsAfterQuietWindowWithoutSecondCrash12159(t *test
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("healthy recovered helper was not journaled after the quiet window without a second crash")
+}
+
+const nmFailedRetryAnchorHelper12159 = `#!/usr/bin/python3
+import os, socket, sys, time
+args = sys.argv[1:]
+path = args[args.index("--control-socket") + 1]
+counter = os.path.join(os.path.dirname(path), "attempts")
+try:
+    n = int(open(counter).read())
+except Exception:
+    n = 0
+n += 1
+open(counter, "w").write(str(n))
+if n == 1 or n == 10:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind(path)
+    s.listen(4)
+    if n == 1:
+        while True:
+            time.sleep(300)
+    time.sleep(0.3)
+    os._exit(7)
+os._exit(3)
+`
+
+func runFailedRetryAnchor12159(t *testing.T, tick time.Duration) {
+	t.Helper()
+	oldBase, oldMax, oldInterval := helperRestartBackoffBase, helperRestartBackoffMax, statusLoopInterval
+	helperRestartBackoffBase, helperRestartBackoffMax = 10*time.Millisecond, 640*time.Millisecond
+	if tick > 0 {
+		statusLoopInterval = tick
+	} else {
+		// Isolate the next-crash path from quiet-window status ticks; the
+		// companion subtest exercises the status-tick path explicitly.
+		statusLoopInterval = time.Hour
+	}
+	t.Cleanup(func() {
+		helperRestartBackoffBase, helperRestartBackoffMax, statusLoopInterval = oldBase, oldMax, oldInterval
+	})
+
+	m := startNMHelper12159(t, nmFailedRetryAnchorHelper12159, func(d time.Duration, fn func()) {
+		time.AfterFunc(d, fn)
+	})
+	m.mu.Lock()
+	dir := filepath.Dir(m.cfg.ControlSocket)
+	m.mu.Unlock()
+	readAttempts := func() int {
+		b, _ := os.ReadFile(filepath.Join(dir, "attempts"))
+		var n int
+		_, _ = fmt.Sscanf(string(b), "%d", &n)
+		return n
+	}
+
+	killNMSupervisedChild12159(t, m)
+	sawLoopBeforeLanding, landed := false, false
+	var landedAt time.Time
+	var postCrash HelperCrashRecord
+	var postCrashLooping bool
+	var postCrashHistory int
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		attempts := readAttempts()
+		running, looping := m.HelperSupervisorState()
+		rec := m.HelperCrashState()
+		if attempts < 10 && looping {
+			sawLoopBeforeLanding = true
+		}
+		if attempts == 10 && running && rec.RecoveredSinceCrash {
+			landed = true
+			landedAt = rec.RecoveredAt
+		}
+		if landed && !running && rec.LastExitWasCrash && rec.At.After(landedAt) {
+			postCrash = rec
+			postCrashLooping = looping
+			_, postCrashHistory = m.HelperCrashHistory()
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !sawLoopBeforeLanding {
+		t.Fatal("premise: failed retries never reached crash-loop verdict before landing")
+	}
+	if !landed {
+		t.Fatal("premise: attempt 10 did not become a recovered, running helper")
+	}
+	if postCrash.At.IsZero() {
+		t.Fatal("premise: attempt 10 did not die after landing")
+	}
+	t.Logf("failed retries then landing: attempts=%d Restarts=%d looping=%v journal=%d",
+		readAttempts(), postCrash.Restarts, postCrashLooping, postCrashHistory)
+	if postCrash.Restarts != 10 || !postCrashLooping || postCrashHistory != 0 {
+		t.Fatalf("failed retries aged out crash-loop state after attempt 10 died: Restarts=%d looping=%v journal=%d, want 10/true/0",
+			postCrash.Restarts, postCrashLooping, postCrashHistory)
+	}
+}
+
+func TestFailedRetriesRefreshCrashQuietWindow12159(t *testing.T) {
+	t.Run("crash path", func(t *testing.T) {
+		runFailedRetryAnchor12159(t, 0)
+	})
+	t.Run("status tick path", func(t *testing.T) {
+		runFailedRetryAnchor12159(t, 10*time.Millisecond)
+	})
+}
+
+const nmPostReadyCrasherHelper12159 = `#!/usr/bin/python3
+import os, socket, sys, time
+args = sys.argv[1:]
+path = args[args.index("--control-socket") + 1]
+counter = os.path.join(os.path.dirname(path), "attempts")
+try:
+    n = int(open(counter).read())
+except Exception:
+    n = 0
+n += 1
+open(counter, "w").write(str(n))
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(path)
+s.listen(4)
+time.sleep(0.03)
+os._exit(7)
+`
+
+func TestSustainedPostReadyCrashLoopIncrementsCounter12159(t *testing.T) {
+	oldBase, oldMax := helperRestartBackoffBase, helperRestartBackoffMax
+	helperRestartBackoffBase, helperRestartBackoffMax = 10*time.Millisecond, 640*time.Millisecond
+	t.Cleanup(func() { helperRestartBackoffBase, helperRestartBackoffMax = oldBase, oldMax })
+
+	m := startNMHelper12159(t, nmPostReadyCrasherHelper12159, func(d time.Duration, fn func()) {
+		time.AfterFunc(d, fn)
+	})
+	m.mu.Lock()
+	dir := filepath.Dir(m.cfg.ControlSocket)
+	m.mu.Unlock()
+	readAttempts := func() int {
+		b, _ := os.ReadFile(filepath.Join(dir, "attempts"))
+		var n int
+		_, _ = fmt.Sscanf(string(b), "%d", &n)
+		return n
+	}
+
+	started := time.Now()
+	var previous, midCount, midEpisodes int
+	for time.Since(started) < 8*time.Second {
+		count := m.HelperCrashExitCount()
+		if count < previous {
+			t.Fatalf("unexpected-exit counter decreased: %d -> %d", previous, count)
+		}
+		previous = count
+		if midCount == 0 && time.Since(started) >= 4*time.Second {
+			midCount = count
+			_, midEpisodes = m.HelperCrashHistory()
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	m.mu.Lock()
+	m.stopLocked()
+	m.mu.Unlock()
+
+	starts := readAttempts()
+	exits := m.HelperCrashExitCount()
+	_, episodes := m.HelperCrashHistory()
+	t.Logf("8s sustained post-ready loop: starts=%d unexpected exits=%d completed episodes=%d mid-run exits=%d",
+		starts, exits, episodes, midCount)
+	if starts < 16 {
+		t.Fatalf("premise: only %d helper starts, want at least 16", starts)
+	}
+	if exits < 15 || exits < starts-1 {
+		t.Fatalf("unexpected exits=%d for %d starts, want 15+ and all but at most the final live child",
+			exits, starts)
+	}
+	if exits > starts {
+		t.Fatalf("unexpected exits=%d exceeds helper starts=%d", exits, starts)
+	}
+	if midCount == 0 || midCount > exits {
+		t.Fatalf("counter did not increment monotonically during the loop: mid=%d final=%d", midCount, exits)
+	}
+	if midEpisodes != 0 || episodes != 0 {
+		t.Fatalf("quiet-window ring unexpectedly closed during sustained loop: mid=%d final=%d",
+			midEpisodes, episodes)
+	}
 }

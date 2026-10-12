@@ -548,8 +548,8 @@ func (d *Daemon) resolveAPIBinds(apiCfg *api.Config, cfg *config.Config) {
 	}
 }
 
-// helperCrashEpisodes reports how many userspace-dataplane helper crash
-// episodes this daemon has recovered from, for #8397's
+// helperCrashEpisodes reports the monotonic count of unexpected
+// userspace-dataplane helper exits for #8397's
 // xpf_dataplane_helper_crash_episodes_total.
 //
 // Returns 0 when the userspace manager is absent — a daemon with no helper has
@@ -563,8 +563,7 @@ func (d *Daemon) helperCrashEpisodes() int {
 	if mgr == nil {
 		return 0
 	}
-	_, total := mgr.HelperCrashHistory()
-	return total
+	return mgr.HelperCrashExitCount()
 }
 
 // forwardingSupported reports whether the userspace dataplane is forwarding

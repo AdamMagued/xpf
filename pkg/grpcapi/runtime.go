@@ -75,9 +75,10 @@ type userspaceCrashProvider interface {
 
 // userspaceCrashHistoryProvider is the #8397 completed-episode accessor.
 //
-// Separate from userspaceCrashProvider because current crash state and
-// recovered history have different lifetimes: a successful restart wipes the
-// current record while the manager retains the episode in its history ring.
+// Separate from userspaceCrashProvider because the open crash record,
+// completed-episode ring, and cumulative unexpected-exit counter have distinct
+// lifetimes. A successful retry leaves the current episode open until its
+// quiet-window boundary; completed history is retained after that boundary.
 type userspaceCrashHistoryProvider interface {
 	HelperCrashHistory() ([]dpuserspace.HelperCrashEpisode, int)
 }

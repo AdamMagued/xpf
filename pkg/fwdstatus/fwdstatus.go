@@ -235,22 +235,19 @@ func Format(fs *ForwardingStatus) string {
 
 // writeHelperCrash renders the helper crash/restart block (#7250).
 //
-// SILENT WHEN THERE IS NOTHING TO REPORT, by design. The record is cleared
-// wholesale on a successful restart (`restartHelperAfterCrash` assigns a fresh
-// HelperCrashRecord{}), so a healthy or recovered helper holds the zero value
-// and there is no episode to describe. `State` already reports helper health;
-// this block is an exception report, and printing "Helper last exit: none" on
-// every healthy box would be the confusing empty record rather than a useful
-// one. Same convention as writeEventStreamSection's early return and
-// FormatSYNCookieCounterRows returning "" when no counter fired.
+// SILENT WHEN THERE IS NOTHING TO REPORT, by design. The live record describes
+// only the current open episode; it is cleared when quiet recovery or a
+// generation-advancing Compile closes that episode. A helper that is healthy
+// after the episode closes has no current crash row, while the completed-
+// episode summary below remains visible from history. `State` already reports
+// helper health; printing "Helper last exit: none" on every healthy box would
+// be the confusing empty record rather than a useful one.
 //
-// It follows that this surface describes the CURRENT crash episode, not a
-// history: once the helper recovers, the exit that preceded it is gone from the
-// record and cannot be rendered. Correlate with journald via the PID row.
-//
-// #5838's "last restart timestamp" is NOT rendered and cannot be: the record is
-// zeroed on a successful restart, so no such field could survive inside it.
-// Tracked in #7967 rather than papered over.
+// This surface describes the CURRENT crash episode, not a history. Once the
+// episode closes, its exit fields are in the completed history ring and the
+// cumulative unexpected-exit counter. `LastRestartAttempt` is rendered while
+// the episode is open and is cleared with the other episode-scoped fields at
+// its boundary.
 func writeHelperCrash(b *strings.Builder, fs *ForwardingStatus) {
 	// HelperCrashKnown first: a zero HelperCrashRecord is byte-identical to a
 	// healthy one, so without this gate an unreachable manager and a
@@ -259,18 +256,10 @@ func writeHelperCrash(b *strings.Builder, fs *ForwardingStatus) {
 		return
 	}
 
-	// #8397: the RECURRENCE row, emitted ABOVE the recovered-helper early
-	// return below, and that placement is the entire point.
-	//
-	// The guard that follows returns as soon as the helper is healthy — which
-	// is correct for every CURRENT-episode row, and fatal for this one. History
-	// exists precisely for the helper that crashed four times in the last hour
-	// and is running now: `restartHelperAfterCrash` wipes the record on
-	// success, so at that moment `LastExitWasCrash` is false, `RestartPending`
-	// is false, and a row placed after the guard would render in every case
-	// EXCEPT the one it was written for. That failure would be invisible —
-	// a clean crash surface is exactly what a healthy helper is supposed to
-	// look like.
+	// #8397: the completed-episode recurrence row is emitted ABOVE the
+	// recovered-helper early return. A healthy helper may have completed crash
+	// episodes, and this row comes from the retained history rather than the
+	// current open record, which is correctly empty after episode closure.
 	if fs.HelperCrashEpisodes > 0 {
 		v := fmt.Sprintf("%d recovered in this daemon", fs.HelperCrashEpisodes)
 		if !fs.HelperCrashEpisodesOldest.IsZero() {
