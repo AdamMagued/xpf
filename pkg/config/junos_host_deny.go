@@ -560,8 +560,8 @@ func junosHostProjectTerm(cfg *Config, key string, p *Policy, feedBound map[stri
 	// An unrepresentable DENY is NOT left intact: the whole-ingress-zone
 	// representability gate suppresses the complete kernel program, including
 	// otherwise valid sibling denies, and keeps the #4168 warning.
-	// An otherwise-unskipped permit unrepresentable in another match dimension
-	// also trips that gate.
+	// An otherwise-unskipped permit that is unrepresentable in any match
+	// dimension, including application resolution, also trips that gate.
 	if p.Action == PolicyPermit {
 		if p.LenientContentDropped {
 			t.skipPermit = true

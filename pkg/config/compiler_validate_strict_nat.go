@@ -1209,10 +1209,12 @@ func validateNATSourceAddressNameReferencesStrict(cfg *Config) error {
 			}
 			// #3229: destination-address-name is the destination twin of
 			// source-address-name and resolves through the same address-book
-			// expander (appendNATDestinationAddressName). A dangling or
-			// unresolvable reference installs no destination = the rule matches
-			// nothing (fail-closed but silent); gate it here so the problem is
-			// operator-visible at commit, exactly like the source name above.
+			// expander (appendNATDestinationAddressName). NAT name expansion
+			// poisons a closure with any unresolved reference. Its raw-name
+			// fallback is not guaranteed to match nothing: a CIDR-shaped book
+			// name can parse as a literal prefix (#12626). The commit-time strict
+			// gate makes the problem operator-visible, exactly like the source
+			// name above.
 			// #3431: validate every value of a bracket list / repeated leaf.
 			for _, name := range rule.Match.DestinationAddressNameList() {
 				if err := nameError(natType, rs.Name, rule.Name,

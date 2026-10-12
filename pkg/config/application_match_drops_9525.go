@@ -137,9 +137,10 @@ const (
 // walkApplicationReference visits collisions, sets and applications using the
 // same precedence and depth bound as application-set expansion. The top-level
 // token resolves application-first; members use memberIsNestedSet so a user
-// set wins over a same-named predefined application. seenSets is global to
-// this walk and is never cleared on return: collision status is path-independent,
-// and every set body is visited at most once.
+// set wins over a same-named predefined application. Nested member collisions
+// are reported before deciding whether the member names a set or application.
+// seenSets is global to this walk and is never cleared on return: collision
+// status is path-independent, and every set body is visited at most once.
 func walkApplicationReference(
 	name string,
 	apps *ApplicationsConfig,
@@ -168,9 +169,6 @@ func walkApplicationReference(
 		// Past the expansion's own nesting limit the expansion already fails.
 		if depth > 3 {
 			return false
-		}
-		if _, collision := apps.CollidingNames[setName]; collision {
-			return onCollision("set", setName, "") == applicationReferenceStop
 		}
 		if seenSets[setName] {
 			return false
@@ -256,9 +254,6 @@ func ApplicationReferenceMatchDrops(name string, apps *ApplicationsConfig) []str
 		case "reference":
 			out = append(out, fmt.Sprintf("application %q: its name is ambiguous due to a collision", setName))
 			return applicationReferenceStop
-		case "set":
-			out = append(out, fmt.Sprintf("application-set %q: its name is ambiguous due to a collision", setName))
-			return applicationReferenceContinue
 		default:
 			out = append(out, fmt.Sprintf("application-set %q: member %q has an ambiguous colliding name", setName, member))
 			return applicationReferenceContinue

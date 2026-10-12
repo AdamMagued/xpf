@@ -173,7 +173,7 @@ Any member not resolved by either a static book entry or a ready feed overlay
 set, an unusable static address without a ready feed value, or an unready
 binding) poisons the entire closure rather than publishing the surviving
 subset. The raw-name fallback keeps the NAT constraint non-empty: an ordinary
-matches nothing, but a CIDR-shaped book name can parse as a literal prefix.
+name matches nothing, but a CIDR-shaped book name can parse as a literal prefix.
 Making the fallback unparseable by construction is tracked by #12626. A
 feed-bound name that is also a static set with a dangling member is accepted by
 the policy path but rejected by NAT; this parity gap is tracked by #12627.

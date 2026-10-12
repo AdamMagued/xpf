@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func assertHostDenyNotRendered12216(t *testing.T, cfg *Config, source, application string) {
 	t.Helper()
@@ -201,5 +204,66 @@ func TestJunosHostApplicationCollisionUnderPredefinedName12216(t *testing.T) {
 	key := JunosHostZonePairPolicyKey("untrust", "blocked")
 	if projection.RenderedPolicyKeys[key] {
 		t.Fatalf("nested application collision must not suppress the host-deny warning: %+v", projection.RenderedPolicyKeys)
+	}
+}
+
+func TestJunosHostAppOnlyNestedCollision12216(t *testing.T) {
+	base := []string{
+		"set interfaces ge-0/0/1 unit 0 family inet address 10.0.2.10/24",
+		"set security zones security-zone untrust interfaces ge-0/0/1.0 host-inbound-traffic system-services ssh",
+		"set applications application app term ssh protocol tcp destination-port 22",
+		"set applications application app term web protocol tcp destination-port 80",
+		"set applications application app-ssh protocol udp destination-port 53",
+		"set applications application-set outer application app-ssh",
+		"set applications application-set outer application junos-https",
+	}
+	for _, ref := range []string{"app", "outer"} {
+		t.Run(ref, func(t *testing.T) {
+			p := "set security policies from-zone untrust to-zone junos-host policy blocked "
+			cmds := append(append([]string{}, base...),
+				p+"match source-address any", p+"match destination-address any",
+				p+"match application "+ref, p+"then deny")
+			cfg, err := CompileConfigLenient(buildTree(t, cmds))
+			if err != nil {
+				t.Fatalf("lenient compile: %v", err)
+			}
+			if _, colliding := cfg.Applications.CollidingNames["app-ssh"]; !colliding {
+				t.Fatal("fixture must mark app-ssh as colliding")
+			}
+			if _, inSets := cfg.Applications.ApplicationSets["app-ssh"]; inSets {
+				t.Fatal("fixture must keep app-ssh application-only, not a set")
+			}
+			if _, inApps := cfg.Applications.Applications["app-ssh"]; !inApps {
+				t.Fatal("fixture must keep app-ssh as an authored application")
+			}
+			projection := BuildJunosHostDenyProjection(cfg)
+			foundZone := false
+			for _, program := range projection.Programs {
+				if program.Zone != "untrust" {
+					continue
+				}
+				foundZone = true
+				if program.Representable {
+					t.Fatalf("app-only nested collision must make untrust unrepresentable: %+v", program)
+				}
+				if len(program.RulesV4) != 0 {
+					t.Fatalf("unrepresentable program must render no rules: %+v", program.RulesV4)
+				}
+			}
+			if !foundZone {
+				t.Fatalf("fixture produced no untrust program: %+v", projection.Programs)
+			}
+			key := JunosHostZonePairPolicyKey("untrust", "blocked")
+			if projection.RenderedPolicyKeys[key] {
+				t.Fatalf("app-only nested collision must not suppress the host-deny warning: %+v", projection.RenderedPolicyKeys)
+			}
+			drops := ApplicationReferenceMatchDrops(ref, &cfg.Applications)
+			if len(drops) == 0 {
+				t.Fatalf("reference %q must carry match drops; got none", ref)
+			}
+			if joined := strings.Join(drops, "\n"); !strings.Contains(joined, `member "app-ssh" has an ambiguous colliding name`) {
+				t.Fatalf("reference %q drops = %q, want the colliding member named", ref, drops)
+			}
+		})
 	}
 }
