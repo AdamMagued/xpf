@@ -669,6 +669,7 @@ type TransferReadinessSnapshot struct {
 	Connected             bool
 	PendingBulkAckEpoch   uint64
 	PendingBulkAckAge     time.Duration
+	BulkAckRetryOwed      bool
 	BulkReceiveInProgress bool
 	BulkReceiveEpoch      uint64
 	BulkReceiveSessions   int
@@ -694,7 +695,8 @@ func (s TransferReadinessSnapshot) ConfigStale() bool {
 // security policy. The unplanned/crash failover path is a separate
 // availability-vs-security tradeoff and is NOT gated here.
 func (s TransferReadinessSnapshot) ReadyForManualFailover() bool {
-	return s.PendingBulkAckEpoch == 0 && !s.BulkReceiveInProgress && !s.ConfigStale()
+	return s.PendingBulkAckEpoch == 0 && !s.BulkAckRetryOwed &&
+		!s.BulkReceiveInProgress && !s.ConfigStale()
 }
 
 // Reason explains the current transfer-readiness blocker, if any.
@@ -706,6 +708,8 @@ func (s TransferReadinessSnapshot) Reason() string {
 			age = 0
 		}
 		return fmt.Sprintf("peer still receiving outbound bulk epoch=%d age=%s", s.PendingBulkAckEpoch, age.Round(100*time.Millisecond))
+	case s.BulkAckRetryOwed:
+		return "outbound authoritative bulk retry is owed"
 	case s.BulkReceiveInProgress:
 		return fmt.Sprintf("local bulk receive still in progress epoch=%d sessions=%d", s.BulkReceiveEpoch, s.BulkReceiveSessions)
 	case s.ConfigStale():
@@ -1390,6 +1394,10 @@ type SessionSync struct {
 	// flag bounds it to a single in-flight re-drive so a survivor that ALSO
 	// flaps cannot cause a re-drive storm.
 	bulkRedriveInFlight atomic.Bool
+	// bulkAckRetryOwed latches a retry when a completed bulk's source failed
+	// during its retry attempt. The peer ack clears it through
+	// clearPendingBulkAck, while reconnect's cold-prime path replaces it.
+	bulkAckRetryOwed atomic.Bool
 	// bulkRequestInFlight coalesces concurrent inbound syncMsgBulkRequest
 	// handlers; ordinary bulks still serialize through bulkSendMu.
 	bulkRequestInFlight atomic.Bool

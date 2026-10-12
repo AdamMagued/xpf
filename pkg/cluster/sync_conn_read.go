@@ -622,6 +622,7 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		}
 		owed := s.pendingBulkOwed.Load() // #9626: the debt this bulk was sent to pay
 		s.clearPendingBulkAck()
+		s.bulkAckRetryOwed.Store(false)
 		s.bulkEverCompleted.Store(true)
 		// #4360: the peer acked OUR outbound bulk — record it on the
 		// outbound-only flag so a stranded outbound bulk can be re-driven on a

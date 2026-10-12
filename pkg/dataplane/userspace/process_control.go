@@ -497,6 +497,13 @@ func (m *Manager) requestSessionSyncResponseLocked(req ControlRequest) (ControlR
 			}
 			return ControlResponse{}, fmt.Errorf("%w: %s", dataplane.ErrSyncedImportRefused, reason)
 		}
+		// Only the helper's known pure-validation failures are deterministic.
+		// In-band mirror-write-failed and unknown responses remain retryable:
+		// acking them could advertise a row that never reached shared authority.
+		if strings.HasPrefix(resp.Error, "parse ") ||
+			strings.HasPrefix(resp.Error, "refusing synced session with unresolved IPv6 extension-header") {
+			return ControlResponse{}, fmt.Errorf("%w: %s", dataplane.ErrSyncedImportRejected, resp.Error)
+		}
 		return ControlResponse{}, errors.New(resp.Error)
 	}
 	return resp, nil
