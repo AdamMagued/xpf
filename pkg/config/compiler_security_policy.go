@@ -135,20 +135,27 @@ func compilePolicies(node *Node, sec *SecurityConfig) error {
 				pairs = append(pairs, zonePair{child.Keys[1], child.Keys[3], child})
 			} else {
 				// Flat set: from-zone → <name> → to-zone → <name> → policy ...
+				if len(child.Keys) >= 2 && bodyHasToZoneLessPolicy12231(child) {
+					// Keyed context: the children are the body, so the source
+					// zone is Keys[1], not a child name.
+					sec.MalformedZonePairs = append(sec.MalformedZonePairs, toZoneLess12231(child.Keys[1]))
+				}
 				for _, fzSub := range child.Children {
+					if len(child.Keys) == 1 {
+						if to, mixed := keysCarryToZone12231(fzSub); mixed {
+							if len(fzSub.FindChildren("policy")) > 0 {
+								sec.MalformedZonePairs = append(sec.MalformedZonePairs,
+									fmt.Sprintf("from-zone { %s to-zone %s { ... } } mixes the container and keyed zone-pair spellings (#11346); the policy context is skipped and not enforced (#12231)",
+										fzSub.Name(), to))
+							}
+							continue
+						}
+						if bodyHasToZoneLessPolicy12231(fzSub) {
+							sec.MalformedZonePairs = append(sec.MalformedZonePairs, toZoneLess12231(fzSub.Name()))
+						}
+					}
 					tzNode := fzSub.FindChild("to-zone")
 					if tzNode == nil {
-						// A keyed from-zone node's direct `to-zone` child is the
-						// separately diagnosed #7523/#11346 nested spelling. Other
-						// source-zone children with policy statements but no
-						// destination would otherwise disappear without any
-						// enforcement diagnostic.
-						nestedToZone := len(child.Keys) >= 2 && fzSub.Name() == "to-zone"
-						if !nestedToZone && len(fzSub.FindChildren("policy")) > 0 {
-							sec.MalformedZonePairs = append(sec.MalformedZonePairs,
-								fmt.Sprintf("from-zone %q has no to-zone context; the policy context is skipped and not enforced (#12231)",
-									fzSub.Name()))
-						}
 						continue
 					}
 					for _, tzSub := range tzNode.Children {
@@ -731,4 +738,35 @@ func LenientDroppedPolicyLocator(cfg *Config) string {
 		}
 	}
 	return ""
+}
+
+func toZoneLess12231(from string) string {
+	return fmt.Sprintf("from-zone %q has no to-zone context; the policy context is skipped and not enforced (#12231)", from)
+}
+
+// bodyHasToZoneLessPolicy12231 reports whether ctx carries a policy without a
+// destination: a direct policy or one nested under a child other than to-zone.
+func bodyHasToZoneLessPolicy12231(ctx *Node) bool {
+	for _, c := range ctx.Children {
+		switch c.Name() {
+		case "policy":
+			return true
+		case "to-zone":
+			continue
+		}
+		if len(c.FindChildren("policy")) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// keysCarryToZone12231 detects #11346's mixed container/keyed spelling.
+func keysCarryToZone12231(n *Node) (string, bool) {
+	for i := 1; i+1 < len(n.Keys); i++ {
+		if n.Keys[i] == "to-zone" {
+			return n.Keys[i+1], true
+		}
+	}
+	return "", false
 }
