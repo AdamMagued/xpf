@@ -12,11 +12,7 @@
 //!   `state.fabrics`, resolving local + peer MACs through
 //!   [`IfaceIndex`] and the populated `state.neighbors` map.
 //!
-//! Also hosts the route-target resolution helpers
-//! ([`resolve_route_next_hops_v4`] etc.) re-exported by
-//! `forwarding_build/mod.rs` as `pub(in crate::afxdp)` for the
-//! other afxdp siblings that consume them via `use
-//! self::forwarding_build::*;` in `afxdp/mod.rs`.
+//! Also hosts private route-target resolution helpers used while building FIB rows.
 
 use super::super::*;
 use super::interfaces::IfaceIndex;
@@ -201,6 +197,9 @@ impl<'a> RecursiveGatewayRoutes<'a> {
 }
 
 const MAX_RECURSIVE_STATIC_DEPTH: usize = 8;
+// Limit total recursive route/gateway probes per authored next-hop. This turns
+// adversarial branching route graphs into bounded, fail-closed work.
+const MAX_RECURSIVE_STATIC_WORK: usize = 512;
 
 fn recursive_static_target_v4(
     state: &ForwardingState,
@@ -211,72 +210,75 @@ fn recursive_static_target_v4(
     linux_names: &BTreeMap<String, i32>,
     visited: &mut [Option<Ipv4Addr>; MAX_RECURSIVE_STATIC_DEPTH],
     depth: usize,
+    work: &mut usize,
 ) -> Option<(Ipv4Addr, i32, u16)> {
-    if depth >= MAX_RECURSIVE_STATIC_DEPTH || visited[..depth].contains(&Some(ip)) {
+    if depth >= MAX_RECURSIVE_STATIC_DEPTH
+        || visited[..depth].contains(&Some(ip))
+        || *work == 0
+    {
         return None;
     }
+    *work -= 1;
     visited[depth] = Some(ip);
-    let resolved = (|| {
-        let candidates = routes.v4.get(table)?;
-        let prefix_len = candidates
-            .iter()
-            .filter(|entry| entry.prefix.contains(ip))
-            .map(|entry| entry.prefix.prefix_len())
-            .max()?;
-        for entry in candidates
-            .iter()
-            .filter(|entry| entry.prefix.prefix_len() == prefix_len && entry.prefix.contains(ip))
-        {
-            let route = entry.route;
-            if route.discard || !route.next_table.is_empty() {
-                return None;
-            }
-            for spec in &route.next_hops {
-                let (gateway, interface) = parse_route_next_hop(spec);
-                let allow_default_interface = gateway.is_some() || spec.starts_with('@');
-                if let Some(name) = interface.as_deref() {
-                    if let Some(ifindex) = explicit_ifindex_in_route_table(
-                        name,
-                        allow_default_interface,
-                        names,
-                        linux_names,
-                        state,
-                        table,
-                    ) {
-                        let tunnel_endpoint_id = state
-                            .tunnel_endpoint_by_ifindex
-                            .get(&ifindex)
-                            .copied()
-                            .unwrap_or(0);
-                        return Some((gateway.unwrap_or(ip), ifindex, tunnel_endpoint_id));
-                    }
-                    continue;
-                }
-                let Some(gateway) = gateway else {
-                    continue;
-                };
-                if let Some((ifindex, tunnel_endpoint_id)) =
-                    infer_connected_route_target_v4(state, gateway, table)
-                {
-                    return Some((gateway, ifindex, tunnel_endpoint_id));
-                }
-                if let Some(resolved) = recursive_static_target_v4(
-                    state,
-                    routes,
-                    gateway,
-                    table,
+    let candidates = routes.v4.get(table)?;
+    let prefix_len = candidates
+        .iter()
+        .filter(|entry| entry.prefix.contains(ip))
+        .map(|entry| entry.prefix.prefix_len())
+        .max()?;
+    for entry in candidates
+        .iter()
+        .filter(|entry| entry.prefix.prefix_len() == prefix_len && entry.prefix.contains(ip))
+    {
+        let route = entry.route;
+        if route.discard || !route.next_table.is_empty() {
+            return None;
+        }
+        for spec in &route.next_hops {
+            let (gateway, interface) = parse_route_next_hop(spec);
+            let allow_default_interface = gateway.is_some() || spec.starts_with('@');
+            if let Some(name) = interface.as_deref() {
+                if let Some(ifindex) = explicit_ifindex_in_route_table(
+                    name,
+                    allow_default_interface,
                     names,
                     linux_names,
-                    visited,
-                    depth + 1,
+                    state,
+                    table,
                 ) {
-                    return Some(resolved);
+                    let tunnel_endpoint_id = state
+                        .tunnel_endpoint_by_ifindex
+                        .get(&ifindex)
+                        .copied()
+                        .unwrap_or(0);
+                    return Some((gateway.unwrap_or(ip), ifindex, tunnel_endpoint_id));
                 }
+                continue;
+            }
+            let Some(gateway) = gateway else {
+                continue;
+            };
+            if let Some((ifindex, tunnel_endpoint_id)) =
+                infer_connected_route_target_v4(state, gateway, table)
+            {
+                return Some((gateway, ifindex, tunnel_endpoint_id));
+            }
+            if let Some(resolved) = recursive_static_target_v4(
+                state,
+                routes,
+                gateway,
+                table,
+                names,
+                linux_names,
+                visited,
+                depth + 1,
+                work,
+            ) {
+                return Some(resolved);
             }
         }
-        None
-    })();
-    resolved
+    }
+    None
 }
 
 fn recursive_static_target_v6(
@@ -288,72 +290,78 @@ fn recursive_static_target_v6(
     linux_names: &BTreeMap<String, i32>,
     visited: &mut [Option<Ipv6Addr>; MAX_RECURSIVE_STATIC_DEPTH],
     depth: usize,
+    work: &mut usize,
 ) -> Option<(Ipv6Addr, i32, u16)> {
-    if depth >= MAX_RECURSIVE_STATIC_DEPTH || visited[..depth].contains(&Some(ip)) {
+    // Link-local next hops have no global routing-table scope. They may use
+    // unambiguous connected inference at the caller, but must never recurse.
+    if ip.is_unicast_link_local()
+        || depth >= MAX_RECURSIVE_STATIC_DEPTH
+        || visited[..depth].contains(&Some(ip))
+        || *work == 0
+    {
         return None;
     }
+    *work -= 1;
     visited[depth] = Some(ip);
-    let resolved = (|| {
-        let candidates = routes.v6.get(table)?;
-        let prefix_len = candidates
-            .iter()
-            .filter(|entry| entry.prefix.contains(ip))
-            .map(|entry| entry.prefix.prefix_len())
-            .max()?;
-        for entry in candidates
-            .iter()
-            .filter(|entry| entry.prefix.prefix_len() == prefix_len && entry.prefix.contains(ip))
-        {
-            let route = entry.route;
-            if route.discard || !route.next_table.is_empty() {
-                return None;
-            }
-            for spec in &route.next_hops {
-                let (gateway, interface) = parse_route_next_hop_v6(spec);
-                let allow_default_interface = gateway.is_some() || spec.starts_with('@');
-                if let Some(name) = interface.as_deref() {
-                    if let Some(ifindex) = explicit_ifindex_in_route_table(
-                        name,
-                        allow_default_interface,
-                        names,
-                        linux_names,
-                        state,
-                        table,
-                    ) {
-                        let tunnel_endpoint_id = state
-                            .tunnel_endpoint_by_ifindex
-                            .get(&ifindex)
-                            .copied()
-                            .unwrap_or(0);
-                        return Some((gateway.unwrap_or(ip), ifindex, tunnel_endpoint_id));
-                    }
-                    continue;
-                }
-                let Some(gateway) = gateway else {
-                    continue;
-                };
-                if let Some((ifindex, tunnel_endpoint_id)) =
-                    infer_connected_route_target_v6(state, gateway, table)
-                {
-                    return Some((gateway, ifindex, tunnel_endpoint_id));
-                }
-                if let Some(resolved) = recursive_static_target_v6(
-                    state,
-                    routes,
-                    gateway,
-                    table,
+    let candidates = routes.v6.get(table)?;
+    let prefix_len = candidates
+        .iter()
+        .filter(|entry| entry.prefix.contains(ip))
+        .map(|entry| entry.prefix.prefix_len())
+        .max()?;
+    for entry in candidates
+        .iter()
+        .filter(|entry| entry.prefix.prefix_len() == prefix_len && entry.prefix.contains(ip))
+    {
+        let route = entry.route;
+        if route.discard || !route.next_table.is_empty() {
+            return None;
+        }
+        for spec in &route.next_hops {
+            let (gateway, interface) = parse_route_next_hop_v6(spec);
+            let allow_default_interface = gateway.is_some() || spec.starts_with('@');
+            if let Some(name) = interface.as_deref() {
+                if let Some(ifindex) = explicit_ifindex_in_route_table(
+                    name,
+                    allow_default_interface,
                     names,
                     linux_names,
-                    visited,
-                    depth + 1,
+                    state,
+                    table,
                 ) {
-                    return Some(resolved);
+                    let tunnel_endpoint_id = state
+                        .tunnel_endpoint_by_ifindex
+                        .get(&ifindex)
+                        .copied()
+                        .unwrap_or(0);
+                    return Some((gateway.unwrap_or(ip), ifindex, tunnel_endpoint_id));
                 }
+                continue;
+            }
+            let Some(gateway) = gateway else {
+                continue;
+            };
+            if let Some((ifindex, tunnel_endpoint_id)) =
+                infer_connected_route_target_v6(state, gateway, table)
+            {
+                return Some((gateway, ifindex, tunnel_endpoint_id));
+            }
+            if let Some(resolved) = recursive_static_target_v6(
+                state,
+                routes,
+                gateway,
+                table,
+                names,
+                linux_names,
+                visited,
+                depth + 1,
+                work,
+            ) {
+                return Some(resolved);
             }
         }
-        None
-    })();
-    resolved
+    }
+    None
 }
 
 fn recursive_gateway_target_v4(
@@ -364,6 +372,7 @@ fn recursive_gateway_target_v4(
     names: &BTreeMap<String, i32>,
     linux_names: &BTreeMap<String, i32>,
 ) -> Option<(Ipv4Addr, i32, u16)> {
+    let mut work = MAX_RECURSIVE_STATIC_WORK;
     let mut visited = [None; MAX_RECURSIVE_STATIC_DEPTH];
     recursive_static_target_v4(
         state,
@@ -374,6 +383,7 @@ fn recursive_gateway_target_v4(
         linux_names,
         &mut visited,
         0,
+        &mut work,
     )
 }
 
@@ -385,6 +395,7 @@ fn recursive_gateway_target_v6(
     names: &BTreeMap<String, i32>,
     linux_names: &BTreeMap<String, i32>,
 ) -> Option<(Ipv6Addr, i32, u16)> {
+    let mut work = MAX_RECURSIVE_STATIC_WORK;
     let mut visited = [None; MAX_RECURSIVE_STATIC_DEPTH];
     recursive_static_target_v6(
         state,
@@ -395,6 +406,7 @@ fn recursive_gateway_target_v6(
         linux_names,
         &mut visited,
         0,
+        &mut work,
     )
 }
 
@@ -745,23 +757,6 @@ pub(super) fn populate_fabrics(
 /// same-table static routes; the terminal gateway and egress ifindex are baked
 /// into the member because lookup consumes `nh.next_hop` and `nh.ifindex`.
 /// Candidates whose interface fails to resolve are retained with ifindex 0.
-pub(in crate::afxdp) fn resolve_route_next_hops_v4(
-    route: &RouteSnapshot,
-    names: &BTreeMap<String, i32>,
-    linux_names: &BTreeMap<String, i32>,
-    state: &ForwardingState,
-    table: &str,
-) -> Vec<RouteNextHopV4> {
-    resolve_route_next_hops_v4_with_routes(
-        route,
-        names,
-        linux_names,
-        state,
-        table,
-        &RecursiveGatewayRoutes::default(),
-    )
-}
-
 fn resolve_route_next_hops_v4_with_routes(
     route: &RouteSnapshot,
     names: &BTreeMap<String, i32>,
@@ -821,23 +816,19 @@ fn resolve_route_next_hops_v4_with_routes(
         .collect()
 }
 
-pub(in crate::afxdp) fn resolve_route_next_hops_v6(
-    route: &RouteSnapshot,
-    names: &BTreeMap<String, i32>,
-    linux_names: &BTreeMap<String, i32>,
-    state: &ForwardingState,
-    table: &str,
-) -> Vec<RouteNextHopV6> {
-    resolve_route_next_hops_v6_with_routes(
-        route,
-        names,
-        linux_names,
-        state,
-        table,
-        &RecursiveGatewayRoutes::default(),
-    )
-}
-
+/// #2389: resolve EVERY configured next-hop of a static route into a
+/// `RouteNextHopV6` candidate. A discard / next-table route has no forwarding
+/// next-hop (returns empty). An explicit interface resolves when it belongs to
+/// the route's canonical table. In a Go-marked forwarding-instance table, an
+/// explicit default-instance interface in routing domain zero is also accepted
+/// for a qualified gateway (#11420, #11684) or an interface-only `@interface`
+/// member (#12036); other explicit cross-instance interfaces stay unresolved
+/// and never fall back to gateway inference.
+/// At FIB construction, bare gateways first infer from connected prefixes in
+/// their own canonical table (#4446), then recursively resolve through
+/// same-table static routes; the terminal gateway and egress ifindex are baked
+/// into the member because lookup consumes `nh.next_hop` and `nh.ifindex`.
+/// Candidates whose interface fails to resolve are retained with ifindex 0.
 fn resolve_route_next_hops_v6_with_routes(
     route: &RouteSnapshot,
     names: &BTreeMap<String, i32>,
@@ -1015,6 +1006,11 @@ fn resolve_next_hop_target_v6(
     if let Some((ifindex, tunnel_endpoint_id)) = infer_connected_route_target_v6(state, ip, table) {
         return (Some(ip), ifindex, tunnel_endpoint_id);
     }
+    // #12398 B1: when connected inference cannot choose a unique link for a
+    // bare link-local gateway, fail closed instead of consulting ::/0.
+    if ip.is_unicast_link_local() {
+        return (Some(ip), 0, 0);
+    }
     recursive_gateway_target_v6(state, recursive_routes, ip, table, names, linux_names)
         .map(|(gateway, ifindex, tunnel_endpoint_id)| (Some(gateway), ifindex, tunnel_endpoint_id))
         .unwrap_or((Some(ip), 0, 0))
@@ -1023,7 +1019,7 @@ fn resolve_next_hop_target_v6(
 /// Route literals are family-checked by `populate_routes` before this parser is
 /// called. Without that guard, a valid IPv6 gateway on an IPv4 route would
 /// silently produce `(None, None)` and the route would become NoRoute.
-pub(in crate::afxdp) fn parse_route_next_hop(spec: &str) -> (Option<Ipv4Addr>, Option<String>) {
+fn parse_route_next_hop(spec: &str) -> (Option<Ipv4Addr>, Option<String>) {
     let (ip_part, if_part) = if let Some((lhs, rhs)) = spec.split_once('@') {
         (lhs, rhs)
     } else {
@@ -1042,7 +1038,7 @@ pub(in crate::afxdp) fn parse_route_next_hop(spec: &str) -> (Option<Ipv4Addr>, O
     (ip, iface)
 }
 
-pub(in crate::afxdp) fn parse_route_next_hop_v6(spec: &str) -> (Option<Ipv6Addr>, Option<String>) {
+fn parse_route_next_hop_v6(spec: &str) -> (Option<Ipv6Addr>, Option<String>) {
     let (ip_part, if_part) = if let Some((lhs, rhs)) = spec.split_once('@') {
         (lhs, rhs)
     } else {
@@ -1061,7 +1057,7 @@ pub(in crate::afxdp) fn parse_route_next_hop_v6(spec: &str) -> (Option<Ipv6Addr>
     (ip, iface)
 }
 
-pub(in crate::afxdp) fn resolve_ifindex(
+fn resolve_ifindex(
     name: &str,
     names: &BTreeMap<String, i32>,
     linux_names: &BTreeMap<String, i32>,
@@ -1072,7 +1068,7 @@ pub(in crate::afxdp) fn resolve_ifindex(
         .or_else(|| linux_names.get(name).copied())
 }
 
-pub(in crate::afxdp) fn infer_connected_route_target_v4(
+fn infer_connected_route_target_v4(
     state: &ForwardingState,
     ip: Ipv4Addr,
     table: &str,
@@ -1098,7 +1094,7 @@ pub(in crate::afxdp) fn infer_connected_route_target_v4(
         .map(|entry| (entry.ifindex, entry.tunnel_endpoint_id))
 }
 
-pub(in crate::afxdp) fn infer_connected_route_target_v6(
+fn infer_connected_route_target_v6(
     state: &ForwardingState,
     ip: Ipv6Addr,
     table: &str,
@@ -1138,4 +1134,55 @@ pub(in crate::afxdp) fn infer_connected_route_target_v6(
         .iter()
         .find(|entry| entry.table == table && entry.prefix.contains(ip))
         .map(|entry| (entry.ifindex, entry.tunnel_endpoint_id))
+}
+#[cfg(test)]
+mod recursive_cycle_guard_12398_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_gateway_is_rejected_before_static_lookup_12398() {
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![InterfaceSnapshot {
+                name: "ge-0-0-1".into(),
+                ifindex: 201,
+                addresses: vec![crate::protocol::snapshot::InterfaceAddressSnapshot {
+                    family: "inet".into(),
+                    address: "192.0.2.1/24".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            routes: vec![RouteSnapshot {
+                table: "inet.0".into(),
+                family: "inet".into(),
+                destination: "10.14.0.0/24".into(),
+                next_hops: vec!["192.0.2.254".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let state = build_forwarding_state(&snapshot);
+        let routes = RecursiveGatewayRoutes::from_snapshot(&snapshot);
+        let gateway = Ipv4Addr::new(10, 14, 0, 1);
+        let mut visited = [None; MAX_RECURSIVE_STATIC_DEPTH];
+        visited[0] = Some(gateway);
+        let mut work = MAX_RECURSIVE_STATIC_WORK;
+
+        let resolved = recursive_static_target_v4(
+            &state,
+            &routes,
+            gateway,
+            "inet.0",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &mut visited,
+            1,
+            &mut work,
+        );
+
+        assert_eq!(
+            resolved, None,
+            "a repeated gateway must be rejected instead of resolving through itself"
+        );
+    }
 }

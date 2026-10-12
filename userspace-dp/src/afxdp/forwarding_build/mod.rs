@@ -14,10 +14,8 @@
 //! - [`tunnels`] — `populate_tunnel_endpoints`
 //! - [`interfaces`] — `populate_interfaces` (returns `IfaceIndex`),
 //!   `populate_egress`, `pick_interface_v[46]`
-//! - [`fib`] — `sort_connected`, `populate_routes`, `sort_routes`,
-//!   `populate_neighbors`, `populate_fabrics`,
-//!   `resolve_route_target_v[46]`, `parse_route_next_hop[_v6]`,
-//!   `resolve_ifindex`, `infer_connected_route_target_v[46]`
+//! - [`fib`] — route/neighbor/fabric population, including private
+//!   same-table recursive-gateway resolution.
 //! - [`install_tables`] — `build_install_table_registry` (#9752)
 //!   installing-table domain → canonical tables + owner check, derived last.
 //! - [`cos`] — `build_cos_state` (split into
@@ -46,13 +44,6 @@ mod link_local_scope_11650;
 #[cfg(test)]
 mod connected_ifindex_12063;
 
-// Re-exports for cross-afxdp-sibling consumers reached via
-// `use self::forwarding_build::*;` in `afxdp/mod.rs`.
-pub(in crate::afxdp) use fib::{
-    infer_connected_route_target_v4, infer_connected_route_target_v6, parse_route_next_hop,
-    parse_route_next_hop_v6, resolve_ifindex, resolve_route_next_hops_v4,
-    resolve_route_next_hops_v6,
-};
 pub(in crate::afxdp) use interfaces::{
     connected_route_tables, pick_interface_v4, pick_interface_v6,
 };

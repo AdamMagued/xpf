@@ -12150,14 +12150,15 @@ fn admin_disabled_interface_addresses_do_not_enter_fib_state_11463() {
     );
 }
 
-/// #12183: a mixed direct/recursive static row whose direct member is dead
-/// must drive the recursive member through the second static that resolves
-/// it — not bake `(R, ifindex 0)` and let the dead direct member win the
-/// drivable fallback. Fixture: direct A has no neighbor (the connected prefix
-/// remains live), while bare R `10.10.0.1` resolves only via second static S
-/// (`10.10.0.0/24` via connected G `192.168.0.254`). The R leg must bake
-/// the TERMINAL gateway `(G, ifindex 201)`: lookup ARPs/transmits via
-/// `nh.next_hop`, so an ifindex alone would still ARP for R.
+/// #12183: a mixed direct/recursive row whose direct member has no neighbor
+/// pins the single-terminal recursive path through the second static in two
+/// route-record orders. It does not cover multiple recursive backup specs or
+/// exclusion of a route from matching itself; B2 is tracked by follow-up #12613.
+/// Fixture: direct A has no neighbor (the connected prefix remains live), while
+/// bare R `10.10.0.1` resolves only via second static S (`10.10.0.0/24` via
+/// connected G `192.168.0.254`). The R leg must bake terminal gateway `(G,
+/// ifindex 201)`: lookup ARPs/transmits via `nh.next_hop`, so an ifindex alone
+/// would still ARP for R.
 #[test]
 fn mixed_static_recursive_backup_resolves_via_second_static_12183() {
     use std::net::Ipv4Addr;
@@ -12270,8 +12271,9 @@ fn mixed_static_recursive_backup_resolves_via_second_static_12183() {
     }
 }
 
-/// #12183 v6 twin: same shape — direct A has no neighbor, bare R via second
-/// static S — must bake the terminal gateway on the recursive leg.
+/// #12183 v6 twin of the single-terminal recursive case above. It pins
+/// route-record order and terminal-hop baking, not B2 multi-spec selection or
+/// self-match exclusion (tracked by follow-up #12613).
 #[test]
 fn mixed_static_recursive_backup_resolves_via_second_static_v6_12183() {
     use std::net::Ipv6Addr;
@@ -12402,7 +12404,7 @@ fn mixed_static_recursive_backup_resolves_via_second_static_v6_12183() {
 }
 
 /// #12183 controls (green pre- and post-fix): recursion must fail closed.
-/// A self-recursive row, an all-bare row with no resolving static, a
+/// A pure self-recursive cycle, an all-bare row with no resolving static, a
 /// cross-table second static, and a discard-covered R must all leave the
 /// recursive leg at ifindex 0 — never bind a wrong egress.
 #[test]
@@ -12498,4 +12500,883 @@ fn mixed_static_recursion_fails_closed_controls_12183() {
             "control row for {destination} must keep its authored gateway"
         );
     }
+}
+/// #12398 B1: ambiguous bare IPv6 link-local gateways must not recurse through
+/// the global default route and acquire an unrelated WAN egress.
+#[test]
+fn bare_v6_link_local_never_recurses_to_default_gateway_12398() {
+    let wan_gateway: std::net::Ipv6Addr = "2001:db8:2::fe".parse().unwrap();
+    let probe: std::net::Ipv6Addr = "2001:db8:20::5".parse().unwrap();
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![
+            InterfaceSnapshot {
+                name: "ge-0-0-1".into(),
+                ifindex: 201,
+                addresses: vec![crate::protocol::snapshot::InterfaceAddressSnapshot {
+                    family: "inet6".into(),
+                    address: "2001:db8:1::1/64".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            InterfaceSnapshot {
+                name: "ge-0-0-2".into(),
+                ifindex: 202,
+                addresses: vec![crate::protocol::snapshot::InterfaceAddressSnapshot {
+                    family: "inet6".into(),
+                    address: "2001:db8:2::1/64".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ],
+        neighbors: vec![crate::NeighborSnapshot {
+            interface: "ge-0-0-2".into(),
+            ifindex: 202,
+            family: "inet6".into(),
+            ip: wan_gateway.to_string(),
+            mac: "02:00:00:00:02:fe".into(),
+            state: "reachable".into(),
+            ..Default::default()
+        }],
+        routes: vec![
+            crate::RouteSnapshot {
+                table: "inet6.0".into(),
+                family: "inet6".into(),
+                destination: "::/0".into(),
+                next_hops: vec![wan_gateway.to_string()],
+                ..Default::default()
+            },
+            crate::RouteSnapshot {
+                table: "inet6.0".into(),
+                family: "inet6".into(),
+                destination: "2001:db8:20::/64".into(),
+                next_hops: vec![
+                    "2001:db8:1::99@missing0".into(),
+                    "fe80::1".into(),
+                ],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    let route = state
+        .routes_v6
+        .get("inet6.0")
+        .unwrap()
+        .iter()
+        .find(|route| route.prefix.contains(probe))
+        .expect("mixed v6 route");
+    assert_eq!(route.next_hops.len(), 2);
+    let link_local_ifindex = route
+        .next_hops
+        .iter()
+        .find(|nh| nh.next_hop == Some("fe80::1".parse().unwrap()))
+        .map(|nh| nh.ifindex);
+    let mut wan_fail_open_flows = 0;
+    for seed in 0u64..256 {
+        let resolution = lookup_forwarding_resolution_v6(
+            &state,
+            None,
+            probe,
+            "inet6.0",
+            0,
+            true,
+            Some(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5555),
+        );
+        if resolution.disposition == ForwardingDisposition::ForwardCandidate
+            && resolution.egress_ifindex == 202
+            && resolution.next_hop == Some(IpAddr::V6(wan_gateway))
+        {
+            wan_fail_open_flows += 1;
+        }
+    }
+    println!("bare fe80::1 WAN fail-open flows: {wan_fail_open_flows}/256");
+    assert_eq!(
+        link_local_ifindex,
+        Some(0),
+        "ambiguous bare link-local must remain unresolved"
+    );
+    assert_eq!(
+        wan_fail_open_flows, 0,
+        "bare fe80::/10 must not steer any of 256 flows to the default WAN gateway"
+    );
+}
+
+/// #12398 F1: a nested bare IPv6 link-local gateway, reached only through a
+/// covering static route, must not recurse through the global default route
+/// and acquire the unrelated WAN egress. Only the recursion guard pins this;
+/// the top-level B1 entry guard never sees the nested next hop.
+#[test]
+fn bare_v6_link_local_nested_never_recurses_to_wan_12398() {
+    let wan_gateway: std::net::Ipv6Addr = "2001:db8:2::fe".parse().unwrap();
+    let probe: std::net::Ipv6Addr = "2001:db8:20::5".parse().unwrap();
+    let nested: std::net::Ipv6Addr = "2001:db8:30::1".parse().unwrap();
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![
+            InterfaceSnapshot {
+                name: "ge-0-0-1".into(),
+                ifindex: 201,
+                addresses: vec![crate::protocol::snapshot::InterfaceAddressSnapshot {
+                    family: "inet6".into(),
+                    address: "2001:db8:1::1/64".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            InterfaceSnapshot {
+                name: "ge-0-0-2".into(),
+                ifindex: 202,
+                addresses: vec![crate::protocol::snapshot::InterfaceAddressSnapshot {
+                    family: "inet6".into(),
+                    address: "2001:db8:2::1/64".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ],
+        neighbors: vec![crate::NeighborSnapshot {
+            interface: "ge-0-0-2".into(),
+            ifindex: 202,
+            family: "inet6".into(),
+            ip: wan_gateway.to_string(),
+            mac: "02:00:00:00:02:fe".into(),
+            state: "reachable".into(),
+            ..Default::default()
+        }],
+        routes: vec![
+            crate::RouteSnapshot {
+                table: "inet6.0".into(),
+                family: "inet6".into(),
+                destination: "::/0".into(),
+                next_hops: vec![wan_gateway.to_string()],
+                ..Default::default()
+            },
+            crate::RouteSnapshot {
+                table: "inet6.0".into(),
+                family: "inet6".into(),
+                destination: "2001:db8:30::/64".into(),
+                next_hops: vec!["fe80::1".into()],
+                ..Default::default()
+            },
+            crate::RouteSnapshot {
+                table: "inet6.0".into(),
+                family: "inet6".into(),
+                destination: "2001:db8:20::/64".into(),
+                next_hops: vec!["2001:db8:1::99@missing0".into(), "2001:db8:30::1".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    let route = state
+        .routes_v6
+        .get("inet6.0")
+        .unwrap()
+        .iter()
+        .find(|route| route.prefix.contains(probe))
+        .expect("mixed v6 route");
+    assert_eq!(route.next_hops.len(), 2);
+    let nested_ifindex = route
+        .next_hops
+        .iter()
+        .find(|nh| nh.next_hop == Some(nested))
+        .map(|nh| nh.ifindex);
+    let mut wan_fail_open_flows = 0;
+    for seed in 0u64..256 {
+        let resolution = lookup_forwarding_resolution_v6(
+            &state,
+            None,
+            probe,
+            "inet6.0",
+            0,
+            true,
+            Some(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5555),
+        );
+        if resolution.disposition == ForwardingDisposition::ForwardCandidate
+            && resolution.egress_ifindex == 202
+            && resolution.next_hop == Some(IpAddr::V6(wan_gateway))
+        {
+            wan_fail_open_flows += 1;
+        }
+    }
+    println!("nested bare fe80::1 WAN fail-open flows: {wan_fail_open_flows}/256");
+    assert_eq!(
+        nested_ifindex,
+        Some(0),
+        "nested bare link-local must remain unresolved"
+    );
+    assert_eq!(
+        wan_fail_open_flows, 0,
+        "nested bare fe80::/10 must not steer any of 256 flows to the default WAN gateway"
+    );
+}
+
+/// #12398 M2: guard the recursion controls in both families and the ordering,
+/// explicit-interface fallback, and cycle backtracking decisions.
+#[test]
+fn recursive_static_v4_controls_kill_surviving_mutants_12398() {
+    let cycle_hops = vec!["10.14.0.1".into(), "10.15.0.1".into()];
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![
+            InterfaceSnapshot {
+                name: "ge-0-0-1".into(),
+                ifindex: 201,
+                addresses: vec![crate::protocol::snapshot::InterfaceAddressSnapshot {
+                    family: "inet".into(),
+                    address: "192.0.2.1/24".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            InterfaceSnapshot {
+                name: "ge-0-0-2".into(),
+                ifindex: 202,
+                addresses: vec![crate::protocol::snapshot::InterfaceAddressSnapshot {
+                    family: "inet".into(),
+                    address: "198.51.100.1/24".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ],
+        routes: vec![
+            crate::RouteSnapshot {
+                table: "inet.0".into(),
+                family: "inet".into(),
+                destination: "10.20.0.0/24".into(),
+                next_hops: vec!["10.10.0.1".into()],
+                ..Default::default()
+            },
+            crate::RouteSnapshot {
+                table: "inet.0".into(),
+                family: "inet".into(),
+                destination: "10.10.0.0/24".into(),
+                next_hops: vec!["192.0.2.254".into()],
+                preference: 5,
+                ..Default::default()
+            },
+            crate::RouteSnapshot {
+                table: "inet.0".into(),
+                family: "inet".into(),
+                destination: "10.10.0.0/24".into(),
+                next_hops: vec!["198.51.100.254".into()],
+                preference: 10,
+                ..Default::default()
+            },
+            crate::RouteSnapshot {
+                table: "inet.0".into(),
+                family: "inet".into(),
+                destination: "10.21.0.0/24".into(),
+                next_hops: vec!["10.11.0.1".into()],
+                ..Default::default()
+            },
+            crate::RouteSnapshot {
+                table: "inet.0".into(),
+                family: "inet".into(),
+                destination: "10.11.0.0/24".into(),
+                next_hops: vec![
+                    "192.0.2.254@missing0".into(),
+                    "192.0.2.253@ge-0-0-1".into(),
+                ],
+                ..Default::default()
+            },
+            crate::RouteSnapshot {
+                table: "inet.0".into(),
+                family: "inet".into(),
+                destination: "10.22.0.0/24".into(),
+                next_hops: vec!["10.14.0.1".into()],
+                ..Default::default()
+            },
+            crate::RouteSnapshot {
+                table: "inet.0".into(),
+                family: "inet".into(),
+                destination: "10.14.0.0/24".into(),
+                next_hops: cycle_hops,
+                ..Default::default()
+            },
+            crate::RouteSnapshot {
+                table: "inet.0".into(),
+                family: "inet".into(),
+                destination: "10.15.0.0/24".into(),
+                next_hops: vec!["192.0.2.254".into()],
+                ..Default::default()
+            },
+            crate::RouteSnapshot {
+                table: "inet.0".into(),
+                family: "inet".into(),
+                destination: "10.23.0.0/24".into(),
+                next_hops: vec!["10.13.0.1".into()],
+                ..Default::default()
+            },
+            crate::RouteSnapshot {
+                table: "inet.0".into(),
+                family: "inet".into(),
+                destination: "10.13.0.0/24".into(),
+                discard: true,
+                preference: 5,
+                ..Default::default()
+            },
+            crate::RouteSnapshot {
+                table: "inet.0".into(),
+                family: "inet".into(),
+                destination: "10.13.0.0/24".into(),
+                next_hops: vec!["192.0.2.254".into()],
+                preference: 10,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    let member = |dst: &str, gateway: &str| {
+        let destination: Ipv4Addr = dst.parse().unwrap();
+        let gateway: Ipv4Addr = gateway.parse().unwrap();
+        state
+            .routes_v4
+            .get("inet.0")
+            .unwrap()
+            .iter()
+            .find(|route| route.prefix.contains(destination))
+            .unwrap()
+            .next_hops
+            .iter()
+            .find(|nh| nh.next_hop == Some(gateway))
+            .copied()
+            .unwrap_or_else(|| panic!("{dst}: missing member via {gateway}"))
+    };
+    let preferred = member("10.20.0.1", "192.0.2.254");
+    assert_eq!(
+        (preferred.next_hop, preferred.ifindex),
+        (Some("192.0.2.254".parse().unwrap()), 201),
+        "lowest preference covering route is the recursive terminal"
+    );
+    let explicit_fallback = member("10.21.0.1", "192.0.2.253");
+    assert_eq!(
+        (explicit_fallback.next_hop, explicit_fallback.ifindex),
+        (Some("192.0.2.253".parse().unwrap()), 201),
+        "an unusable explicit first spec must not hide the following usable one"
+    );
+    let cycle_exit = member("10.22.0.1", "192.0.2.254");
+    assert_eq!(
+        (cycle_exit.next_hop, cycle_exit.ifindex),
+        (Some("192.0.2.254".parse().unwrap()), 201),
+        "cycle detection must backtrack to the terminal gateway"
+    );
+    let discard = member("10.23.0.1", "10.13.0.1");
+    assert_eq!(
+        (discard.next_hop, discard.ifindex),
+        (Some("10.13.0.1".parse().unwrap()), 0),
+        "a discard covering route must fail closed instead of continuing to a peer row"
+    );
+}
+
+/// #12398 M2: the IPv6 controls mirror the v4 discard/table-scope assertions;
+/// the family-specific recursion copy must not bind a cross-table terminal.
+#[test]
+fn recursive_static_v6_discard_and_table_controls_12398() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "ge-0-0-1".into(),
+            ifindex: 201,
+            addresses: vec![crate::protocol::snapshot::InterfaceAddressSnapshot {
+                family: "inet6".into(),
+                address: "2001:db8:1::1/64".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        routes: vec![
+            crate::RouteSnapshot {
+                table: "inet6.0".into(),
+                family: "inet6".into(),
+                destination: "2001:db8:32::/64".into(),
+                next_hops: vec!["2001:db8:40::1".into()],
+                ..Default::default()
+            },
+            crate::RouteSnapshot {
+                table: "tenant-b.inet6.0".into(),
+                family: "inet6".into(),
+                destination: "2001:db8:40::/64".into(),
+                next_hops: vec!["2001:db8:1::2".into()],
+                ..Default::default()
+            },
+            crate::RouteSnapshot {
+                table: "inet6.0".into(),
+                family: "inet6".into(),
+                destination: "2001:db8:33::/64".into(),
+                next_hops: vec!["2001:db8:50::1".into()],
+                ..Default::default()
+            },
+            crate::RouteSnapshot {
+                table: "inet6.0".into(),
+                family: "inet6".into(),
+                destination: "2001:db8:50::/64".into(),
+                next_hops: vec!["2001:db8:1::2".into()],
+                discard: true,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    for (destination, gateway) in [
+        ("2001:db8:32::5", "2001:db8:40::1"),
+        ("2001:db8:33::5", "2001:db8:50::1"),
+    ] {
+        let destination: Ipv6Addr = destination.parse().unwrap();
+        let gateway: Ipv6Addr = gateway.parse().unwrap();
+        let route = state
+            .routes_v6
+            .get("inet6.0")
+            .unwrap()
+            .iter()
+            .find(|route| route.prefix.contains(destination))
+            .unwrap();
+        let member = route
+            .next_hops
+            .iter()
+            .find(|nh| nh.next_hop == Some(gateway))
+            .unwrap();
+        assert_eq!(
+            member.ifindex, 0,
+            "{destination}: cross-table and discard routes must remain unresolved"
+        );
+    }
+}
+
+/// #12398 F2: pin the IPv6 copies of preference, explicit-member fallback,
+/// discard, and visited-cycle handling used by the v4 mutation controls.
+#[test]
+fn recursive_static_v6_controls_kill_surviving_mutants_12398() {
+    let iface = |name: &str, ifindex: i32, address: &str| InterfaceSnapshot {
+        name: name.into(),
+        ifindex,
+        addresses: vec![crate::protocol::snapshot::InterfaceAddressSnapshot {
+            family: "inet6".into(),
+            address: address.into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let route = |destination: &str, next_hops: &[&str], preference: i32| crate::RouteSnapshot {
+        table: "inet6.0".into(),
+        family: "inet6".into(),
+        destination: destination.into(),
+        next_hops: next_hops.iter().map(|spec| (*spec).into()).collect(),
+        preference,
+        ..Default::default()
+    };
+    let mut discard = route("2001:db8:13::/64", &[], 5);
+    discard.discard = true;
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![
+            iface("ge-0-0-1", 201, "2001:db8:1::1/64"),
+            iface("ge-0-0-2", 202, "2001:db8:2::1/64"),
+        ],
+        routes: vec![
+            route("2001:db8:20::/64", &["2001:db8:10::1"], 0),
+            route("2001:db8:10::/64", &["2001:db8:1::2"], 5),
+            route("2001:db8:10::/64", &["2001:db8:2::2"], 10),
+            route("2001:db8:21::/64", &["2001:db8:11::1"], 0),
+            route(
+                "2001:db8:11::/64",
+                &["2001:db8:1::254@missing0", "2001:db8:1::253@ge-0-0-1"],
+                0,
+            ),
+            route("2001:db8:22::/64", &["2001:db8:14::1"], 0),
+            route("2001:db8:14::/64", &["2001:db8:14::1", "2001:db8:15::1"], 0),
+            route("2001:db8:15::/64", &["2001:db8:1::2"], 0),
+            route("2001:db8:23::/64", &["2001:db8:13::1"], 0),
+            discard,
+            route("2001:db8:13::/64", &["2001:db8:1::2"], 10),
+        ],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    let member = |destination: &str, gateway: &str| {
+        let destination: Ipv6Addr = destination.parse().unwrap();
+        let gateway: Ipv6Addr = gateway.parse().unwrap();
+        state
+            .routes_v6
+            .get("inet6.0")
+            .unwrap()
+            .iter()
+            .find(|route| route.prefix.contains(destination))
+            .unwrap()
+            .next_hops
+            .iter()
+            .find(|nh| nh.next_hop == Some(gateway))
+            .copied()
+            .unwrap_or_else(|| panic!("{destination}: missing member via {gateway}"))
+    };
+    let preferred = member("2001:db8:20::1", "2001:db8:1::2");
+    assert_eq!(
+        (preferred.next_hop, preferred.ifindex),
+        (Some("2001:db8:1::2".parse().unwrap()), 201),
+        "lowest-preference covering route must be selected"
+    );
+    let explicit_fallback = member("2001:db8:21::1", "2001:db8:1::253");
+    assert_eq!(
+        (explicit_fallback.next_hop, explicit_fallback.ifindex),
+        (Some("2001:db8:1::253".parse().unwrap()), 201),
+        "an unusable explicit first spec must not hide the following usable one"
+    );
+    let cycle_exit = member("2001:db8:22::1", "2001:db8:1::2");
+    assert_eq!(
+        (cycle_exit.next_hop, cycle_exit.ifindex),
+        (Some("2001:db8:1::2".parse().unwrap()), 201),
+        "cycle detection must backtrack to the terminal gateway"
+    );
+    let discard_member = member("2001:db8:23::1", "2001:db8:13::1");
+    assert_eq!(
+        (discard_member.next_hop, discard_member.ifindex),
+        (Some("2001:db8:13::1".parse().unwrap()), 0),
+        "a discard covering route must fail closed instead of continuing to a peer row"
+    );
+}
+
+/// #12398 F2: a pure IPv6 recursive cycle must remain unresolved.
+#[test]
+fn recursive_static_v6_cycle_fails_closed_12398() {
+    let snapshot = ConfigSnapshot {
+        routes: vec![
+            crate::RouteSnapshot {
+                table: "inet6.0".into(),
+                family: "inet6".into(),
+                destination: "2001:db8:22::/64".into(),
+                next_hops: vec!["2001:db8:14::1".into()],
+                ..Default::default()
+            },
+            crate::RouteSnapshot {
+                table: "inet6.0".into(),
+                family: "inet6".into(),
+                destination: "2001:db8:14::/64".into(),
+                next_hops: vec!["2001:db8:15::1".into()],
+                ..Default::default()
+            },
+            crate::RouteSnapshot {
+                table: "inet6.0".into(),
+                family: "inet6".into(),
+                destination: "2001:db8:15::/64".into(),
+                next_hops: vec!["2001:db8:14::1".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    let route = state
+        .routes_v6
+        .get("inet6.0")
+        .unwrap()
+        .iter()
+        .find(|route| route.prefix.contains("2001:db8:22::1".parse().unwrap()))
+        .unwrap();
+    assert_eq!(route.next_hops.len(), 1);
+    assert_eq!(route.next_hops[0].ifindex, 0);
+    assert_eq!(
+        route.next_hops[0].next_hop,
+        Some("2001:db8:14::1".parse().unwrap())
+    );
+}
+
+/// #12398 F3: a specific recursive covering route must beat the default.
+#[test]
+fn recursive_static_lpm_covering_route_beats_default_v4_12398() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![
+            InterfaceSnapshot {
+                name: "trust0".into(),
+                ifindex: 201,
+                addresses: vec![crate::protocol::snapshot::InterfaceAddressSnapshot {
+                    family: "inet".into(),
+                    address: "192.168.0.1/24".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            InterfaceSnapshot {
+                name: "untrust0".into(),
+                ifindex: 202,
+                addresses: vec![crate::protocol::snapshot::InterfaceAddressSnapshot {
+                    family: "inet".into(),
+                    address: "203.0.113.2/24".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ],
+        neighbors: vec![
+            crate::NeighborSnapshot {
+                interface: "trust0".into(),
+                ifindex: 201,
+                family: "inet".into(),
+                ip: "192.168.0.254".into(),
+                mac: "02:00:00:00:00:fe".into(),
+                state: "reachable".into(),
+                ..Default::default()
+            },
+            crate::NeighborSnapshot {
+                interface: "untrust0".into(),
+                ifindex: 202,
+                family: "inet".into(),
+                ip: "203.0.113.1".into(),
+                mac: "02:00:00:00:01:01".into(),
+                state: "reachable".into(),
+                ..Default::default()
+            },
+        ],
+        routes: vec![
+            crate::RouteSnapshot {
+                table: "inet.0".into(),
+                family: "inet".into(),
+                destination: "0.0.0.0/0".into(),
+                next_hops: vec!["203.0.113.1".into()],
+                ..Default::default()
+            },
+            crate::RouteSnapshot {
+                table: "inet.0".into(),
+                family: "inet".into(),
+                destination: "10.10.0.0/16".into(),
+                next_hops: vec!["192.168.0.254".into()],
+                ..Default::default()
+            },
+            crate::RouteSnapshot {
+                table: "inet.0".into(),
+                family: "inet".into(),
+                destination: "10.20.0.0/24".into(),
+                next_hops: vec!["192.168.0.99@missing0".into(), "10.10.0.1".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    let probe: Ipv4Addr = "10.20.0.5".parse().unwrap();
+    let route = state
+        .routes_v4
+        .get("inet.0")
+        .unwrap()
+        .iter()
+        .find(|route| route.prefix.contains(probe))
+        .unwrap();
+    assert!(route
+        .next_hops
+        .iter()
+        .any(|nh| { nh.next_hop == Some("192.168.0.254".parse().unwrap()) && nh.ifindex == 201 }));
+    let mut trust_flows = 0;
+    let mut untrust_flows = 0;
+    for seed in 0u64..256 {
+        let resolution = lookup_forwarding_resolution_v4(
+            &state,
+            None,
+            probe,
+            "inet.0",
+            0,
+            true,
+            Some(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5555),
+        );
+        if resolution.disposition == ForwardingDisposition::ForwardCandidate {
+            match resolution.egress_ifindex {
+                201 => trust_flows += 1,
+                202 => untrust_flows += 1,
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        trust_flows, 256,
+        "covering route must steer every flow to trust"
+    );
+    assert_eq!(
+        untrust_flows, 0,
+        "default route must not steer flows to untrust"
+    );
+}
+
+/// #12398 F3: IPv6 recursive covering-route selection must use longest prefix.
+#[test]
+fn recursive_static_lpm_covering_route_beats_default_v6_12398() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![
+            InterfaceSnapshot {
+                name: "trust0".into(),
+                ifindex: 201,
+                addresses: vec![crate::protocol::snapshot::InterfaceAddressSnapshot {
+                    family: "inet6".into(),
+                    address: "2001:db8:1::1/64".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            InterfaceSnapshot {
+                name: "untrust0".into(),
+                ifindex: 202,
+                addresses: vec![crate::protocol::snapshot::InterfaceAddressSnapshot {
+                    family: "inet6".into(),
+                    address: "2001:db8:2::1/64".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ],
+        neighbors: vec![
+            crate::NeighborSnapshot {
+                interface: "trust0".into(),
+                ifindex: 201,
+                family: "inet6".into(),
+                ip: "2001:db8:1::fe".into(),
+                mac: "02:00:00:00:00:fe".into(),
+                state: "reachable".into(),
+                ..Default::default()
+            },
+            crate::NeighborSnapshot {
+                interface: "untrust0".into(),
+                ifindex: 202,
+                family: "inet6".into(),
+                ip: "2001:db8:2::fe".into(),
+                mac: "02:00:00:00:01:fe".into(),
+                state: "reachable".into(),
+                ..Default::default()
+            },
+        ],
+        routes: vec![
+            crate::RouteSnapshot {
+                table: "inet6.0".into(),
+                family: "inet6".into(),
+                destination: "::/0".into(),
+                next_hops: vec!["2001:db8:2::fe".into()],
+                ..Default::default()
+            },
+            crate::RouteSnapshot {
+                table: "inet6.0".into(),
+                family: "inet6".into(),
+                destination: "2001:db8:10::/48".into(),
+                next_hops: vec!["2001:db8:1::fe".into()],
+                ..Default::default()
+            },
+            crate::RouteSnapshot {
+                table: "inet6.0".into(),
+                family: "inet6".into(),
+                destination: "2001:db8:20::/64".into(),
+                next_hops: vec!["2001:db8:1::99@missing0".into(), "2001:db8:10::1".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    let probe: Ipv6Addr = "2001:db8:20::5".parse().unwrap();
+    let route = state
+        .routes_v6
+        .get("inet6.0")
+        .unwrap()
+        .iter()
+        .find(|route| route.prefix.contains(probe))
+        .unwrap();
+    assert!(route
+        .next_hops
+        .iter()
+        .any(|nh| { nh.next_hop == Some("2001:db8:1::fe".parse().unwrap()) && nh.ifindex == 201 }));
+    let mut trust_flows = 0;
+    let mut untrust_flows = 0;
+    for seed in 0u64..256 {
+        let resolution = lookup_forwarding_resolution_v6(
+            &state,
+            None,
+            probe,
+            "inet6.0",
+            0,
+            true,
+            Some(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5555),
+        );
+        if resolution.disposition == ForwardingDisposition::ForwardCandidate {
+            match resolution.egress_ifindex {
+                201 => trust_flows += 1,
+                202 => untrust_flows += 1,
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        trust_flows, 256,
+        "covering route must steer every flow to trust"
+    );
+    assert_eq!(
+        untrust_flows, 0,
+        "default route must not steer flows to untrust"
+    );
+}
+
+/// A cycle-heavy route must not consume the probe budget before a later
+/// usable terminal candidate. This distinguishes the visited-set guard from
+/// the independent depth limit.
+#[test]
+fn recursive_static_v6_cycles_do_not_exhaust_work_before_terminal_12398() {
+    let cycle_hops: Vec<String> = (1..=80).map(|n| format!("2001:db8:100::{n}")).collect();
+    let mut root_hops = cycle_hops.clone();
+    root_hops.push("2001:db8:200::1".into());
+    let mut routes = vec![
+        crate::RouteSnapshot {
+            table: "inet6.0".into(),
+            family: "inet6".into(),
+            destination: "2001:db8:20::/64".into(),
+            next_hops: vec!["2001:db8:50::1".into()],
+            ..Default::default()
+        },
+        crate::RouteSnapshot {
+            table: "inet6.0".into(),
+            family: "inet6".into(),
+            destination: "2001:db8:50::/64".into(),
+            next_hops: root_hops,
+            ..Default::default()
+        },
+        crate::RouteSnapshot {
+            table: "inet6.0".into(),
+            family: "inet6".into(),
+            destination: "2001:db8:200::/64".into(),
+            next_hops: vec!["2001:db8:1::2".into()],
+            ..Default::default()
+        },
+    ];
+    for gateway in cycle_hops {
+        routes.push(crate::RouteSnapshot {
+            table: "inet6.0".into(),
+            family: "inet6".into(),
+            destination: format!("{gateway}/128"),
+            next_hops: vec![gateway],
+            ..Default::default()
+        });
+    }
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "ge-0-0-1".into(),
+            ifindex: 201,
+            addresses: vec![crate::protocol::snapshot::InterfaceAddressSnapshot {
+                family: "inet6".into(),
+                address: "2001:db8:1::1/64".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+        routes,
+        ..Default::default()
+    };
+    let state = build_forwarding_state(&snapshot);
+    let route = state
+        .routes_v6
+        .get("inet6.0")
+        .unwrap()
+        .iter()
+        .find(|route| route.prefix.contains("2001:db8:20::1".parse().unwrap()))
+        .unwrap();
+    assert_eq!(route.next_hops.len(), 1);
+    assert_eq!(
+        (route.next_hops[0].next_hop, route.next_hops[0].ifindex),
+        (Some("2001:db8:1::2".parse().unwrap()), 201),
+        "visited-cycle detection must preserve work for the later terminal route"
+    );
 }
