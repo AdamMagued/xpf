@@ -205,9 +205,9 @@ func TestReconcileRGStateDrivesTheGate6889(t *testing.T) {
 // by an event. This closes #6890 while preserving the distinction between
 // initial-secondary seating and a real demotion (#12171).
 func TestNeverTransitionedSecondaryGetsGated6889_6890(t *testing.T) {
-	// A node seated as secondary before any ownership event. The dropped-
-	// demotion control below records prior local Primary; this boot fixture
-	// does not, so the reconcile must arm the same gate without confirming.
+	// This gate-only boot fixture has no pending confirm window. It proves that
+	// cold-start reconciliation arms the gate without requiring an ownership
+	// event.
 	d := clusteredDaemon6889(t, cluster.StateSecondary, false /* never armed */)
 
 	if d.store.ClusterReadOnly() {

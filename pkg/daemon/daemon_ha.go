@@ -883,6 +883,14 @@ func (d *Daemon) reconcileRG0ConfigOwnership() {
 	if rg0.State == cluster.StatePrimary {
 		d.rg0WasPrimary.Store(true)
 	}
+	// #12171: GroupState snapshots RG0 before running its transfer-readiness
+	// callback outside the manager lock. Recheck ownership after that callback
+	// so a concurrent event cannot make this reconcile consume a promotion
+	// latch from a stale Secondary snapshot or re-arm the gate on a new Primary.
+	if primary, known := d.cluster.LocalGroupPrimary(0); !known || primary != (rg0.State == cluster.StatePrimary) {
+		return
+	}
+
 	if d.store.ClusterReadOnly() == wantReadOnly {
 		if wantReadOnly && d.store.IsConfirmPending() && d.cluster.IsPeerPrimary(0) {
 			d.applyRG0OwnershipTransition(rg0.State, true)
@@ -949,19 +957,29 @@ func (d *Daemon) applyRG0OwnershipTransition(newState cluster.NodeState, demotio
 	case cluster.StateSecondary, cluster.StateSecondaryHold:
 		primaryInThisIncarnation := d.rg0WasPrimary.Swap(false)
 		genuineDemotion := demotionProven || primaryInThisIncarnation
+		peerTakeoverObserved := false
 		if !genuineDemotion && d.cluster != nil {
-			genuineDemotion = d.cluster.IsPeerPrimary(0)
+			peerTakeoverObserved = d.cluster.IsPeerPrimary(0)
+			genuineDemotion = peerTakeoverObserved
 		}
 		if d.eventEngine != nil {
 			d.eventEngine.SetPublishEnabled(false)
 		}
-		slog.Info("cluster: became secondary for RG0, disabling config writes")
+		if peerTakeoverObserved {
+			slog.Info("cluster: observed peer takeover of RG0, disabling config writes")
+		} else {
+			slog.Info("cluster: became secondary for RG0, disabling config writes")
+		}
 		if genuineDemotion {
 			// #4378: confirm before going read-only so the rollback timer does
 			// not revert a demoted standby while the peer holds the synced
 			// committed config.
 			if d.store.ConfirmPendingOnDemotion() {
-				slog.Info("cluster: confirmed pending commit-confirmed on RG0 demotion")
+				if peerTakeoverObserved {
+					slog.Info("cluster: confirmed pending commit-confirmed after peer RG0 takeover")
+				} else {
+					slog.Info("cluster: confirmed pending commit-confirmed on RG0 demotion")
+				}
 			}
 		}
 		d.store.SetClusterReadOnly(true)

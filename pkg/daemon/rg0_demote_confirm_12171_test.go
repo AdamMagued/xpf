@@ -17,13 +17,16 @@
 // read-only gate (#6890 stays closed) but leaves the recovered window armed,
 // so its rollback timer can still fire and revert the unconfirmed config.
 //
-// The cells below bind the boot fixture (RED pre-fix), genuine-demotion and
-// peer-takeover controls, and a self-election control.
+// The cells bind the clustered cold-boot fixture, repeated no-peer reconciles,
+// delivered event and peer evidence, the stale-snapshot race, and self-election.
 package daemon
 
 import (
+	"context"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
@@ -34,11 +37,11 @@ import (
 
 // recoveredSecondaryDaemon12171 builds the post-restart shape the issue
 // names: a store whose commit-confirmed window was re-armed by Load (as after
-// an xpfd restart inside the window), a live cluster manager holding RG0 in
-// StateSecondary exactly as UpdateConfig initially seats a new RG, no peer
-// heard from, and the store gate still at its false zero value. The skew
-// callback reports no active clock-skew alarm, so #10875 recovery does NOT
-// roll back first — recovery re-arms, which is the precondition this issue needs.
+// an xpfd restart inside the window), plus an RG0 in the clustered cold-boot
+// non-preempt hold. No peer has been heard from, and the store gate is still
+// at its false zero value. The skew callback reports no active clock-skew
+// alarm, so #10875 recovery does NOT roll back first — recovery re-arms, which
+// is the precondition this issue needs.
 func recoveredSecondaryDaemon12171(t *testing.T) *Daemon {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "xpf.conf")
@@ -77,23 +80,26 @@ func recoveredSecondaryDaemon12171(t *testing.T) *Daemon {
 
 	cm := cluster.NewManager(0, 1)
 	cm.UpdateConfig(&config.ClusterConfig{
+		ControlInterface: "em0",
 		RedundancyGroups: []*config.RedundancyGroup{
 			{ID: 0, NodePriorities: map[int]int{0: 100}},
 		},
 	})
-	cm.SetGroupStateForTesting(0, cluster.StateSecondary)
 	if got := cm.GroupState(0); got == nil || got.State != cluster.StateSecondary {
-		t.Fatalf("precondition: fresh RG0 must seat StateSecondary, got %+v", got)
+		t.Fatalf("precondition: clustered cold boot must hold RG0 Secondary, got %+v", got)
 	}
 
 	d := &Daemon{
-		applySem:        semaphore.NewWeighted(1),
-		cluster:         cm,
-		vrrpMgr:         vrrp.NewManager(),
-		rgStates:        make(map[int]*rgStateMachine),
-		blackholeRoutes: make(map[int][]netlink.Route),
-		store:           s,
-		opts:            Options{NoDataplane: true},
+		applySem:                   semaphore.NewWeighted(1),
+		cluster:                    cm,
+		vrrpMgr:                    vrrp.NewManager(),
+		rgStates:                   make(map[int]*rgStateMachine),
+		blackholeRoutes:            make(map[int][]netlink.Route),
+		store:                      s,
+		opts:                       Options{NoDataplane: true},
+		failoverActuateWait:        make(map[failoverActuationKey]*failoverActuation),
+		failoverActuateTimeout:     2 * time.Second,
+		userspaceDemotionPrepUntil: make(map[int]time.Time),
 	}
 	if d.store.ClusterReadOnly() {
 		t.Fatal("precondition: the gate must start unarmed (false zero value)")
@@ -101,22 +107,32 @@ func recoveredSecondaryDaemon12171(t *testing.T) *Daemon {
 	return d
 }
 
+func deliverRG0OwnershipEvent12171(d *Daemon, oldState, newState cluster.NodeState) {
+	if timer := d.handleClusterEvent(context.Background(), cluster.ClusterEvent{
+		GroupID: 0, OldState: oldState, NewState: newState,
+	}, nil); timer != nil {
+		timer.Stop()
+	}
+}
+
 // TestRecoveredWindowSurvivesFirstSecondaryReconcile_12171 is the issue: the
-// first reconcile tick after restart must arm the read-only gate but leave
-// the recovered window ARMED — no demotion happened, this node was never
-// primary, and no peer took over.
+// reconcile must arm the read-only gate but leave the recovered window ARMED
+// across repeated passes — no demotion happened and no peer took over.
 func TestRecoveredWindowSurvivesFirstSecondaryReconcile_12171(t *testing.T) {
 	d := recoveredSecondaryDaemon12171(t)
 
-	d.reconcileRGState()
-
-	if !d.store.ClusterReadOnly() {
-		t.Fatal("the reconcile must still arm the read-only gate on an RG0 secondary (#6890)")
-	}
-	if !d.store.IsConfirmPending() {
-		t.Fatal("the first post-restart RG0-Secondary reconcile CONFIRMED a recovered " +
-			"commit-confirmed window nobody demoted from: IsConfirmPending=false, " +
-			"so the auto-rollback safety hatch is silently gone (#12171)")
+	for pass := 1; pass <= 3; pass++ {
+		d.reconcileRGState()
+		if !d.store.ClusterReadOnly() {
+			t.Fatalf("reconcile pass %d did not arm the read-only gate (#6890)", pass)
+		}
+		if d.cluster.IsPeerPrimary(0) {
+			t.Fatalf("precondition: peer became primary on pass %d", pass)
+		}
+		if !d.store.IsConfirmPending() {
+			t.Fatalf("reconcile pass %d confirmed a recovered window with no peer primary: "+
+				"the auto-rollback safety hatch is silently gone (#12171)", pass)
+		}
 	}
 	if _, _, _, ok := d.store.RecoveredConfirmWindow(); !ok {
 		t.Error("the surviving window must still be the recovered one")
@@ -132,16 +148,19 @@ func TestRecoveredWindowSurvivesFirstSecondaryReconcile_12171(t *testing.T) {
 	}
 }
 
-// TestGenuineDemotionStillConfirmsRecoveredWindow_12171 is the control: an
-// event that reports Primary→Secondary is a genuine demotion, so #4378 must
-// still confirm the recovered window.
+// TestGenuineDemotionStillConfirmsRecoveredWindow_12171 delivers the actual
+// RG0 Primary→Secondary event while a recovered window is pending. No
+// promotion event or reconcile observes the intervening Primary state, so the
+// event is the only demotion evidence.
 func TestGenuineDemotionStillConfirmsRecoveredWindow_12171(t *testing.T) {
 	d := recoveredSecondaryDaemon12171(t)
 
-	d.applyRG0OwnershipTransition(cluster.StateSecondary, true)
+	d.cluster.SetGroupStateForTesting(0, cluster.StatePrimary)
+	d.cluster.SetGroupStateForTesting(0, cluster.StateSecondary)
+	deliverRG0OwnershipEvent12171(d, cluster.StatePrimary, cluster.StateSecondary)
 
 	if d.store.IsConfirmPending() {
-		t.Fatal("a recovered window must be confirmed on a genuine RG0 demotion")
+		t.Fatal("a delivered Primary→Secondary event must confirm the recovered window")
 	}
 }
 
@@ -163,14 +182,71 @@ func TestRecoveredWindowConfirmsWhenPeerTakesOver_12171(t *testing.T) {
 	}
 }
 
-// TestSelfElectedPrimaryKeepsWindow_12171 is the control: a node that
-// self-elects RG0 primary before secondary reconciliation owns its window.
+// TestPeerAlreadyPrimaryConfirmsFirstSecondaryReconcile_12171 binds the
+// peer-primary fallback on the first gate mismatch, rather than only after
+// a later reconcile observes takeover.
+func TestPeerAlreadyPrimaryConfirmsFirstSecondaryReconcile_12171(t *testing.T) {
+	d := recoveredSecondaryDaemon12171(t)
+	d.cluster.SetPeerGroupStateForTesting(0, cluster.StatePrimary)
+
+	d.reconcileRG0ConfigOwnership()
+	if !d.store.ClusterReadOnly() {
+		t.Fatal("the first secondary reconcile must still arm the read-only gate")
+	}
+	if d.store.IsConfirmPending() {
+		t.Fatal("first secondary reconcile with a primary peer did not confirm")
+	}
+}
+
+// TestStaleSecondarySnapshotDoesNotConsumePromotionLatch_12171 reproduces
+// the GroupState readiness-callback interleaving: the snapshot says Secondary,
+// then a self-election event runs before reconciliation compares the gate.
+func TestStaleSecondarySnapshotDoesNotConsumePromotionLatch_12171(t *testing.T) {
+	d := recoveredSecondaryDaemon12171(t)
+	d.reconcileRGState()
+	if !d.store.IsConfirmPending() || !d.store.ClusterReadOnly() {
+		t.Fatal("precondition: initial reconcile must preserve the window and arm the gate")
+	}
+
+	var once sync.Once
+	d.cluster.SetTransferReadinessFunc(func(rgID int) (bool, []string) {
+		if rgID == 0 {
+			once.Do(func() {
+				d.cluster.SetGroupStateForTesting(0, cluster.StatePrimary)
+				deliverRG0OwnershipEvent12171(d, cluster.StateSecondary, cluster.StatePrimary)
+			})
+		}
+		return true, nil
+	})
+	d.reconcileRG0ConfigOwnership()
+
+	if !d.cluster.IsLocalPrimary(0) {
+		t.Fatal("precondition: node must be RG0 primary after the self-election")
+	}
+	if !d.store.IsConfirmPending() {
+		t.Error("a stale Secondary snapshot consumed the self-election promotion latch")
+	}
+	if d.store.ClusterReadOnly() {
+		t.Error("a stale Secondary snapshot re-armed the gate on the RG0 primary")
+	}
+}
+
+// TestSelfElectedPrimaryKeepsWindow_12171 is the control: after the initial
+// secondary reconcile arms the gate, the node self-elects and reconciliation
+// must open the gate without confirming its recovered window.
 func TestSelfElectedPrimaryKeepsWindow_12171(t *testing.T) {
 	d := recoveredSecondaryDaemon12171(t)
 
+	d.reconcileRGState()
+	if !d.store.IsConfirmPending() || !d.store.ClusterReadOnly() {
+		t.Fatal("precondition: initial secondary reconciliation must preserve the window and arm the gate")
+	}
 	d.cluster.SetGroupStateForTesting(0, cluster.StatePrimary)
 	d.reconcileRGState()
 	if !d.store.IsConfirmPending() {
 		t.Error("a self-elected RG0 primary must keep its pending window armed")
+	}
+	if d.store.ClusterReadOnly() {
+		t.Error("a self-elected RG0 primary must have config writes enabled")
 	}
 }
