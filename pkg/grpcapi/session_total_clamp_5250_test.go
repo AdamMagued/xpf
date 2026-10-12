@@ -5,13 +5,13 @@
 // rather than a saturated one. A clampInt32 helper (server_nat.go, #2282)
 // already existed in this package and simply was not applied at these sites.
 //
-// FAIL-ON-REVERT: restore `resp.Total = int32(v4 + v6)` in setSessionsTotal
-// and TestSessionsTotalSaturates_5250 goes RED with a negative Total. Restore
-// the int32 fields on natSessionCounts and TestNATSessionCountsAre64Bit_5250
-// goes RED — that accumulator now cannot silently wrap while being built.
+// FAIL-ON-REVERT: TestClampInt32Saturates_5250 pins the positive, zero, and
+// MaxInt32 overflow boundaries; TestNATSessionCountsAre64Bit_5250 pins the
+// int64 accumulators that prevent wrapping before the clamp can run.
 //
-// Scope note (honest): the FILTERED count path (setSessionsTotal's iterator
-// scan) and countNATSessions' per-rule-set map are only reachable past
+// Scope note (honest): the count path (setSessionsTotal's iterator scan,
+// which now serves both filtered and unfiltered cases) and
+// countNATSessions' per-rule-set map are only reachable past
 // MaxInt32 by iterating >2^31 sessions, which no unit test can drive. Those
 // two sites share the clamp helper asserted here and the 64-bit accumulator
 // asserted below; neither is independently drivable in a unit test.
@@ -19,39 +19,9 @@ package grpcapi
 
 import (
 	"math"
-	"path/filepath"
 	"reflect"
 	"testing"
-
-	"github.com/psaab/xpf/pkg/dataplane"
-	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
-
-// hugeCountDP reports a v4+v6 session total past MaxInt32.
-type hugeCountDP struct {
-	*dataplane.Manager
-	v4, v6 int
-}
-
-func (*hugeCountDP) IsLoaded() bool { return true }
-
-func (d *hugeCountDP) SessionCount() (int, int) { return d.v4, d.v6 }
-
-func TestSessionsTotalSaturates_5250(t *testing.T) {
-	dp := &hugeCountDP{Manager: dataplane.New(), v4: math.MaxInt32 - 1, v6: 10}
-	s := &Server{dp: dp, store: newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))}
-
-	resp := &pb.GetSessionsResponse{}
-	if err := s.setSessionsTotal(resp, &sessionFilter{}); err != nil {
-		t.Fatalf("setSessionsTotal: %v", err)
-	}
-	if resp.Total < 0 {
-		t.Fatalf("Total = %d, want a saturated non-negative count (int32 conversion wrapped)", resp.Total)
-	}
-	if resp.Total != math.MaxInt32 {
-		t.Fatalf("Total = %d, want %d (saturate at the int32 ceiling)", resp.Total, int32(math.MaxInt32))
-	}
-}
 
 func TestNATSessionCountsAre64Bit_5250(t *testing.T) {
 	ty := reflect.TypeOf(natSessionCounts{})

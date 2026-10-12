@@ -82,8 +82,8 @@ func (d *filteredTotalDP) GetSessionV6(dataplane.SessionKeyV6) (dataplane.Sessio
 	return dataplane.SessionValueV6{}, errors.New("no reverse entry in test")
 }
 
-// SessionCount reports forward-only entries, matching the production map
-// walk (IsReverse == 0). Used for the unfiltered total.
+// SessionCount reports forward-only entries to satisfy grpcRuntime. The
+// cursor total deliberately uses the cancellation-sampled iterators instead.
 func (d *filteredTotalDP) SessionCount() (v4, v6 int) {
 	for _, s := range d.v4 {
 		if s.val.IsReverse == 0 {
@@ -189,7 +189,7 @@ func TestGetSessionsFilteredTotalRealCount(t *testing.T) {
 		t.Fatalf("cursor filtered Total(udp) = %d, want 2", udp.Total)
 	}
 
-	// --- Unfiltered still uses the lightweight forward-only SessionCount.
+	// --- Unfiltered uses the same forward-only cancellation-sampled iterator.
 	all, err := s.GetSessions(ctx, &pb.GetSessionsRequest{PageSize: 100})
 	if err != nil {
 		t.Fatalf("cursor GetSessions(unfiltered) error = %v", err)
