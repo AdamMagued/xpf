@@ -219,9 +219,13 @@ func TestAliasedVLANChildMayReuseParentSlot7497(t *testing.T) {
 	if err != nil {
 		t.Fatalf("primary pass rejected the parent binding: %v", err)
 	}
+	ctrl := &fakeCtrlMap{}
 	if _, err = m.applyAliasBindingRowsLocked(
-		status, &fakeCtrlMap{}, rec, userspaceCtrlValue{}, map[uint32]bool{}, idxs, set); err != nil {
+		status, ctrl, rec, userspaceCtrlValue{Enabled: 1}, map[uint32]bool{}, idxs, set); err != nil {
 		t.Fatalf("a VLAN child reusing its parent's slot was rejected: %v", err)
+	}
+	if ctrl.haveStored {
+		t.Errorf("valid VLAN alias wrote fail-closed ctrl row: %+v", ctrl.stored)
 	}
 
 	parentIdx := uint32(parentIfindex) * bindingQueuesPerIface

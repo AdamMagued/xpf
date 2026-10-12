@@ -87,10 +87,13 @@ func watchdogAliasBindingIndex(childIfindex, parentIfindex uint32, binding Bindi
 			"queue", binding.QueueID, "stride", uint32(bindingQueuesPerIface))
 		return 0, false
 	}
-	// #12307: bound the uint32 child ifindex before multiplying. Otherwise a
-	// wrapped stride can land inside the dense cap and alias a different row.
-	if childIfindex >= dataplane.MaxInterfaces {
-		slog.Warn("userspace: bindings watchdog alias: child ifindex at/above MaxInterfaces would wrap the composed index onto another row, skipping (#12307)",
+	// #12307/#12194: bound the uint32 child ifindex before multiplying.
+	// Otherwise a wrapped stride can land inside the dense cap and alias a
+	// different row. Shared with the apply paths via bindingIfindexInRange
+	// (#9698), so child 0 is skipped here exactly as the apply alias pass
+	// refuses it.
+	if !bindingIfindexInRange(int(childIfindex)) {
+		slog.Warn("userspace: bindings watchdog alias: child ifindex outside valid range, skipping (#12307)",
 			"child", childIfindex, "parent", parentIfindex,
 			"queue", binding.QueueID, "max_interfaces", dataplane.MaxInterfaces)
 		return 0, false
