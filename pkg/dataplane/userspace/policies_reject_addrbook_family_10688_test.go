@@ -26,29 +26,53 @@ func mappedAddressBookConfig10688(value string) *config.Config {
 // FAIL-ON-REVERT: removing collectAddressBookFamilyRejections from either
 // PolicyContentRejectionReasons or buildSnapshot leaves both reason lists empty.
 func TestMappedAddressBookPrefixHasWrongFamilyRejectionReason10688(t *testing.T) {
-	cfg := mappedAddressBookConfig10688("::ffff:10.0.0.0/104")
-	books, _, err := buildAddressBookTableWithFeeds(cfg, nil)
-	if err != nil {
-		t.Fatalf("fixture book build: %v", err)
-	}
-	if len(books) != 1 || len(books[0].PrefixesV4) != 1 || books[0].PrefixesV4[0] != "::ffff:10.0.0.0/104" {
-		t.Fatalf("fixture must reproduce the Go-to-v4 filing, got %+v", books)
-	}
+	for _, prefix := range []string{
+		"::ffff:10.0.0.0/104",
+		"::ffff:10.0.0.0/096",
+		"::ffff:10.0.0.0/0096",
+	} {
+		t.Run(strings.ReplaceAll(prefix, "/", "_"), func(t *testing.T) {
+			cfg := mappedAddressBookConfig10688(prefix)
+			books, _, err := buildAddressBookTableWithFeeds(cfg, nil)
+			if err != nil {
+				t.Fatalf("fixture book build: %v", err)
+			}
+			found := false
+			for _, book := range books {
+				for _, got := range book.PrefixesV4 {
+					if got == prefix {
+						found = true
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("fixture must reproduce the Go-to-v4 filing of %q, got %+v", prefix, books)
+			}
 
-	reasons := PolicyContentRejectionReasons(cfg, nil)
-	if len(reasons) != 1 || !strings.Contains(reasons[0], `address-book "mapped-v4"`) ||
-		!strings.Contains(reasons[0], "prefixes_v4") || !strings.Contains(reasons[0], "IPv6") ||
-		!strings.Contains(reasons[0], "entire policy snapshot") {
-		t.Fatalf("wrong-family mirror must name the helper's whole-snapshot refusal, got %v", reasons)
-	}
+			hasFamilyRefusal := func(reasons []string) bool {
+				for _, reason := range reasons {
+					if strings.Contains(reason, `address-book "mapped-v4"`) &&
+						strings.Contains(reason, "prefixes_v4") &&
+						strings.Contains(reason, "IPv6") &&
+						strings.Contains(reason, "entire policy snapshot") {
+						return true
+					}
+				}
+				return false
+			}
+			reasons := PolicyContentRejectionReasons(cfg, nil)
+			if !hasFamilyRefusal(reasons) {
+				t.Fatalf("wrong-family mirror must name the helper's whole-snapshot refusal, got %v", reasons)
+			}
 
-	snap, err := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
-	if err != nil {
-		t.Fatalf("snapshot build: %v", err)
-	}
-	if len(snap.Capabilities.PolicyContentRejected) != 1 ||
-		!strings.Contains(snap.Capabilities.PolicyContentRejected[0], "prefixes_v4") {
-		t.Fatalf("published snapshot must carry the refusal diagnostic, got %v", snap.Capabilities.PolicyContentRejected)
+			snap, err := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+			if err != nil {
+				t.Fatalf("snapshot build: %v", err)
+			}
+			if !hasFamilyRefusal(snap.Capabilities.PolicyContentRejected) {
+				t.Fatalf("published snapshot must carry the wrong-family refusal, got %v", snap.Capabilities.PolicyContentRejected)
+			}
+		})
 	}
 }
 

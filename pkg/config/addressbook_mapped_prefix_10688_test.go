@@ -32,6 +32,34 @@ func TestMappedAddressBookPrefixRejectedAtCommit10688(t *testing.T) {
 			},
 			want: "security zone \"trust\" address-book address \"mapped-v4\"",
 		},
+		{
+			name: "global-padded-096",
+			lines: []string{
+				"set security address-book global address mapped-v4 ::ffff:10.0.0.0/096",
+			},
+			want: "security global address-book address \"mapped-v4\"",
+		},
+		{
+			name: "global-padded-0096",
+			lines: []string{
+				"set security address-book global address mapped-v4 ::ffff:10.0.0.0/0096",
+			},
+			want: "security global address-book address \"mapped-v4\"",
+		},
+		{
+			name: "zone-local-padded-096",
+			lines: []string{
+				"set security zones security-zone trust address-book address mapped-v4 ::ffff:10.0.0.0/096",
+			},
+			want: "security zone \"trust\" address-book address \"mapped-v4\"",
+		},
+		{
+			name: "zone-local-padded-0096",
+			lines: []string{
+				"set security zones security-zone trust address-book address mapped-v4 ::ffff:10.0.0.0/0096",
+			},
+			want: "security zone \"trust\" address-book address \"mapped-v4\"",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := CompileConfig(buildTree(t, tc.lines))

@@ -1,6 +1,9 @@
 package config
 
-import "net/netip"
+import (
+	"net"
+	"net/netip"
+)
 
 // FRRAddrFamily classifies s — an IP literal or a CIDR prefix — for FRR
 // static-route CLI grammar purposes: "v4", "v6", or "" (unparseable).
@@ -47,13 +50,13 @@ func FRRAddrFamily(s string) string {
 	return ""
 }
 
-// FRRAddrIsMapped reports whether s (IP literal or CIDR prefix) is an
-// IPv4-mapped IPv6 literal (::ffff:a.b.c.d, any spelling netip accepts).
-// It recognizes the parsed address class across equivalent spellings —
-// compressed, fully expanded, uppercase, dotted or hexadecimal.
+// FRRAddrIsMapped reports whether s (an IP literal or valid Go CIDR prefix) is
+// an IPv4-mapped IPv6 literal. It recognizes mapped prefixes with padded masks
+// even when netip.ParsePrefix rejects that otherwise valid Go spelling.
 func FRRAddrIsMapped(s string) bool {
-	if p, err := netip.ParsePrefix(s); err == nil {
-		return p.Addr().Is4In6()
+	if _, _, err := net.ParseCIDR(s); err == nil {
+		p, err := netip.ParsePrefix(normalizeCIDRMaskPadding(s))
+		return err == nil && p.Addr().Is4In6()
 	}
 	if a, err := netip.ParseAddr(s); err == nil {
 		return a.Is4In6()
