@@ -284,6 +284,8 @@ pub(crate) fn build_synced_session_entry(
     zone_name_to_id: &rustc_hash::FxHashMap<String, u16>,
     routing_domain: u32,
 ) -> Result<SyncedSessionEntry, String> {
+    let source_nat_static =
+        crate::session::source_nat_static_from_provenance(req.source_nat_provenance);
     let key = build_synced_session_key(req, routing_domain, SyncedKeyIntent::Install)?;
     let next_hop = if req.next_hop.is_empty() {
         None
@@ -557,6 +559,7 @@ pub(crate) fn build_synced_session_entry(
         // across both nodes. An old peer omits the field => serde(default) 0,
         // which falls back to `alloc_session_id()` (rolling-upgrade safe).
         session_id: req.session_id,
+        source_nat_static,
     })
 }
 

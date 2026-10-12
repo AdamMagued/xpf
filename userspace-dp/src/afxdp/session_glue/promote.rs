@@ -162,6 +162,7 @@ pub(in crate::afxdp) fn maybe_promote_synced_session_with_conntrack(
             // a worker materializing it from the shared maps keeps the close state.
             tcp_close_class: sessions.close_class_wire_for(key),
             tcp_handshake_state: sessions.handshake_state_wire_for(key),
+            source_nat_static: sessions.source_nat_static_for(key),
         };
         publish_shared_session(
             shared.sessions,

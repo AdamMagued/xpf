@@ -40,6 +40,13 @@ func TestProducerDeltaConvertsToSyncedValue9752(t *testing.T) {
 	if err := json.Unmarshal(raw, &delta); err != nil {
 		t.Fatalf("unmarshal producer delta: %v", err)
 	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		t.Fatalf("unmarshal producer delta fields: %v", err)
+	}
+	if _, ok := fields["source_nat_provenance"]; !ok {
+		t.Fatal("Rust producer golden omitted source_nat_provenance")
+	}
 	if delta.Event != "open" || delta.SrcPort != 55068 || delta.DstPort != 443 {
 		t.Fatalf("producer golden misread: event=%s ports=%d/%d", delta.Event, delta.SrcPort, delta.DstPort)
 	}
@@ -52,6 +59,9 @@ func TestProducerDeltaConvertsToSyncedValue9752(t *testing.T) {
 	}
 	if !delta.SourceNatICMPValid || delta.SourceNatICMPType != 13 || delta.SourceNatICMPCode != 0 {
 		t.Fatalf("producer golden lost typed source-NAT identity: %+v", delta)
+	}
+	if delta.SourceNatProvenance != dataplane.SourceNatProvenanceUnknown {
+		t.Fatalf("Rust producer golden lost unknown source-NAT provenance: %d", delta.SourceNatProvenance)
 	}
 	d, ss := primaryForRG1Daemon9752()
 	sink := &chainSink9752{}
@@ -69,6 +79,9 @@ func TestProducerDeltaConvertsToSyncedValue9752(t *testing.T) {
 	}
 	if !val.SourceNatICMPValid || val.SourceNatICMPType != 13 || val.SourceNatICMPCode != 0 {
 		t.Fatalf("converted value lost typed source-NAT identity: %+v", val)
+	}
+	if got := dataplane.SourceNatProvenanceFromFlags(val.Flags); got != dataplane.SourceNatProvenanceUnknown {
+		t.Fatalf("daemon conversion changed unknown source-NAT provenance: got %d", got)
 	}
 	if val.SessionID == 0 || val.RTFlowSessionID == 0 {
 		t.Fatalf("converted value lost session identity: %+v", val)

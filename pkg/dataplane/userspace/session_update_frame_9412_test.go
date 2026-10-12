@@ -55,6 +55,9 @@ func TestSessionUpdateGoldenFrameDecodes9412(t *testing.T) {
 		t.Fatalf("#11064: golden UPDATE decoded source_nat_icmp=(%t,%d,%d), want (true,13,0)",
 			d.SourceNatICMPValid, d.SourceNatICMPType, d.SourceNatICMPCode)
 	}
+	if d.SourceNatProvenance != 2 {
+		t.Fatalf("#12187: Rust golden UPDATE decoded SourceNatProvenance=%d, want 2 (static)", d.SourceNatProvenance)
+	}
 }
 
 func TestCloseClassWireKeyLockstepWithRust9412(t *testing.T) {

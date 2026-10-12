@@ -443,6 +443,7 @@ pub(super) fn source_nat_revocation_on_session_hit(
     decision: SessionDecision,
     flow: &SessionFlow,
     origin: SessionOrigin,
+    source_nat_static: Option<bool>,
 ) -> Option<PolicyRevocation> {
     let (forward_key, forward_decision, forward_metadata, forward_origin, canonical_key, stored_static) =
         if metadata.is_reverse {
@@ -490,7 +491,7 @@ pub(super) fn source_nat_revocation_on_session_hit(
                     metadata.clone(),
                     origin,
                     None,
-                    None,
+                    source_nat_static,
                 ),
             }
         };

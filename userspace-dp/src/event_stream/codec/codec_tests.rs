@@ -885,7 +885,7 @@ fn test_encode_session_open_carries_nat64_flag_and_snat_v4() {
     );
     // #4565 snat_v4 precedes the session id, tunnel discriminator and routing
     // domain. `n` excludes every trailer added after the routing domain.
-    let n = payload.len() - 21; // Exclude the close class, table pair, ICMP/ingress identity, empty rule-ID length and handshake state.
+    let n = payload.len() - 22; // Exclude close class, table pair, ICMP/ingress identity, rule-ID length, handshake state, and provenance.
     assert_eq!(
         &payload[n - 24..n - 20],
         &[203, 0, 113, 5],
@@ -906,7 +906,7 @@ fn test_encode_session_open_carries_nat64_flag_and_snat_v4() {
     );
     let pp = &frame_plain.data[FRAME_HEADER_SIZE..frame_plain.len as usize];
     assert_eq!(pp[26] & FLAG_NAT64, 0, "non-nat64 must leave the flag clear");
-    let m = pp.len() - 21; // Same empty-rule-ID session-open suffix as above.
+    let m = pp.len() - 22; // Same empty-rule-ID session-open suffix as above.
     assert_eq!(&pp[m - 24..m - 20], &[0, 0, 0, 0], "non-nat64 snat is zero");
 }
 
@@ -932,7 +932,7 @@ fn test_encode_session_open_carries_session_id_5212() {
         0, // #9412: tcp_close_class
     );
     let payload = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
-    let n = payload.len() - 21; // Exclude the close class, table pair, ICMP/ingress identity, empty rule-ID length and handshake state.
+    let n = payload.len() - 22; // Exclude close class, table pair, ICMP/ingress identity, rule-ID length, handshake state, and provenance.
     // The session id is now THIRD from last: #7188 appended an 8-byte
     // discriminator behind it and #7239 a 4-byte routing domain behind that, so
     // it sits at [n-20 .. n-12]. The 4 bytes before it are the #4565 snat_v4
@@ -962,7 +962,7 @@ fn test_encode_session_open_carries_session_id_5212() {
         0, // #9412: tcp_close_class
     );
     let p0 = &frame0.data[FRAME_HEADER_SIZE..frame0.len as usize];
-    let n0 = p0.len() - 21; // Same empty-rule-ID session-open suffix as above.
+    let n0 = p0.len() - 22; // Same empty-rule-ID session-open suffix as above.
     assert_eq!(
         u64::from_le_bytes(p0[n0 - 20..n0 - 12].try_into().unwrap()),
         0,
@@ -994,9 +994,9 @@ fn test_encode_session_open_carries_policy_fields_3301() {
     );
     let p = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
     // #3301 attribution fields precede the #4565 pool address, #5212 session
-    // id, #7188 discriminator and #7239 domain. `n` excludes all subsequent
-    // close-class/install-table/ICMP/ingress identity trailers.
-    let n = p.len() - 21; // Exclude the close class, table pair, ICMP/ingress identity, empty rule-ID length and handshake state.
+    // id, #7188 discriminator and #7239 domain. `n` excludes the later
+    // close-class/install-table/ICMP/ingress/rule-ID/handshake/provenance trailer.
+    let n = p.len() - 22; // Exclude close class, table pair, ICMP/ingress identity, rule-ID length, handshake state, and provenance.
     let policy_id = u32::from_le_bytes(p[n - 36..n - 32].try_into().unwrap());
     let counter_idx = u32::from_le_bytes(p[n - 32..n - 28].try_into().unwrap());
     let inact_secs = u32::from_le_bytes(p[n - 28..n - 24].try_into().unwrap());
@@ -1022,7 +1022,7 @@ fn test_encode_session_open_carries_policy_fields_3301() {
         0, // #9412: tcp_close_class
     );
     let pn = &frame_none.data[FRAME_HEADER_SIZE..frame_none.len as usize];
-    let m = pn.len() - 21; // Same empty-rule-ID session-open suffix as above.
+    let m = pn.len() - 22; // Same empty-rule-ID session-open suffix as above.
     // Each default attribution value is zero in the same order as the
     // non-zero control above.
     assert_eq!(
@@ -1060,7 +1060,7 @@ fn test_encode_session_open_carries_ingress_and_stable_policy_rule_id11070() {
     );
     let end = frame.len as usize;
     let rule_id = b"lan->wan/allow-web";
-    let id_end = end - 1; // The final byte is the TCP handshake state.
+    let id_end = end - 2; // Handshake state and provenance follow the policy rule ID.
     let id_start = id_end - rule_id.len();
     let len_start = id_start - 2;
     let ingress_start = len_start - 6;
@@ -1280,6 +1280,7 @@ fn test_close_flags() {
         tcp_close_class: 0,
         tcp_handshake_state: 0,
         purge_retirement: false,
+        source_nat_static: None,
     };
     let flags = close_flags(&delta);
     assert_eq!(flags & FLAG_FABRIC_REDIRECT, FLAG_FABRIC_REDIRECT);
@@ -1355,7 +1356,7 @@ fn session_open_frames_carry_distinct_tunnel_discriminators_7188() {
     let second = encode(200);
 
     let tail = |frame: &EventFrame| {
-        let end = frame.len as usize - 21; // Exclude close class, table pair, ICMP/ingress identity, empty rule-ID length and handshake state.
+        let end = frame.len as usize - 22; // Exclude close class, table pair, ICMP/ingress identity, rule-ID length, handshake state, and provenance.
         u64::from_le_bytes(frame.data[end - 12..end - 4].try_into().unwrap())
     };
     assert_eq!(
@@ -1371,10 +1372,10 @@ fn session_open_frames_carry_distinct_tunnel_discriminators_7188() {
          one key for both and the second install would evict the first (#7188)"
     );
     // The discriminator precedes the routing domain and all following
-    // close-class/install-table/ICMP/ingress/rule-ID/handshake trailers; the
-    // common prefix stops 33 bytes from the end.
+    // close-class/install-table/ICMP/ingress/rule-ID/handshake/provenance
+    // trailers; the common prefix stops 34 bytes from the end.
     let body =
-        |frame: &EventFrame| frame.data[FRAME_HEADER_SIZE..frame.len as usize - 33].to_vec();
+        |frame: &EventFrame| frame.data[FRAME_HEADER_SIZE..frame.len as usize - 34].to_vec();
     assert_eq!(
         body(&first),
         body(&second),
@@ -1384,7 +1385,7 @@ fn session_open_frames_carry_distinct_tunnel_discriminators_7188() {
 }
 
 /// #7239: the routing domain follows the #7188 discriminator and precedes the
-/// close-class/install-table/ICMP/ingress trailers.
+/// close-class/install-table/ICMP/ingress/rule-ID/handshake/provenance trailers.
 ///
 /// FAIL-ON-REVERT: drop either `key.routing_domain` write from
 /// `event_stream/codec/session_sync.rs` and the matching cell reads the
@@ -1403,7 +1404,7 @@ fn session_open_frames_carry_the_routing_domain_7239() {
         0,
         0, // #9412: tcp_close_class
     );
-    let end = frame.len as usize - 21; // Exclude close class, table pair, ICMP/ingress identity, empty rule-ID length and handshake state.
+    let end = frame.len as usize - 22; // Exclude close class, table pair, ICMP/ingress identity, rule-ID length, handshake state, and provenance.
     assert_eq!(
         u32::from_le_bytes(frame.data[end - 4..end].try_into().unwrap()),
         100_007,
@@ -1464,7 +1465,7 @@ fn session_open_frames_state_none_explicitly_for_non_tunnel_protocols_7188() {
         0,
         0, // #9412: tcp_close_class
     );
-    let end = frame.len as usize - 21; // Exclude close class, table pair, ICMP/ingress identity, empty rule-ID length and handshake state.
+    let end = frame.len as usize - 22; // Exclude close class, table pair, ICMP/ingress identity, rule-ID length, handshake state, and provenance.
     let tail = u64::from_le_bytes(frame.data[end - 12..end - 4].try_into().unwrap());
     assert_ne!(
         tail, 0,
@@ -1498,13 +1499,11 @@ fn v6_session_open_frame_still_fits_the_buffer_7188() {
     );
 }
 
-/// #9412 LOCKSTEP. The close-state UPDATE frame is compared byte for byte
-/// against a golden file that the Go decoder reads too
-/// (`pkg/dataplane/userspace/testdata/session_update_frame_9412.hex`). So
-/// neither language can move or rename the close-class byte on its own: the
-/// encoder must still produce these bytes, and the decoder must still read the
-/// class out of them. Regenerate the golden only for a deliberate layout change,
-/// with `XPF_WRITE_GOLDEN_9412=1`.
+/// #9412/#12187 LOCKSTEP. Rust produces the shared UPDATE golden with nonzero
+/// source-NAT provenance, and the Go decoder reads those exact bytes. The test
+/// pins both close class and provenance so an absent-byte default cannot pass.
+/// Regenerate only for an intentional wire-layout change with
+/// `XPF_WRITE_GOLDEN_9412=1`.
 #[test]
 fn test_encode_session_update_matches_the_shared_golden_9412() {
     let zones = test_zone_map();
@@ -1514,7 +1513,7 @@ fn test_encode_session_update_matches_the_shared_golden_9412() {
     decision.install_table_domain = 525_590;
     decision.install_table_check = 3_318_534_811;
     decision.nat.source_nat_icmp = Some((13, 0));
-    let frame = EventFrame::encode_session_update(
+    let frame = EventFrame::encode_session_update_with_handshake_state(
         42,
         &test_key_v4(),
         &decision,
@@ -1523,34 +1522,40 @@ fn test_encode_session_update_matches_the_shared_golden_9412() {
         false,
         0x5EED,
         2,
+        3,
+        Some(true),
     );
     assert_eq!(frame.data[4], MSG_SESSION_UPDATE);
     let bytes = &frame.data[..frame.len as usize];
-    assert_eq!(bytes[bytes.len() - 21], 2, "#9412: the close class precedes the session-sync trailers");
     assert_eq!(
-        u32::from_le_bytes(bytes[bytes.len() - 20..bytes.len() - 16].try_into().unwrap()),
+        bytes[bytes.len() - 22],
+        2,
+        "#9412: the close class precedes the session-sync trailers"
+    );
+    assert_eq!(
+        u32::from_le_bytes(bytes[bytes.len() - 21..bytes.len() - 17].try_into().unwrap()),
         525_590,
         "#9752: the golden tail carries the domain"
     );
     assert_eq!(
-        u32::from_le_bytes(bytes[bytes.len() - 16..bytes.len() - 12].try_into().unwrap()),
+        u32::from_le_bytes(bytes[bytes.len() - 17..bytes.len() - 13].try_into().unwrap()),
         3_318_534_811,
         "#9752: the golden tail carries the check"
     );
     assert_eq!(
-        &bytes[bytes.len() - 12..bytes.len() - 9],
+        &bytes[bytes.len() - 13..bytes.len() - 10],
         &[1, 13, 0],
         "#11064: the golden tail carries a valid ICMP type/code pair"
     );
     assert_eq!(
-        &bytes[bytes.len() - 9..bytes.len() - 3],
+        &bytes[bytes.len() - 10..bytes.len() - 4],
         &[0, 0, 0, 0, 0, 0],
         "#11070: the golden fixture carries a zero ingress identity"
     );
     assert_eq!(
-        &bytes[bytes.len() - 3..],
-        &[0, 0, 0],
-        "#10888: the golden fixture carries an empty rule ID and legacy handshake state"
+        &bytes[bytes.len() - 4..],
+        &[0, 0, 3, 2],
+        "#10888/#12187: the golden fixture carries an empty rule ID, handshake state 3, and static provenance"
     );
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     let path = concat!(
@@ -1584,7 +1589,7 @@ fn test_encode_session_open_carries_the_close_class_9412() {
         1,
     );
     assert_eq!(frame.data[4], MSG_SESSION_OPEN);
-    assert_eq!(frame.data[frame.len as usize - 21], 1); // Close class precedes the session-sync trailer.
+    assert_eq!(frame.data[frame.len as usize - 22], 1); // Close class precedes the session-sync trailer.
 }
 
 #[test]
@@ -1600,14 +1605,51 @@ fn session_update_carries_tcp_handshake_state_10888() {
         0,
         0,
         3,
+        None,
     );
     let bytes = &frame.data[..frame.len as usize];
     assert_eq!(bytes[4], MSG_SESSION_UPDATE);
     assert_eq!(
-        &bytes[bytes.len() - 3..],
-        &[0, 0, 3],
-        "#10888: a SYN-ACK-first pending Update has an empty rule ID prefix and its handshake stage"
+        &bytes[bytes.len() - 4..],
+        &[0, 0, 3, 0],
+        "#10888 handshake state precedes #12187's unknown provenance byte"
     );
+}
+
+#[test]
+fn session_open_and_update_carry_source_nat_provenance_12187() {
+    let zones = test_zone_map();
+    for (source_nat_static, expected) in [(None, 0), (Some(false), 1), (Some(true), 2)] {
+        let open = EventFrame::encode_session_open_with_handshake_state(
+            9,
+            &test_key_v4(),
+            &test_decision(),
+            &test_metadata(),
+            &zones,
+            false,
+            0,
+            0,
+            3,
+            source_nat_static,
+        );
+        let update = EventFrame::encode_session_update_with_handshake_state(
+            10,
+            &test_key_v4(),
+            &test_decision(),
+            &test_metadata(),
+            &zones,
+            false,
+            0,
+            0,
+            3,
+            source_nat_static,
+        );
+        for frame in [&open, &update] {
+            let bytes = &frame.data[..frame.len as usize];
+            assert_eq!(bytes[bytes.len() - 2], 3);
+            assert_eq!(bytes[bytes.len() - 1], expected);
+        }
+    }
 }
 
 /// #9752: open AND update frames carry the installing-table identity as the
@@ -1645,15 +1687,15 @@ fn session_frames_carry_the_install_table_identity_9752() {
     .enumerate()
     {
         let end = frame.len as usize;
-        // Install-table bytes precede the ICMP identity, ingress identity,
-        // empty rule-ID length prefix and handshake-state byte.
+        // Install-table bytes precede ICMP, ingress, rule-ID length, handshake
+        // state, and provenance.
         assert_eq!(
-            u32::from_le_bytes(frame.data[end - 20..end - 16].try_into().unwrap()),
+            u32::from_le_bytes(frame.data[end - 21..end - 17].try_into().unwrap()),
             525_590,
             "frame {i}: domain must trail the close class"
         );
         assert_eq!(
-            u32::from_le_bytes(frame.data[end - 16..end - 12].try_into().unwrap()),
+            u32::from_le_bytes(frame.data[end - 17..end - 13].try_into().unwrap()),
             3_318_534_811,
             "frame {i}: check precedes the ICMP and ingress identity tails"
         );
@@ -1672,7 +1714,7 @@ fn session_frames_carry_the_install_table_identity_9752() {
     );
     let end = frame.len as usize;
     assert_eq!(
-        u64::from_le_bytes(frame.data[end - 20..end - 12].try_into().unwrap()),
+        u64::from_le_bytes(frame.data[end - 21..end - 13].try_into().unwrap()),
         0
     );
 }

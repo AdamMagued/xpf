@@ -3035,6 +3035,7 @@ fn helper_local_session_on_miss_clears_stale_shared_aliases() {
         session_id: 0,
         tcp_close_class: 0,
         tcp_handshake_state: 0,
+        source_nat_static: None,
     };
 
     // Install with SyncImport origin so take_synced_local recognizes

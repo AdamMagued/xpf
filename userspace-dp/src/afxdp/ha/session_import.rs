@@ -737,7 +737,7 @@ impl crate::afxdp::ha::SessionDomain {
     ) -> crate::afxdp::bpf_map::ConntrackPublishResult {
         let v4_fd = maps.conntrack_v4_fd.as_ref().map_or(-1, |fd| fd.fd);
         let v6_fd = maps.conntrack_v6_fd.as_ref().map_or(-1, |fd| fd.fd);
-        crate::afxdp::bpf_map::publish_bpf_conntrack_entry_under_gate(
+        crate::afxdp::bpf_map::publish_bpf_conntrack_entry_under_gate_with_source_nat(
             v4_fd,
             v6_fd,
             &entry.key,
@@ -749,6 +749,7 @@ impl crate::afxdp::ha::SessionDomain {
             entry.session_id,
             0,
             entry.origin,
+            entry.source_nat_static,
         )
     }
 
@@ -2173,6 +2174,7 @@ impl crate::afxdp::ha::SessionDomain {
             session_id: 0,
             tcp_close_class: 0,
             tcp_handshake_state: 0,
+            source_nat_static: None,
         });
     }
 }
@@ -2326,6 +2328,7 @@ mod rejected_mirror_reservation_10790_tests {
             session_id,
             tcp_close_class: 0,
             tcp_handshake_state: 0,
+            source_nat_static: None,
         }
     }
 
@@ -2457,6 +2460,7 @@ mod rejected_mirror_reservation_10790_tests {
             session_id: 0,
             tcp_close_class: 0,
             tcp_handshake_state: 0,
+            source_nat_static: None,
         };
         let allocator = &coordinator.forwarding.source_nat_rules[0].pool_allocator;
         assert!(

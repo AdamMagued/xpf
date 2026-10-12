@@ -910,6 +910,9 @@ pub(super) struct ResolvedFlowSessionDecision {
     pub(super) key: SessionKey,
     pub(super) session_id: u64,
     pub(super) decision: SessionDecision,
+    /// Ordinary source-NAT provenance from the installed or synced entry.
+    /// `None` preserves conservative, revocable behavior for legacy rows.
+    pub(super) source_nat_static: Option<bool>,
     pub(super) metadata: SessionMetadata,
     pub(super) origin: SessionOrigin,
     pub(super) created: bool,
@@ -1808,6 +1811,7 @@ pub(super) fn synthesized_synced_reverse_entry_in_table(
         // `companion_keeps_alive` then held the closing forward alive with it.
         tcp_close_class: entry.tcp_close_class,
         tcp_handshake_state: entry.tcp_handshake_state,
+        source_nat_static: None,
     })
 }
 
@@ -2065,6 +2069,7 @@ pub(super) fn install_reverse_session_from_forward_match(
             session_id: 0,
             tcp_close_class: 0,
             tcp_handshake_state: sessions.handshake_state_wire_for(reverse_key),
+            source_nat_static: None,
         };
         publish_shared_session(
             shared_sessions,

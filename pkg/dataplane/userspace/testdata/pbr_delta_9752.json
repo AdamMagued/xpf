@@ -42,6 +42,7 @@
   "source_nat_icmp_code": 0,
   "source_nat_icmp_type": 13,
   "source_nat_icmp_valid": true,
+  "source_nat_provenance": 0,
   "src_ip": "10.0.61.102",
   "src_mac": "",
   "src_port": 55068,

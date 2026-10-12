@@ -442,6 +442,9 @@ pub(in crate::afxdp) fn session_delta_info(
         // frame's trailing byte. Only meaningful on Close deltas; opens carry
         // false (the emit paths never set it there).
         purge_retirement: delta.purge_retirement,
+        source_nat_provenance: crate::session::source_nat_provenance_to_wire(
+            delta.source_nat_static,
+        ),
     }
 }
 
@@ -497,6 +500,7 @@ pub(in crate::afxdp) fn export_close_direct(
         tcp_close_class: tombstone.close_class,
         tcp_handshake_state: 0,
         purge_retirement: false,
+        source_nat_static: None,
     };
     session_delta_info(ident, &delta, zone_id_to_name)
 }
