@@ -894,11 +894,17 @@ pub(in crate::afxdp) fn should_seed_fabric_punt(
 ///    `fabric_ingress_return_traffic_is_denied_on_the_lan_node_7770` keeps
 ///    pinned.
 ///
-/// The direction of the change is therefore: nothing that is permitted today
-/// becomes denied — this function NEVER changes the packet's disposition, so it
-/// adds no drop site — and one thing that is denied today becomes permitted:
-/// the reply of a flow this node itself ingressed and its own policy permitted.
-/// That is not a privilege the requester did not already hold.
+/// The direction of the change is therefore: this helper never changes the
+/// current packet's disposition and adds no direct drop site; one previously
+/// denied return path may be admitted — the reply of a flow this node itself
+/// ingressed and its own policy permitted. That is not a privilege the
+/// requester did not already hold.
+///
+/// Separately, a permitted seed is a counted session. The earlier #12179
+/// new-flow quota check can reject a later punted flow at the always-on source
+/// quota (`session-limit-src`; default 4096 per source IP, ingress zone, and
+/// worker unless positively overridden) or an enabled destination quota
+/// (`session-limit-dst`), before this helper is reached.
 ///
 /// ## What it deliberately does not carry
 ///
