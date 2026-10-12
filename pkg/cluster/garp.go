@@ -346,6 +346,10 @@ func PrimaryIPv4(iface string) (net.IP, error) {
 }
 
 func probeIPv6Source(addrs []net.Addr) net.IP {
+	return probeIPv6SourceExcluding(addrs, nil)
+}
+
+func probeIPv6SourceExcluding(addrs []net.Addr, excluded net.IP) net.IP {
 	var linkLocal net.IP
 	for _, a := range addrs {
 		ipNet, ok := a.(*net.IPNet)
@@ -353,7 +357,7 @@ func probeIPv6Source(addrs []net.Addr) net.IP {
 			continue
 		}
 		ip := ipNet.IP.To16()
-		if ip == nil || ipNet.IP.To4() != nil {
+		if ip == nil || ipNet.IP.To4() != nil || ip.Equal(excluded) {
 			continue
 		}
 		if ip.IsLinkLocalUnicast() {
@@ -433,7 +437,7 @@ func SendGratuitousIPv6(iface string, ip net.IP, count int) error {
 		return fmt.Errorf("interface %s: %w", iface, err)
 	}
 
-	pkt := buildUnsolicitedNA(ifi.HardwareAddr, ip6)
+	pkt := buildVIPUnsolicitedNA(ifi.HardwareAddr, ip6)
 
 	fd, err := linuxsock.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_IPV6)))
 	if err != nil {
@@ -493,9 +497,41 @@ func SendGratuitousIPv6BurstGated(iface string, ip net.IP, count int, stillValid
 	if err != nil {
 		return fmt.Errorf("interface %s: %w", iface, err)
 	}
+	pkt := buildVIPUnsolicitedNA(ifi.HardwareAddr, ip6)
+	return sendUnsolicitedIPv6NABurstGated(iface, ifi, ip6, pkt, count, stillValid)
+}
 
-	pkt := buildUnsolicitedNA(ifi.HardwareAddr, ip6)
+// SendProxyGratuitousIPv6BurstGated sends an unsolicited NA for a proxy-NDP
+// target. Unlike a configured VIP, a proxy target is not assigned to the
+// outgoing interface; RFC 4861 §4.4 requires the packet source to be another
+// address actually assigned to that interface. Prefer an assigned global/ULA
+// address when available. Linux's route-based source selection for ff02::1 can
+// choose link-local, so this raw packet path does not mirror kernel selection.
+func SendProxyGratuitousIPv6BurstGated(iface string, targetIP net.IP, count int, stillValid BurstStillValid) error {
+	if count <= 0 {
+		count = 1
+	}
+	target := targetIP.To16()
+	if target == nil || target.To4() != nil {
+		return fmt.Errorf("not an IPv6 proxy target: %s", targetIP)
+	}
 
+	ifi, err := net.InterfaceByName(iface)
+	if err != nil {
+		return fmt.Errorf("interface %s: %w", iface, err)
+	}
+	addrs, err := ifi.Addrs()
+	if err != nil {
+		return fmt.Errorf("interface addresses %s: %w", iface, err)
+	}
+	pkt, err := buildProxyUnsolicitedNA(ifi.HardwareAddr, addrs, target)
+	if err != nil {
+		return fmt.Errorf("build proxy NA for %s: %w", iface, err)
+	}
+	return sendUnsolicitedIPv6NABurstGated(iface, ifi, target, pkt, count, stillValid)
+}
+
+func sendUnsolicitedIPv6NABurstGated(iface string, ifi *net.Interface, target net.IP, pkt []byte, count int, stillValid BurstStillValid) error {
 	fd, err := linuxsock.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_IPV6)))
 	if err != nil {
 		return fmt.Errorf("raw socket: %w", err)
@@ -515,7 +551,7 @@ func SendGratuitousIPv6BurstGated(iface string, ip net.IP, count int, stillValid
 	}
 
 	slog.Info("cluster: sent unsolicited IPv6 NA burst (1st)",
-		"interface", iface, "ip", ip6.String(), "total", count)
+		"interface", iface, "ip", target.String(), "total", count)
 
 	// Schedule remaining NAs in background. As with the GARP burst above,
 	// follow-up sends are the failover-convergence reliability mechanism;
@@ -523,7 +559,7 @@ func SendGratuitousIPv6BurstGated(iface string, ip net.IP, count int, stillValid
 	// loop (never per-iteration). The loop never aborts on a transient
 	// error so the remaining NAs still get a chance to reach the LAN.
 	if count > 1 {
-		go runNABurstFollowups(fd, iface, ip6.String(), pkt, addr, count, stillValid)
+		go runNABurstFollowups(fd, iface, target.String(), pkt, addr, count, stillValid)
 	} else {
 		unix.Close(fd)
 	}
@@ -566,23 +602,52 @@ func runNABurstFollowups(fd int, iface, ip string, pkt []byte, addr unix.Sockadd
 	}
 }
 
+// buildProxyUnsolicitedNA constructs a proxy-target NA using a source address
+// selected from the outgoing interface's addresses. A proxy target is not
+// itself a valid source for this packet.
+func buildProxyUnsolicitedNA(mac net.HardwareAddr, addrs []net.Addr, target net.IP) ([]byte, error) {
+	target6 := target.To16()
+	if target6 == nil || target6.To4() != nil {
+		return nil, fmt.Errorf("not an IPv6 proxy target: %s", target)
+	}
+	source := probeIPv6SourceExcluding(addrs, target6)
+	if source == nil {
+		return nil, fmt.Errorf("no suitable IPv6 source distinct from proxy target %s", target6)
+	}
+	if source.Equal(target6) || !interfaceHasIPv6Address(addrs, source) {
+		return nil, fmt.Errorf("invalid proxy NA source %s for target %s", source, target6)
+	}
+	return buildUnsolicitedNA(mac, source, target6, false), nil
+}
+
+func interfaceHasIPv6Address(addrs []net.Addr, want net.IP) bool {
+	for _, addr := range addrs {
+		ipNet, ok := addr.(*net.IPNet)
+		if ok && ipNet.IP.To16() != nil && ipNet.IP.To4() == nil && ipNet.IP.Equal(want) {
+			return true
+		}
+	}
+	return false
+}
+
+// buildVIPUnsolicitedNA builds a Router=1 announcement for a VIP or router
+// identity, preserving the flag required for hosts to retain their default
+// router entry.
+func buildVIPUnsolicitedNA(mac net.HardwareAddr, ip net.IP) []byte {
+	return buildUnsolicitedNA(mac, ip, ip, true)
+}
+
 // buildUnsolicitedNA constructs a raw Ethernet + IPv6 + ICMPv6 Neighbor
 // Advertisement packet, sent to the all-nodes multicast address (ff02::1) per
 // RFC 4861 §7.2.6 (unsolicited NA). Includes the Target Link-Layer Address
-// option.
+// option. The source must be assigned to the outgoing interface; the advertised
+// target may instead be an address served by proxy NDP.
 //
-// Flags are Router=1, Override=1, Solicited=0 — see the pkt[58] = 0xA0 setter
-// below, which states the same thing thirty lines further down.
-//
-// #6934: this comment used to say "with Override and Solicited flags cleared",
-// which contradicted that setter. Only Solicited is cleared. The distinction is
-// not cosmetic and it is the whole reason this builder works: RFC 4861 §7.2.5
-// lets a receiver keep its existing cache entry when an NA arrives with
-// Override=0, so an Override=0 burst could not correct a peer still pointing at
-// the old node — precisely the failover convergence this exists to drive. A
-// reader auditing RFC conformance hit the false sentence first, and #6934 spent
-// a round ruling out an Override=0 bug that the code never had.
-func buildUnsolicitedNA(mac net.HardwareAddr, ip net.IP) []byte {
+// #6934: the Override flag must remain set to replace stale neighbor entries.
+// RFC 4861 §7.2.5 permits a receiver to keep an existing cache entry when the
+// NA has Override=0, so an Override=0 announcement could not correct a peer
+// still pointing at the old node.
+func buildUnsolicitedNA(mac net.HardwareAddr, source, target net.IP, router bool) []byte {
 	// 14 Ethernet + 40 IPv6 + 24 ICMPv6 NA (8 hdr + 16 target) + 8 TLLA option = 86
 	pkt := make([]byte, 86)
 
@@ -598,8 +663,8 @@ func buildUnsolicitedNA(mac net.HardwareAddr, ip net.IP) []byte {
 	binary.BigEndian.PutUint16(pkt[18:20], 32) // Payload Length: ICMPv6 NA(24) + TLLA option(8)
 	pkt[20] = 58                               // Next Header: ICMPv6
 	pkt[21] = 255                              // Hop Limit
-	// Source: our IP
-	copy(pkt[22:38], ip.To16())
+	// RFC 4861 §4.4: source is assigned to the interface sending this packet.
+	copy(pkt[22:38], source.To16())
 	// Destination: ff02::1 (all-nodes multicast)
 	pkt[38] = 0xff
 	pkt[39] = 0x02
@@ -610,15 +675,22 @@ func buildUnsolicitedNA(mac net.HardwareAddr, ip net.IP) []byte {
 	pkt[54] = 136 // Type: Neighbor Advertisement
 	pkt[55] = 0   // Code: 0
 	// pkt[56:58] = checksum (filled below)
-	// Flags: Router=1, Override=1, Solicited=0
-	// RFC 4861 §7.2.5: if IsRouter was true in the neighbor cache and the
-	// received NA has Router=0, the host MUST remove that router from the
-	// Default Router List. We MUST set Router=1 to preserve the host's
-	// default route through this link-local address across failover.
-	pkt[58] = 0xA0 // Router(bit 31)=0x80 + Override(bit 29)=0x20
+	// Override=1 replaces stale mappings and Solicited=0 is required for
+	// multicast NAs. Router depends on the advertised identity: VIP and
+	// router link-local announcements use 1; proxy targets use 0.
+	if router {
+		// RFC 4861 §7.2.5: Router=0 removes a previously-known router from
+		// the Default Router List. VIP and router link-local callers advertise
+		// this node's forwarding identity, so they retain Router=1.
+		pkt[58] = 0xA0 // Router=1 + Override=1; Solicited=0.
+	} else {
+		// Kernel NTF_PROXY entries omit NTF_ROUTER and answer Router=0.
+		// Keep proxy announcements consistent with the later kernel response.
+		pkt[58] = 0x20 // Override=1; Router=0, Solicited=0.
+	}
 	// pkt[59:62] = 0 (reserved)
-	// Target address
-	copy(pkt[62:78], ip.To16())
+	// Target may be a proxy address that is not assigned to this interface.
+	copy(pkt[62:78], target.To16())
 
 	// --- Target Link-Layer Address option (8 bytes) ---
 	pkt[78] = 2 // Type: Target Link-Layer Address
