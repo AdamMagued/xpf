@@ -443,7 +443,7 @@ func (t *authFailureTracker) recordFailure(source, account string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	now := t.now()
-	if b := t.accountBucketLocked(source+"\x00"+account); b != nil {
+	if b := t.accountBucketLocked(source + "\x00" + account); b != nil {
 		t.chargeLocked(b, now, authThrottleAccountFailures)
 	}
 	if key := globalBasicAccountKey(account); key != "" {
