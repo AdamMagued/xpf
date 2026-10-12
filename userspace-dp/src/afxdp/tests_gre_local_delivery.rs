@@ -345,8 +345,8 @@ fn poll_descriptor_junos_host_permit_no_log_local_delivery_no_overlog() {
 /// `to-zone junos-host then permit` host-local session must count each packet
 /// against the admitting rule's hit counter EXACTLY ONCE — parity with transit.
 /// The #3706 MISS-install stamps a bound `policy_counter`, and the LocalDelivery
-/// session-HIT path ALSO re-evaluates the junos-host policy on every hit (the
-/// mandatory teardown re-check), whose `try_match_rule` counts the packet.
+/// session-HIT re-checks junos-host for teardown on every hit, counting via
+/// `apply_frag_deny_override_and_count`.
 /// Counting at the generic session-hit `record_policy_hit_counter` site TOO
 /// would double-count every established host-local permit packet (2N for N
 /// hits). This drives 1 SYN (miss) + 3 established ACKs (hits) and asserts the

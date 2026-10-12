@@ -1062,8 +1062,8 @@ fn flush_pending_policy_hit_record(record: &mut PendingPolicyHitRecord) {
 /// #3073: record one established-session packet against the admitting
 /// policy's hit counter, coalesced per worker. Called from the
 /// `poll_descriptor` session-hit fast path and the flow-cache hit replay —
-/// NOT the cold path, which already counts the first packet in
-/// `try_match_rule`, so every packet is counted exactly once.
+/// NOT the cold path: `apply_frag_deny_override_and_count` counts the first
+/// packet there, so each packet is counted exactly once.
 #[cfg(not(test))]
 #[inline(always)]
 pub(crate) fn record_policy_hit_counter(counter: &Arc<PolicyRuleCounter>, packet_bytes: u64) {
@@ -3727,8 +3727,8 @@ fn evaluate_policy_result_counted(
     // default-DENY this is the ONLY count (a denied flow installs no session,
     // so every dropped packet re-evaluates here); for default-PERMIT this is
     // the first-packet count and the established fast path re-counts the rest
-    // via the reserved handle below. Mirrors the per-rule `rule.hit_counter.add`
-    // in `apply_frag_deny_override_and_count`.
+    // via the reserved handle. Mirrors `matched_rule.hit_counter.add_if` in
+    // `apply_frag_deny_override_and_count`.
     state.default_counter.add_if(packet_len, hit_count);
     PolicyEvaluationResult {
         action: state.default_action,
@@ -3868,13 +3868,13 @@ pub(crate) fn evaluate_junos_host_policy(
 /// unaffected for every flow that does not overlap a deny. The L4 path never
 /// records a skip, so it stays byte-identical.
 #[allow(clippy::too_many_arguments)]
-/// #9385: this walker passes `PolicyHitCount::Count` at each `try_match_rule`
-/// site and that is correct, not an oversight. It is the `to-zone junos-host`
-/// (host-inbound) evaluation, and #3706 deliberately makes it the counting site
-/// for a host-bound packet — the established-hit path SKIPS its own re-count for
-/// LocalDelivery precisely because this re-eval already counted the packet. Only
-/// #8356's zone-policy re-derivation is side-effect-free, and it does not come
-/// through here.
+/// #9385: this walker passes `PolicyHitCount::Count` to each
+/// `apply_frag_deny_override_and_count` call deliberately. This is the
+/// `to-zone junos-host` (host-inbound) evaluation; #3706 makes it the counting
+/// site for a host-bound packet. The established-hit path SKIPS its own
+/// re-count for LocalDelivery because this re-eval already counted the packet.
+/// Only #8356's zone-policy re-derivation is side-effect-free, and it does not
+/// come through here.
 pub(crate) fn evaluate_junos_host_policy_l3_aware(
     state: &PolicyState,
     from_id: u16,

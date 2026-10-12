@@ -129,18 +129,18 @@
 //! reasoning was half right in a way that mattered: `evaluate_policy_result_*`
 //! does take `&PolicyState` and does RETURN a counter handle
 //! (`policy_counter_idx`) for the caller to bump, and this module never bumps
-//! what it is handed. But the EVALUATION counts internally — `apply_frag_deny_override_and_count`
-//! calls `rule.hit_counter.add` on every match and the implicit-default path
-//! calls `state.default_counter.add` — and `&PolicyState` does not prevent it,
-//! because those counters are ATOMICS behind shared references, so an immutable
-//! borrow is not the guarantee the claim rested on. Passing `packet_len = 0` did
-//! not help either: the zero-length gate in `HitCounter::add` covers BYTES only
-//! and the packet increment is unconditional. So every re-derivation recorded a
-//! PHANTOM hit on whichever rule (or the implicit default) it matched, inflating
-//! `show security policies hit-count` by up to one packet per live session per
-//! config generation — arriving at exactly the moment an operator is watching
-//! hit-count to confirm a narrowing took effect.
-//!
+//! what it is handed. But the EVALUATION counts internally:
+//! `apply_frag_deny_override_and_count` calls
+//! `matched_rule.hit_counter.add_if` on every match that
+//! survives the fragment override.
+//! The default path uses `state.default_counter.add_if`; `&PolicyState`
+//! cannot prevent either: both counters are ATOMICS behind shared
+//! references, so an immutable borrow is not the guarantee the claim
+//! rested on. Passing `packet_len = 0` does not help:
+//! `HitCounter::add` covers BYTES only; packet increments are unconditional.
+//! So every re-derivation recorded a PHANTOM hit on a matched rule
+//! or the implicit default — up to one packet per live session per
+//! config generation, just as an operator checks for narrowing.
 //! The filter needed `NonRoutingCountPolicy::Never` for precisely this reason
 //! and this module now needs the same thing: it calls
 //! `evaluate_policy_result_without_counting_at` (`PolicyHitCount::Never`), and the

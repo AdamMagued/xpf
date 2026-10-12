@@ -1308,8 +1308,8 @@ drift) closed in `fix/2008-quickwins-batch1`:
   #7473.
   The raw read primitive (`Manager.ReadPolicyCounters`) and
   `clear security policies hit-count` stay ungated by design. The Rust increment
-  (`policy.rs` `apply_frag_deny_override_and_count` for the first packet, plus the established
-  fast-path / flow-cache re-count added in #3073, see below) stays always-on —
+  (`policy.rs` `apply_frag_deny_override_and_count` for the first packet, plus
+  the #3073 established fast-path / flow-cache re-count) stays always-on —
   the gate is display-only, so enabling the knob surfaces counts that accrued
   while it was off, and no wire-format change was needed. NOTE: the per-rule hit-count chain itself (increment →
   coordinator snapshot → `policy_rule_counters` wire array → Go

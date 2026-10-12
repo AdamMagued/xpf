@@ -6073,9 +6073,9 @@ fn policy_hit_count_counts_every_established_packet_not_just_first() {
         &test_zone_name_to_id(),
     );
 
-    // Packet 1: the cold (session-miss) path runs policy evaluation, which
-    // increments the counter once inside `try_match_rule` and hands back the
-    // counter handle to stamp on the new session.
+    // Packet 1: the cold (session-miss) path counts once in
+    // `apply_frag_deny_override_and_count` and returns the counter handle
+    // to stamp on the new session.
     const FIRST_LEN: u64 = 100;
     let res = evaluate_policy_result_with_len(
         &state,

@@ -1029,8 +1029,8 @@ unattributed local session.
 
 **Exactly-once hit counting (#3706).** The LocalDelivery session-HIT path
 re-evaluates the junos-host policy on every packet (the mandatory teardown
-re-check), and that re-eval's `try_match_rule` counts the packet against the
-admitting rule's hit counter — as it did pre-#3706, when a host-local session
+re-check). Its `apply_frag_deny_override_and_count` counts the packet against
+the admitting rule's hit counter, as it did pre-#3706 when a host-local session
 carried no bound counter and the generic session-hit
 `record_policy_hit_counter` was a no-op (`resolve_session_hit_counter(None, 0)`
 → `None`). Because #3706 now stamps a bound counter onto a junos-host permit
@@ -1040,7 +1040,7 @@ lets the per-hit junos-host re-eval be the single counter. Transit has no per-hi
 re-eval and counts solely at the generic site, so both paths count exactly once
 (the bound counter is still stamped for close-time `policy_id` re-resolution and
 HA sync). The first (miss) packet counts once via the session-MISS junos-host
-gate's `try_match_rule`.
+gate's `apply_frag_deny_override_and_count`.
 
 `policy::evaluate_junos_host_policy` resolves the reserved `junos-host` zone
 name to `JUNOS_HOST_ZONE_ID` (`u16::MAX-1`, the bottom of the reserved range,

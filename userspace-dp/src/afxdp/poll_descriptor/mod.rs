@@ -1858,13 +1858,13 @@ pub(super) fn poll_binding_process_descriptor_with_injection(
                         } else {
                             None
                         };
-                        // #3073: re-count this established-session packet against
-                        // the admitting policy's hit counter. The cold path
-                        // counts the first packet in `try_match_rule`; this
-                        // covers every subsequent packet that hits the session
-                        // (and reply traffic on the reverse companion), so
-                        // `show security policies hit-count` reflects the real
-                        // load the rule carries — not just the first frame.
+                        // #3073: re-count established packets on the admitting
+                        // policy's counter. The cold path counts packet 1 in
+                        // `apply_frag_deny_override_and_count`; this covers
+                        // later session hits (and reverse-companion replies).
+                        // Thus `show security policies hit-count` reflects
+                        // the rule's real traffic load, not just the first
+                        // frame of each flow.
                         // `resolve_flow_session_decision` never runs policy
                         // evaluation, so a packet reaching here was never counted
                         // by the cold path: exactly-once holds. The per-worker
@@ -1875,11 +1875,11 @@ pub(super) fn poll_binding_process_descriptor_with_injection(
                         // packets to a different rule.
                         //
                         // #3706: EXCEPT on the LocalDelivery (host-bound) path.
-                        // A host-local session re-evaluates the `to-zone
-                        // junos-host` policy on EVERY hit (the mandatory teardown
-                        // re-check below), and that re-eval's `try_match_rule`
-                        // already counts this packet against the admitting rule's
-                        // hit counter — exactly as it did pre-#3706, when a
+                        // A host-local session re-checks `to-zone junos-host`
+                        // on EVERY hit for teardown. That re-eval's
+                        // `apply_frag_deny_override_and_count` already counts
+                        // this packet on the admitting rule's hit counter,
+                        // as it did pre-#3706, when a
                         // host-local session carried no bound counter and this
                         // line was a no-op (`resolve_session_hit_counter(None, 0)`
                         // -> None). Now that a junos-host permit stamps a bound

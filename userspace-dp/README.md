@@ -464,10 +464,11 @@ logging rules, not these specific hot-path constants.
     signature (#9385).** This invariant used to be stated STRUCTURALLY —
     that `evaluate_policy_result_*` "takes `&PolicyState` and RETURNS a
     counter handle; it cannot count, log or meter by itself". True of the
-    HANDLE, false of the EVALUATION: `try_match_rule` bumps
-    `rule.hit_counter` on every match and the implicit-default path bumps
-    `state.default_counter`, and `&PolicyState` does not prevent it
-    because those counters are ATOMICS behind shared references. Passing
+    HANDLE, false of the EVALUATION: `apply_frag_deny_override_and_count`
+    calls `matched_rule.hit_counter.add_if` on every match that survives the
+    fragment override, and the implicit-default path bumps
+    `state.default_counter`. `&PolicyState` does not prevent it because those
+    counters are ATOMICS behind shared references. Passing
     `packet_len = 0` does not help either — the zero-length gate in
     `HitCounter::add` covers BYTES only and the packet increment is
     unconditional. So every re-derivation recorded a phantom hit, up to
