@@ -354,6 +354,9 @@ func TestReconcileHandoffAtBoot10769(t *testing.T) {
 	})
 	t.Run("clean post-reboot clears", func(t *testing.T) {
 		isolateHandoffFlag(t)
+		oldHistory := feedShrinkHistoryPath
+		feedShrinkHistoryPath = filepath.Join(t.TempDir(), "feeds", "feed-shrink-history.json")
+		t.Cleanup(func() { feedShrinkHistoryPath = oldHistory })
 		custom := filepath.Join(t.TempDir(), "custom", "userspace-dp.json")
 		if err := configstore.WriteResetHandoff("other-boot", "", custom); err != nil {
 			t.Fatal(err)
@@ -366,6 +369,9 @@ func TestReconcileHandoffAtBoot10769(t *testing.T) {
 	})
 	t.Run("clean same-boot is kept", func(t *testing.T) {
 		isolateHandoffFlag(t)
+		oldHistory := feedShrinkHistoryPath
+		feedShrinkHistoryPath = filepath.Join(t.TempDir(), "feeds", "feed-shrink-history.json")
+		t.Cleanup(func() { feedShrinkHistoryPath = oldHistory })
 		boot, err := configstore.CurrentBootID()
 		if err != nil {
 			t.Fatal(err)
@@ -603,24 +609,25 @@ type handoffResiduePaths struct {
 	ipsecTemps   []string
 }
 
-// isolateHandoffRepairPaths redirects the Kea/DDNS/IPsec verify sets into a
+// isolateHandoffRepairPaths redirects the Kea/DDNS/IPsec/feed verify sets into a
 // disposable tree and returns the residue inventory plus the custom helper
 // path tests record in the flag.
 func isolateHandoffRepairPaths(t *testing.T) (custom string, rp handoffResiduePaths) {
 	t.Helper()
 	isolateHandoffFlag(t)
-	oldLease, oldSurfaceA, oldIPsec := resetDDNSLeaseStatePath, resetDDNSSurfaceAPath, resetIPsecStatePath
+	oldLease, oldSurfaceA, oldIPsec, oldHistory := resetDDNSLeaseStatePath, resetDDNSSurfaceAPath, resetIPsecStatePath, feedShrinkHistoryPath
 	oldKea := resetKeaLeaseCurrents
 	root := t.TempDir()
 	resetDDNSLeaseStatePath = filepath.Join(root, "ddns", "dhcp-ddns-state.json")
 	resetDDNSSurfaceAPath = filepath.Join(root, "ddns", "interface-ddns-state.json")
 	resetIPsecStatePath = filepath.Join(root, "ipsec", "ipsec-conn-state.json")
+	feedShrinkHistoryPath = filepath.Join(root, "feeds", "feed-shrink-history.json")
 	resetKeaLeaseCurrents = []string{
 		filepath.Join(root, "kea", "kea-leases4.csv"),
 		filepath.Join(root, "kea", "kea-leases6.csv"),
 	}
 	t.Cleanup(func() {
-		resetDDNSLeaseStatePath, resetDDNSSurfaceAPath, resetIPsecStatePath = oldLease, oldSurfaceA, oldIPsec
+		resetDDNSLeaseStatePath, resetDDNSSurfaceAPath, resetIPsecStatePath, feedShrinkHistoryPath = oldLease, oldSurfaceA, oldIPsec, oldHistory
 		resetKeaLeaseCurrents = oldKea
 	})
 	custom = filepath.Join(root, "custom", "userspace-dp.json")
