@@ -211,8 +211,7 @@ func junosHostResolveApplications(cfg *Config, tokens []string) (l4 []JunosHostD
 			appAny = true
 			continue
 		}
-		if len(cfg.Applications.CollidingNames) > 0 &&
-			junosHostApplicationCollides(cfg, tok, map[string]bool{}) {
+		if applicationReferenceCollides(tok, &cfg.Applications) {
 			ok = false
 			continue
 		}
@@ -253,31 +252,6 @@ func junosHostResolveApplications(cfg *Config, tokens []string) (l4 []JunosHostD
 		return nil, true, ok
 	}
 	return l4, false, ok
-}
-
-func junosHostApplicationCollides(cfg *Config, name string, visited map[string]bool) bool {
-	apps := &cfg.Applications
-	if _, collision := apps.CollidingNames[name]; collision {
-		return true
-	}
-	if visited[name] {
-		return false
-	}
-	visited[name] = true
-	defer delete(visited, name)
-	if _, isApp := ResolveApplication(name, apps.Applications); isApp {
-		return false
-	}
-	set, isSet := ResolveApplicationSet(name, apps.ApplicationSets)
-	if !isSet || set == nil {
-		return false
-	}
-	for _, member := range set.Applications {
-		if junosHostApplicationCollides(cfg, member, visited) {
-			return true
-		}
-	}
-	return false
 }
 
 // junosHostReduceApp reduces a single application to L4 fragments. Rejects

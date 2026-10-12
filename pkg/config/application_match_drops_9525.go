@@ -125,19 +125,116 @@ func appendMatchLeafDrops9525(out, leaves []string, format string) []string {
 	return out
 }
 
-// ApplicationReferenceMatchDrops resolves a policy's `match application` name
-// the way the userspace expansion does (an application first, else an
-// application-set, through nested sets) and returns every drop on that path,
-// each prefixed with the application that carries it: ApplicationMatchDrops for
-// every application reached, and, for every application-set reached, a direct
-// match body the compiler discarded because the same application also defined
-// `term` blocks (MixedDirectTermApps).
+// applicationReferenceCollisionAction controls what a caller does after a
+// collision is reported while walking an application reference.
+type applicationReferenceCollisionAction uint8
+
+const (
+	applicationReferenceContinue applicationReferenceCollisionAction = iota
+	applicationReferenceStop
+)
+
+// walkApplicationReference visits collisions, sets and applications using the
+// same precedence and depth bound as application-set expansion. The top-level
+// token resolves application-first; members use memberIsNestedSet so a user
+// set wins over a same-named predefined application. seenSets is global to
+// this walk and is never cleared on return: collision status is path-independent,
+// and every set body is visited at most once.
+func walkApplicationReference(
+	name string,
+	apps *ApplicationsConfig,
+	onCollision func(kind, setName, member string) applicationReferenceCollisionAction,
+	onApplication func(name string, app *Application),
+	onSet func(name string),
+	onSetMembers func(name string, set *ApplicationSet),
+) {
+	if apps == nil || name == "" || name == "any" {
+		return
+	}
+	if _, collision := apps.CollidingNames[name]; collision {
+		onCollision("reference", name, "")
+		return
+	}
+	if app, ok := ResolveApplication(name, apps.Applications); ok {
+		if onApplication != nil {
+			onApplication(name, app)
+		}
+		return
+	}
+
+	seenSets := make(map[string]bool)
+	var walkSet func(setName string, depth int) bool
+	walkSet = func(setName string, depth int) bool {
+		// Past the expansion's own nesting limit the expansion already fails.
+		if depth > 3 {
+			return false
+		}
+		if _, collision := apps.CollidingNames[setName]; collision {
+			return onCollision("set", setName, "") == applicationReferenceStop
+		}
+		if seenSets[setName] {
+			return false
+		}
+		seenSets[setName] = true
+		if onSet != nil {
+			onSet(setName)
+		}
+		set, ok := lookupApplicationSet(setName, apps.ApplicationSets)
+		if !ok {
+			return false
+		}
+		if onSetMembers != nil {
+			onSetMembers(setName, set)
+		}
+		for _, member := range set.Applications {
+			if _, collision := apps.CollidingNames[member]; collision {
+				if onCollision("member", setName, member) == applicationReferenceStop {
+					return true
+				}
+				continue
+			}
+			if memberIsNestedSet(member, apps) {
+				if walkSet(member, depth+1) {
+					return true
+				}
+				continue
+			}
+			if onApplication != nil {
+				if app, found := ResolveApplication(member, apps.Applications); found {
+					onApplication(member, app)
+				}
+			}
+		}
+		return false
+	}
+	walkSet(name, 0)
+}
+
+// applicationReferenceCollides reports whether an application reference reaches
+// a colliding name. It uses the same bounded set-first member walk as
+// ApplicationReferenceMatchDrops and the junos-host projection.
+func applicationReferenceCollides(name string, apps *ApplicationsConfig) bool {
+	if apps == nil || len(apps.CollidingNames) == 0 {
+		return false
+	}
+	collides := false
+	walkApplicationReference(name, apps, func(_, _, _ string) applicationReferenceCollisionAction {
+		collides = true
+		return applicationReferenceStop
+	}, nil, nil, nil)
+	return collides
+}
+
+// ApplicationReferenceMatchDrops resolves a top-level policy `match
+// application` token application-first, then as an application-set. Within a
+// set, members follow `memberIsNestedSet` precedence, matching expansion. It
+// returns every drop on the path, each prefixed with the application that
+// carries it: ApplicationMatchDrops for every application reached and, for
+// each application-set reached, a direct match body the compiler discarded
+// because the same application also defined `term` blocks (MixedDirectTermApps).
 func ApplicationReferenceMatchDrops(name string, apps *ApplicationsConfig) []string {
 	if apps == nil || name == "" || name == "any" {
 		return nil
-	}
-	if _, collision := apps.CollidingNames[name]; collision {
-		return []string{fmt.Sprintf("application %q: its name is ambiguous due to a collision", name)}
 	}
 	var out []string
 	seenApps := make(map[string]bool)
@@ -150,57 +247,34 @@ func ApplicationReferenceMatchDrops(name string, apps *ApplicationsConfig) []str
 			out = append(out, fmt.Sprintf("application %q: %s", appName, d))
 		}
 	}
-	if app, ok := ResolveApplication(name, apps.Applications); ok {
-		addApp(name, app)
-		return out
-	}
 	mixed := make(map[string]bool, len(apps.MixedDirectTermApps))
 	for _, n := range apps.MixedDirectTermApps {
 		mixed[n] = true
 	}
-	seenSets := make(map[string]bool)
-	var walkSet func(setName string, depth int)
-	walkSet = func(setName string, depth int) {
-		// Past the expansion's own nesting limit the expansion already fails.
-		if depth > 3 {
-			return
-		}
-		if _, collision := apps.CollidingNames[setName]; collision {
+	walkApplicationReference(name, apps, func(kind, setName, member string) applicationReferenceCollisionAction {
+		switch kind {
+		case "reference":
+			out = append(out, fmt.Sprintf("application %q: its name is ambiguous due to a collision", setName))
+			return applicationReferenceStop
+		case "set":
 			out = append(out, fmt.Sprintf("application-set %q: its name is ambiguous due to a collision", setName))
-			return
+			return applicationReferenceContinue
+		default:
+			out = append(out, fmt.Sprintf("application-set %q: member %q has an ambiguous colliding name", setName, member))
+			return applicationReferenceContinue
 		}
-		if seenSets[setName] {
-			return
-		}
-		seenSets[setName] = true
+	}, addApp, func(setName string) {
 		if mixed[setName] {
 			out = append(out, fmt.Sprintf(
 				"application %q: its direct match body was discarded because it also defines term blocks",
 				setName))
 		}
-		set, ok := lookupApplicationSet(setName, apps.ApplicationSets)
-		if !ok {
-			return
-		}
+	}, func(setName string, set *ApplicationSet) {
 		for _, ref := range unknownMemberReferences9595(set, apps) {
 			out = append(out, fmt.Sprintf(
 				"application-set %q: an unrecognized member statement names %q, which resolves as an application, so the set is missing a member",
 				setName, ref))
 		}
-		for _, member := range set.Applications {
-			if _, collision := apps.CollidingNames[member]; collision {
-				out = append(out, fmt.Sprintf("application-set %q: member %q has an ambiguous colliding name", setName, member))
-				continue
-			}
-			if memberIsNestedSet(member, apps) {
-				walkSet(member, depth+1)
-				continue
-			}
-			if app, found := ResolveApplication(member, apps.Applications); found {
-				addApp(member, app)
-			}
-		}
-	}
-	walkSet(name, 0)
+	})
 	return out
 }

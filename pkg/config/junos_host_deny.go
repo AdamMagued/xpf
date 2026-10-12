@@ -555,9 +555,13 @@ func junosHostProjectTerm(cfg *Config, key string, p *Policy, feedBound map[stri
 	// same problem for this projection: userspace refuses that reference too
 	// (ApplicationReferenceMatchDrops, #9525), but the kernel host-bound path
 	// must independently avoid turning it into an unconstrained permit. Skip the
-	// permit before resolution; any later deny rules remain authored and can
-	// only drop more traffic. A poisoned DENY is left intact because widening a
-	// DROP is the fail-closed direction.
+	// permit before resolution so it cannot carve a later deny.
+	//
+	// An unrepresentable DENY is NOT left intact: the whole-ingress-zone
+	// representability gate suppresses the complete kernel program, including
+	// otherwise valid sibling denies, and keeps the #4168 warning.
+	// An otherwise-unskipped permit unrepresentable in another match dimension
+	// also trips that gate.
 	if p.Action == PolicyPermit {
 		if p.LenientContentDropped {
 			t.skipPermit = true

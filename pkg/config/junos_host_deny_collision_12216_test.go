@@ -162,3 +162,44 @@ func TestJunosHostApplicationCollisionsAreUnrepresentable12216(t *testing.T) {
 		})
 	}
 }
+
+func TestJunosHostApplicationCollisionUnderPredefinedName12216(t *testing.T) {
+	cmds := []string{
+		"set interfaces ge-0/0/1 unit 0 family inet address 10.0.2.10/24",
+		"set security zones security-zone untrust interfaces ge-0/0/1.0 host-inbound-traffic system-services ssh",
+		"set applications application-set junos-http application x",
+		"set applications application-set outer application junos-http",
+		"set security policies from-zone untrust to-zone junos-host policy blocked match source-address any",
+		"set security policies from-zone untrust to-zone junos-host policy blocked match destination-address any",
+		"set security policies from-zone untrust to-zone junos-host policy blocked match application outer",
+		"set security policies from-zone untrust to-zone junos-host policy blocked then deny",
+		"set applications application x protocol tcp destination-port 80",
+		"set applications application-set x application junos-https",
+	}
+	cfg, err := CompileConfigLenient(buildTree(t, cmds))
+	if err != nil {
+		t.Fatalf("lenient compile: %v", err)
+	}
+	if _, colliding := cfg.Applications.CollidingNames["x"]; !colliding {
+		t.Fatal("fixture must mark nested member x as colliding")
+	}
+
+	projection := BuildJunosHostDenyProjection(cfg)
+	foundZone := false
+	for _, program := range projection.Programs {
+		if program.Zone != "untrust" {
+			continue
+		}
+		foundZone = true
+		if program.Representable {
+			t.Fatalf("set-first nested collision must make untrust unrepresentable: %+v", program)
+		}
+	}
+	if !foundZone {
+		t.Fatalf("fixture produced no untrust program: %+v", projection.Programs)
+	}
+	key := JunosHostZonePairPolicyKey("untrust", "blocked")
+	if projection.RenderedPolicyKeys[key] {
+		t.Fatalf("nested application collision must not suppress the host-deny warning: %+v", projection.RenderedPolicyKeys)
+	}
+}

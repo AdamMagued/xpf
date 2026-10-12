@@ -111,3 +111,71 @@ func TestNATReadyFeedWithEmptySameNameSetStillResolves12216(t *testing.T) {
 		t.Fatal("policy-path control rejected the same ready feed")
 	}
 }
+
+func TestNATAddressSetWithEmptyNestedClosureQuarantined12216(t *testing.T) {
+	ab := &config.AddressBook{
+		Addresses: map[string]*config.Address{
+			"good": {Name: "good", Value: "10.20.0.0/16"},
+		},
+		AddressSets: map[string]*config.AddressSet{
+			"empty": {Name: "empty"},
+			"mixed": {Name: "mixed", Addresses: []string{"good"}, AddressSets: []string{"empty"}},
+		},
+	}
+	cfg := &config.Config{}
+	cfg.Security.AddressBook = ab
+
+	if got := resolveNATAddressNamePrefixes(cfg, nil, "mixed"); got != nil {
+		t.Fatalf("NAT set with an empty nested closure must resolve to nil, got %v", got)
+	}
+	if nameRepresentable(ab, nil, nil, "mixed", map[string]bool{}) {
+		t.Fatal("policy-path control accepted a set with an empty nested closure")
+	}
+}
+
+func TestNATAddressSetWithUnusableAddressClosureQuarantined12216(t *testing.T) {
+	ab := &config.AddressBook{
+		Addresses: map[string]*config.Address{
+			"good": {Name: "good", Value: "10.20.0.0/16"},
+			"dns":  {Name: "dns", Value: "10.30.0.0/16", UnimplementedForms: []string{"dns-name"}},
+		},
+		AddressSets: map[string]*config.AddressSet{
+			"mixed": {Name: "mixed", Addresses: []string{"good", "dns"}},
+		},
+	}
+	cfg := &config.Config{}
+	cfg.Security.AddressBook = ab
+
+	if got := resolveNATAddressNamePrefixes(cfg, nil, "mixed"); got != nil {
+		t.Fatalf("NAT set with an unusable nested address must resolve to nil, got %v", got)
+	}
+	if nameRepresentable(ab, nil, nil, "mixed", map[string]bool{}) {
+		t.Fatal("policy-path control accepted a set with an unusable address")
+	}
+}
+
+func TestNATReadyFeedWithUnusableStaticAliasStillResolves12216(t *testing.T) {
+	ab := &config.AddressBook{
+		Addresses: map[string]*config.Address{
+			"good":     {Name: "good", Value: "10.20.0.0/16"},
+			"feed-dns": {Name: "feed-dns", Value: "10.30.0.0/16", UnimplementedForms: []string{"dns-name"}},
+		},
+		AddressSets: map[string]*config.AddressSet{
+			"mixed": {Name: "mixed", Addresses: []string{"good", "feed-dns"}},
+		},
+	}
+	cfg := &config.Config{}
+	cfg.Security.AddressBook = ab
+	cfg.Security.DynamicAddress.AddressBindings = map[string]*config.AddressBinding{
+		"feed-dns": {Name: "feed-dns", FeedNames: []string{"threat"}},
+	}
+	overlay := map[string][]string{"feed-dns": {"198.51.100.0/24"}}
+
+	got := resolveNATAddressNamePrefixes(cfg, overlay, "mixed")
+	if !contains(got, "10.20.0.0/16") || !contains(got, "198.51.100.0/24") {
+		t.Fatalf("ready feed must resolve beside a static member when the same-name static alias is unusable, got %v", got)
+	}
+	if !nameRepresentable(ab, overlay, cfg.Security.DynamicAddress.AddressBindings, "mixed", map[string]bool{}) {
+		t.Fatal("policy-path control rejected the same ready feed closure")
+	}
+}

@@ -3417,14 +3417,14 @@ policy `match source-address <name>` / `destination-address <name>` names a
 single token) but are stored in two SEPARATE maps
 (`AddressBook.Addresses` / `AddressBook.AddressSets`). So an operator can author
 `address blocklist 10.0.1.0/24` AND `address-set blocklist { address other; }`
-in the same book with no commit error — and every place a name is resolved to
-prefixes checks `Addresses` before `AddressSets` (**address-first**: the
-dataplane `expandBookNameRecursive` / `nameRepresentability` /
-`capabilities`, and the host-inbound `junos_host_deny` compiler). The plain
-address therefore SILENTLY SHADOWS the same-named address-set: a deny built on
-the SET covers only the single address, so the set's other members leak (an
-under-block) — a security-relevant change to which traffic a rule covers, with
-no diagnostic (codex-review-182 M10, High).
+in the same book. Strict commit validation rejects the collision; tolerant load
+keeps the entries, records the collision metadata and warns (#1960). Before
+#12216, some runtime resolvers selected the address-first winner, so a deny
+authored for the set could cover only the address and miss the set's other
+members. The NAT address-name expander, userspace policy representability check,
+and junos-host projection now inspect collision metadata and refuse the whole
+reference instead of applying that winner. Static-NAT `prefix-name` remains a
+separate address-first path and is tracked as follow-up #12625.
 
 `validateAddressBookNameCollisionStrict` (`compiler_validate_strict_addrbook.go`,
 wired in `runEarlyStrictAndFolds` right after `validateAddressBookEntryNamesStrict`
@@ -3437,12 +3437,12 @@ same-name `address` + `address-set` in one book (there is no vendor-defined
 precedence to honor). The tolerant load / peer-sync path
 (`opts.lenientAddressBookNameCollision`, #1960 no-brick) downgrades to a
 `cfg.Warnings` entry so an already-persisted or peer-synced config carrying a
-pre-existing collision still BOOTS — and keeps the **deterministic address-first
-winner** the runtime already used (`resolveAddressBookNameKind`, the single
-source of truth), so a leniently-loaded config forwards exactly as before rather
-than silently changing its dispositions on reload. Covered by
+pre-existing collision still BOOTS and keeps collision metadata with both
+typed entries. Address-name paths that consult that metadata quarantine the
+whole reference; NAT's raw-name fallback still needs the CIDR-shaped-name fix
+tracked by #12626. Covered by
 `pkg/config/addr_set_namespace_5676_test.go` (global + zone-local reject,
-both config orderings, lenient-warn, deterministic-winner, namespace-aware
+both config orderings, lenient-warn, both-entry retention, namespace-aware
 absent-collision, non-colliding-commits), the strict-reject + lenient-warn cases
 RED on revert of the gate wiring.
 
@@ -10769,36 +10769,35 @@ reserved for whole-dataplane selection where a rewrite shim
     stripped to its network address exactly like a literal `match
     destination-address` CIDR. An undefined name is hard-rejected at commit
     (`validateNATSourceAddressNameReferencesStrict`, which gates BOTH the
-    source and destination name leaves) and fails closed on the lenient
-    load / peer-sync path (the unresolved raw token cannot parse as an IP,
-    so the rule matches NOTHING rather than broadening to match-any).
-    **#3425 — defined-but-unresolvable references**: the same gate now also
-    rejects a name that IS defined under `security address-book` but
-    resolves to NO concrete address — a defined-but-empty `address-set`, a
-    set whose members dangle, or an `address` with no prefix
-    (`Value == ""`). Existence alone is not enough: the snapshot builder
-    resolves the name through `resolveUserspaceAddressBookEntry` (which
-    returns `ok=false` for these cases) and appends the raw unparseable
-    token, so the SNAT source list stays non-empty-but-unmatchable and the
-    DNAT rule emits zero `DnatTable` entries — the rule translates no
-    traffic. Strict commit now surfaces this as an operator-visible error
-    (resolution mirrors the runtime via the shared
-    `policyMatchAddressBookResolves` helper, so commit and apply cannot
-    diverge — the NAT analog of the #3149 policy-address representability
-    gate and the #3434 NAT match-application gate). A DIRECT
-    `security dynamic-address address-name <name>` feed binding is ACCEPTED
-    (its static expansion is empty but the live feed overlay supplies the
-    prefixes at runtime, #3303) — mirroring the
-    `validatePolicyMatchAddressesStrict` feed carve-out (#3294); a feed
-    member NESTED in an address-set stays poisoned by the static resolver
-    (the anti-Option-C guardrail). Lenient load / peer-sync downgrades to a
-    warning so an already-persisted or peer-synced config still boots
-    (#1960); the dataplane fails closed independently. **#3418** — the
-    feed carve-out is now pinned through the full `CompileConfig` strict
-    commit path for ALL FOUR SNAT/DNAT source/destination address-name
-    combinations (the #3303 snapshot tests call the builder directly and
-    bypass the strict validator, which is how the over-reject survived for
-    the three combinations the #3425 SNAT-source test did not cover).
+    source and destination name leaves) and remains loadable with a warning on
+    the lenient load / peer-sync path (#1960). The runtime keeps the raw name
+    as a non-empty constraint. A non-IP/CIDR token contributes no prefix, but
+    names may themselves be CIDRs: a CIDR-shaped fallback can match that
+    literal prefix or produce a DNAT translation row. Making the fallback
+    unparseable by construction is tracked by #12626.
+    **#3425 — defined-but-unresolvable references**: the same gate rejects a
+    name that IS defined under `security address-book` but resolves to NO
+    concrete address — an empty unbound `address-set`, a set with any dangling
+    or unusable member not resolved by a ready feed value, or an
+    `address` with no usable value. At runtime,
+    `expandBookNameRecursive` poisons the WHOLE closure when a member remains
+    unresolved rather than returning its surviving subset; the raw-name fallback
+    still applies as above. Strict
+    commit surfaces this as an operator-visible error using
+    `policyMatchAddressBookResolves`, the policy-address representability
+    check (#3149) and NAT match-application gate (#3434).
+    A DIRECT `security dynamic-address address-name <name>` feed binding is
+    ACCEPTED (its static expansion is empty but the live feed overlay supplies
+    prefixes at runtime, #3303), mirroring the
+    `validatePolicyMatchAddressesStrict` feed carve-out (#3294). Strict commit
+    still rejects a feed member NESTED in an address-set (the anti-Option-C
+    guardrail), while the lenient runtime expander includes a ready nested feed
+    member and poisons the closure for an unready or otherwise unresolved member.
+    Lenient load / peer-sync warns so an already-persisted config still boots
+    (#1960); #3418 pins the direct-feed carve-out through the full `CompileConfig`
+    strict path for ALL FOUR SNAT/DNAT source/destination combinations (the
+    #3303 snapshot tests call the builder directly and bypassed the strict
+    validator for three combinations).
   - `security nat source/destination rule-set rule then ... pool <name>`
     (#5626) — a NAT rule's `then source-nat pool` / `then destination-nat
     pool` names a pool that MUST be defined under `security nat source pool
