@@ -646,9 +646,9 @@ func (d *Daemon) reconcileUserPassword(user *config.LoginUser) (err error) {
 		}
 	case pwLock:
 		// A timed-out rollback owner may resume after a new config re-presents
-		// this account. Never lock a password the live config desires; if the
-		// stale lock operation was already in flight, synchronously re-apply
-		// the live password before returning.
+		// this account. Never lock a password the live config desires; re-apply
+		// the live password. Root-auth repairs then revalidate under applySem
+		// before returning; removed-login deprovision settles at its own boundary.
 		if superseded, err := d.repairStalePasswordLock12169(user.Name); superseded {
 			fail(err)
 			break

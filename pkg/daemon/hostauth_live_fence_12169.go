@@ -2,6 +2,8 @@
 package daemon
 
 import (
+	"context"
+	"errors"
 	"log/slog"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -26,9 +28,9 @@ import (
 //   - POST-mutation (blocking mutations only — `chpasswd`, sshd reload): the
 //     process may have been spawned pre-promotion and resumed
 //     post-promotion. Re-read live and synchronously converge before dropping
-//     markers or returning. A password repair that races a removal re-acquires
-//     applySem, revalidates live intent, and re-locks the removed account
-//     before its provenance can be discarded.
+//     markers or returning. Login deprovision and root-password repairs
+//     reacquire applySem and revalidate intent before they finish, relocking
+//     a removed account before its provenance can be discarded.
 //
 // Under applySem the passed config IS the live config, so every check below
 // is a no-op on the healthy path (one RLock + slice scan); the fence only
@@ -89,14 +91,37 @@ func (d *Daemon) liveDesiredPasswordUser12169(name string) (config.LoginUser, bo
 // repairStalePasswordLock12169 re-applies a live password after a timed-out
 // owner resumes from its captured `name:!` chpasswd. It reports whether the
 // live config still desires an encrypted password and therefore superseded
-// the stale lock operation.
+// the stale lock operation. Only an abandoned closeout owner can observe a
+// mismatch: normal apply callers hold applySem and apply the promoted config.
 func (d *Daemon) repairStalePasswordLock12169(name string) (bool, error) {
 	live, ok := d.liveDesiredPasswordUser12169(name)
 	if !ok || live.EncryptedPassword.Reveal() == "" {
 		return false, nil
 	}
 	staleRevocationSuperseded12169("repair-password", name)
-	return true, d.reconcileUserPassword(&live)
+	repairErr := d.reconcileUserPassword(&live)
+	if name != "root" {
+		return true, repairErr
+	}
+	return true, errors.Join(repairErr, d.settleStaleRootPassword12169())
+}
+
+// settleStaleRootPassword12169 revalidates root's password after a stale
+// closeout repair while serialized with config commits. The caller is an
+// abandoned owner, not a normal apply already holding applySem.
+func (d *Daemon) settleStaleRootPassword12169() error {
+	if d != nil && d.applySem != nil {
+		if err := d.applySem.Acquire(context.Background(), 1); err != nil {
+			return err
+		}
+		defer d.applySem.Release(1)
+	}
+
+	live, desired := d.liveDesiredPasswordUser12169("root")
+	if !desired {
+		live = config.LoginUser{Name: "root"}
+	}
+	return d.reconcileUserPassword(&live)
 }
 
 // liveDesiredSudoersGrant12169 reports whether the LIVE config desires the
