@@ -417,6 +417,13 @@ func (m *Manager) statusLoop(ctx context.Context) {
 				m.mu.Unlock()
 				return
 			}
+			// Quiet-window expiry is observed on the existing periodic health
+			// tick. A recovered episode is journaled and cleared even when no
+			// later crash arrives to trigger the next episode boundary.
+			if m.helperCrash.RecoveredSinceCrash &&
+				m.resetQuietHelperCrashEpisodeLocked(time.Now()) {
+				m.notifyHelperSupervisorLocked()
+			}
 			// #6871: a RETH MAC link cycle owns the dataplane between
 			// PrepareLinkCycle and NotifyLinkCycle, and this tick is the busiest
 			// producer in that window. Skip the WHOLE body, not one publish:

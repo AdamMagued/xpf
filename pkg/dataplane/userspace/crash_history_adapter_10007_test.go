@@ -17,8 +17,8 @@ func TestLegacyAdapterForwardsCrashHistory10007(t *testing.T) {
 	first := time.Date(2026, 9, 16, 9, 0, 0, 0, time.UTC)
 	second := time.Date(2026, 9, 16, 11, 0, 0, 0, time.UTC)
 	m := crashedManagerFor8397(first, 4242, 101, 3, "exit status 101")
-	m.recordRecoveredCrashEpisodeLocked(first.Add(2 * time.Second))
-	m.helperCrash = HelperCrashRecord{}
+	m.mu.Lock()
+	m.completeHelperCrashRecoveryLocked(first.Add(2 * time.Second))
 	m.helperCrash = HelperCrashRecord{
 		LastExitWasCrash: true,
 		At:               second,
@@ -28,13 +28,12 @@ func TestLegacyAdapterForwardsCrashHistory10007(t *testing.T) {
 		Detail:           "killed by signal killed",
 		Restarts:         1,
 	}
-	m.recordRecoveredCrashEpisodeLocked(second.Add(time.Second))
-	// The wipe the production path performs immediately after each recovery.
-	m.helperCrash = HelperCrashRecord{}
+	m.completeHelperCrashRecoveryLocked(second.Add(time.Second))
+	m.mu.Unlock()
 
 	// CONTROL on the premise: healthy now, so only history can speak.
 	if m.helperCrash.LastExitWasCrash || m.helperCrash.Restarts != 0 {
-		t.Fatal("fixture broken: the episode record must be wiped for a healthy-after-crash manager")
+		t.Fatal("fixture broken: the current episode should be closed after recovery")
 	}
 
 	adapter := NewLegacyDataPlaneAdapter(m)

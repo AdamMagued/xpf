@@ -466,12 +466,14 @@ type Config struct {
 	// Optional; if nil, the gauge is not emitted.
 	SchedulerRepublishFailedFn func() bool
 
-	// HelperCrashEpisodesFn returns the #8397 count of userspace-dataplane
-	// helper crash episodes this daemon has recovered from, feeding
-	// xpf_dataplane_helper_crash_episodes_total. Wired independently of the
-	// dataplane accessor chain because the metric must stay readable when the
-	// dataplane is NOT loaded -- "has this helper been crashing?" is most worth
-	// answering exactly then. nil disables the metric.
+	// HelperCrashEpisodesFn returns the #8397 monotonic count of unexpected
+	// exits of userspace-dataplane helpers that reached readiness, feeding
+	// xpf_dataplane_helper_crash_episodes_total. It increments at each such
+	// exit, including during a sustained crash loop before recovery is journaled;
+	// failures before readiness are excluded.
+	// Wired independently of the dataplane accessor chain because the metric
+	// must stay readable when the dataplane is NOT loaded — "has this helper
+	// been crashing?" is most worth answering exactly then. nil disables it.
 	HelperCrashEpisodesFn func() int
 
 	// ForwardingSupportedFn reports whether the userspace dataplane is

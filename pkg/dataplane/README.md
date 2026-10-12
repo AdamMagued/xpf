@@ -682,12 +682,28 @@ would blackhole every flow handed to it.
   capability / event-stream readiness gates all still run before
   forwarding is re-armed.
 
-- **Named crash-loop state (#7250).** `HelperCrashRecord.CrashLooping()`
-  is the predicate an operator or a health surface reads as "this helper
-  is not coming back". It is **backoff at the cap**, not a raw restart
-  count: a count is time-blind, and twenty restarts over a week and
-  twenty in a minute are different situations. With the shipped 1s base
-  and 60s cap it trips at seven consecutive attempts.
+- **Named crash-loop state (#7250, #12159).** `HelperCrashRecord.CrashLooping()`
+  is the predicate an operator, health surface, or the daemon's HA gate can
+  read as "this helper is not coming back". It is **backoff at the cap** within
+  one crash episode, not a lifetime restart count: a quiet interval longer than
+  twice the maximum backoff resets the consecutive-attempt count. With the
+  shipped 1s base and 60s cap it trips at seven consecutive attempts and clears
+  after more than 120s without another unexpected exit. `HelperSupervisorState`
+  treats it as election debt only while the helper is down and the retry is
+  still fenced to the current generation; an intentional stop does not resign.
+- **HA response (#12159).** Supervisor death wakes the daemon transit gate,
+  which closes while the helper is down even though the xpfd-owned XDP shim is
+  still attached. A fast restart reopens transit without changing RG weight.
+  When restart backoff reaches its cap, a dedicated full-cost monitor debt
+  takes a DATA RG's local weight to 0 so even a non-preempt incumbent yields.
+  RG0 is excluded: it is the config-authority group with no data VIP, and
+  assigning it full debt would trigger the read-only lock and pending-commit
+  auto-confirm on demotion. That can lock a lone node with no owner anywhere.
+  RG0 stays primary and writable so an operator can repair the loop in-band;
+  data RGs still resign.
+  A landed supervisor retry clears live HA debt while its episode remains
+  visible until the quiet window expires; ordinary Compile recovery closes the
+  episode immediately.
 - **Operator surface (#7250).** `show chassis forwarding` renders the
   crash block, via `pkg/fwdstatus` so the in-process CLI and the remote
   `cli` binary share one implementation. It was chosen over the other
@@ -700,29 +716,33 @@ would blackhole every flow handed to it.
 
   Three properties of that render are load-bearing:
 
-  - It is **silent when there is nothing to report**. A successful
-    restart assigns a fresh `HelperCrashRecord{}`, so a recovered helper
-    holds the zero value and there is no episode to describe. It follows
-    that the surface describes the **current** crash episode, never a
-    history — once the helper recovers, the exit that preceded it is
-    gone from the record.
+  - It is **silent when there is nothing to report**. Ordinary Compile
+    recovery ends the current episode and journals it. A supervisor retry
+    instead retains the open episode record and marks the helper as running;
+    the headline says "recovered — running after a crash" until the episode
+    closes at the quiet-window or Compile boundary. The existing periodic
+    status loop journals and clears it after quiet expiry even if no later
+    crash occurs; a new exit that observes expiry first closes the prior
+    episode before counting the next. The journal uses the actual readiness
+    time and needs no extra timer. The surface reports the current open episode,
+    while #8397 history remains available separately.
   - `ForwardingStatus.HelperCrashKnown` gates every field, and is **not**
     redundant with `LastExitWasCrash`. A zero `HelperCrashRecord` is
     byte-identical to a healthy one, and `ExitCode: 0` satisfies the
     `ExitCode >= 0` discriminator, so a renderer keyed on the record
     alone prints "exit code 0" for a helper that never crashed. Same
     discipline as `BufferKnown` beside `BufferPercent`.
-  - The headline is one of **four named states** over
-    (`RestartPending` x `CrashLooping()`), and **`RestartPending` picks
-    it**. `CrashLooping()` stays true after an intentional stop —
-    `LastExitWasCrash` survives a stop by design and `Restarts` survives
-    with it — so a helper that is merely stopped is headlined
-    **"stopped — after a crash loop"**, with the loop history as
-    subordinate detail. An operator reads the first line and acts on it,
-    and "CRASH LOOPING" on a stopped helper sends them hunting a crash
-    that is not currently happening. Same shape as
-    `firewallEffectiveLiveness`, whose third arm carries an explicit
-    reason rather than a flag.
+  - The headline has **five named states**: four combinations of
+  (`RestartPending` x `CrashLooping()`), plus a recovered-running state.
+  The recovered state is checked first so a live retry is never rendered as
+  stopped. For the other four states, `RestartPending` picks the headline.
+  `CrashLooping()` can remain true after an intentional stop — `LastExitWasCrash`
+  and `Restarts` remain in the episode record — so the stopped helper is
+  headlined **"stopped — after a crash loop"** with loop history as subordinate
+  detail. An operator reads the first line and acts on it, and "CRASH LOOPING"
+  on a stopped helper sends them hunting a crash that is not currently
+  happening. Same shape as `firewallEffectiveLiveness`, whose third arm carries
+  an explicit reason rather than a flag.
   - The crash-loop **reason** is **derived, not stored**.
     `CrashLooping()` is
     `LastExitWasCrash && helperRestartDelay(Restarts) >= helperRestartBackoffMax`,
@@ -737,23 +757,21 @@ satisfied by derivation (above), and the **last-restart timestamp** is backed by
 `HelperCrashRecord.LastRestartAttempt`, set where the attempt is made in
 `restartHelperAfterCrash` and rendered as `Helper last restart attempt`.
 
-This paragraph previously said such a field "cannot be" added, because
-`restartHelperAfterCrash` zeroes the whole record on a successful restart and it
-would be "wiped by the very event it records". **That argument does not survive
-being applied consistently**: the wipe is total, so it clears `Restarts`,
-`NextRestart`, `ExitCode`, `Detail` and `LastExitWasCrash` too — five fields
-that were already shipped and rendered on the same surface. A rejection that
-would equally reject what you have already built is not a reason to withhold
-the sixth. The record is episode-scoped and the new field is episode-scoped
-with it, which is the contract, not a defect.
+The record describes the current open crash episode. A supervisor retry that
+proves READY keeps that episode open until its quiet-window boundary; an
+ordinary generation-advancing Compile closes it immediately. At that boundary
+the episode-scoped fields, including `LastRestartAttempt`, are cleared
+together, and the completed episode is added to the bounded history ring.
 
-What the bullet asked for and what an operator often wants are still different
-things. **History across episodes** — "has this helper crashed before?" — is
-not answerable by any field on a record that is wiped on recovery, and nothing
-retains it today: there is no crash or restart metric either, so journald is
-the only trace. That is a separate requirement, tracked as #8397, and it must
-not be conflated with the bullet — shipping it instead would leave the bullet
-unmet while looking done.
+History across episodes is available independently of the live record:
+`HelperCrashHistory` returns the retained completed episodes and their
+unbounded episode total. The `xpf_dataplane_helper_crash_episodes_total`
+Prometheus counter instead increments when a helper that reached readiness
+exits unexpectedly, so a sustained crash loop remains visible even when no
+quiet window completes an episode. Pre-readiness failures are excluded; their
+failed restart attempts remain represented in the helper's restart state.
+These are separate operator views: the ring provides recent episode details;
+the counter provides the monotonic alert signal.
 
 ### A helper that answers nothing is restarted from the Go side (#9651)
 

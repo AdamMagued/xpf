@@ -1968,9 +1968,10 @@ func (d *Daemon) setDataplane(dp dataplane.RuntimeDataPlane) {
 	d.transitGateMu.Lock()
 	defer d.transitGateMu.Unlock()
 
-	// The wake callback follows the published runtime. Clear it before
-	// replacement so a retired runtime cannot keep signalling this daemon.
+	// The wake callback follows the published runtime. Clear both observers
+	// before replacement so a retired runtime cannot keep signalling this daemon.
 	d.clearAttachedLinksObserver()
+	d.clearHelperSupervisorObserver()
 	if dp == nil {
 		d.dpCell.Store(nil)
 		return
@@ -1986,6 +1987,7 @@ func (d *Daemon) setDataplane(dp dataplane.RuntimeDataPlane) {
 	}
 	d.dpCell.Store(&dpSlot{v: dp})
 	d.registerAttachedLinksObserver()
+	d.registerHelperSupervisorObserver()
 }
 
 func (d *Daemon) applyResult() *dataplane.ApplyResult {

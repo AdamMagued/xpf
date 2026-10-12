@@ -10,12 +10,10 @@ import (
 // ATTEMPTED, not only how many attempts there have been and when the next is
 // due.
 //
-// The issue that filed this argued the field could not exist, because the
-// successful-restart wipe would clear it — "wiped by the very event it is meant
-// to record". That objection applies verbatim to `Restarts`, `NextRestart`,
-// `ExitCode`, `Detail` and `LastExitWasCrash`, which are all shipped and
-// rendered. These cells pin the property the objection would have removed, and
-// pin the wipe itself so the episode contract stays explicit.
+// The field is episode-scoped. A landed supervisor retry keeps the open
+// episode and its attempt timestamp; quiet-window or Compile recovery clears
+// them together. These cells pin that boundary rather than a restart-success
+// wipe.
 
 // The attempt time is recorded even when the restart FAILS — that is the case
 // where the record survives to be read, and the one an operator is looking at
@@ -44,9 +42,8 @@ func TestLastRestartAttemptRecordedOnFailedRestart7967(t *testing.T) {
 	}
 }
 
-// The field is episode-scoped: the successful-restart wipe clears it along with
-// everything else. Pinned deliberately — this IS the behaviour the issue called
-// disqualifying, and it is the same behaviour the five shipped fields have.
+// The field is episode-scoped and clears with the rest of the record when the
+// episode ends.
 func TestLastRestartAttemptIsEpisodeScoped7967(t *testing.T) {
 	rec := HelperCrashRecord{
 		LastExitWasCrash:   true,
@@ -56,18 +53,25 @@ func TestLastRestartAttemptIsEpisodeScoped7967(t *testing.T) {
 		NextRestart:        time.Now().Add(time.Minute),
 		LastRestartAttempt: time.Now(),
 	}
+	m := &Manager{helperCrash: rec}
 
-	// The wipe restartHelperAfterCrash performs on success.
-	rec = HelperCrashRecord{}
+	// A generation-advancing Compile closes the episode and retains its history.
+	m.mu.Lock()
+	m.completeHelperCrashRecoveryLocked(time.Now())
+	m.mu.Unlock()
+	rec = m.HelperCrashState()
+
+	_, total := m.HelperCrashHistory()
+	if total != 1 {
+		t.Fatalf("episode boundary history total = %d, want 1", total)
+	}
 
 	if !rec.LastRestartAttempt.IsZero() {
-		t.Fatal("attempt time survived the episode wipe")
+		t.Fatal("attempt time survived the episode boundary")
 	}
-	// Control: it is cleared the SAME way as the fields already shipped, which
-	// is the whole answer to "it would be wiped by the event it records".
 	if rec.Restarts != 0 || rec.ExitCode != 0 || rec.LastExitWasCrash ||
 		!rec.NextRestart.IsZero() || rec.Detail != "" {
-		t.Fatalf("the wipe is not total, so the new field is not scoped like the rest: %+v", rec)
+		t.Fatalf("episode closure did not clear all episode-scoped fields: %+v", rec)
 	}
 }
 
@@ -99,10 +103,10 @@ func TestRestartDelayIsAPureFunctionOfAttempts7967(t *testing.T) {
 // THE WIRING CELL: `restartHelperAfterCrash` actually sets the field.
 //
 // The cells above build a `HelperCrashRecord` by hand, so they prove the struct
-// carries the value and the wipe clears it — NOT that anything ever writes it.
-// That distinction cost a round on #7497 blocker 4, where a guard asserted a
-// renderer while the capture feeding it was unbound and could be emptied with
-// the whole suite still green.
+// carries the value and the episode-boundary clear removes it — NOT that
+// anything ever writes it. That distinction cost a round on #7497 blocker 4,
+// where a guard asserted a renderer while the capture feeding it was unbound
+// and could be emptied with the whole suite still green.
 //
 // Driven through the real supervisor with a binary that cannot exist, so
 // `ensureProcessLocked` fails at `findBinary` without spawning: the record

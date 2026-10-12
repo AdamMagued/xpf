@@ -330,7 +330,46 @@ func (m *Manager) bootstrapNAPIQueuesAsyncForGenerationLocked(
 	return done
 }
 
-func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
+func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) (retErr error) {
+	pendingCrashRetry := m.helperCrash.LastExitWasCrash && m.proc == nil &&
+		m.procGen == m.helperCrash.restartGen
+	restartAttempt := m.restartAttemptInProgress
+	entryGen := m.procGen
+	defer func() {
+		if retErr != nil {
+			// NM-1: a FAILED supervisor retry is a NEW crash-loop data
+			// point, not a preserved one — schedule (Restarts++) so a
+			// helper that never starts escalates to crash-looping. Only
+			// the Compile path re-arms at the same count (MAJOR-3a):
+			// Compile bring-up retires the generation carrying an armed
+			// retry without proving anything about the helper.
+			if restartAttempt && pendingCrashRetry && m.proc == nil {
+				// NM-2: a failed retry is observed helper failure, not quiet
+				// time — refresh the anchor so a run of failures cannot age
+				// the window out and journal the next landing as recovered.
+				m.helperCrashLastAt = time.Now()
+				m.scheduleHelperRestartLocked(m.procGen)
+				m.notifyHelperSupervisorLocked()
+				return
+			}
+			if pendingCrashRetry && m.proc == nil &&
+				m.procGen != m.helperCrash.restartGen {
+				m.rearmHelperRestartLocked()
+			}
+			return
+		}
+		// A supervisor retry proves READY, not STABLE; it preserves the
+		// current attempt count until the quiet window expires. An ordinary
+		// Compile bring-up that ADVANCES the generation (operator commit, peer
+		// sync — a genuinely new helper proven ready) DOES end the episode
+		// (MAJOR-3b).
+		if restartAttempt {
+			return
+		}
+		if m.procGen != entryGen {
+			m.completeHelperCrashRecoveryLocked(time.Now())
+		}
+	}()
 	// First bring-up skips the restart preflight below, so refuse a
 	// reserved state-file here too, before the runtime-dir MkdirAll and
 	// the spawn: the helper must never start with a path whose save
@@ -462,6 +501,7 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 					m.setLastStatusLocked(status)
 				}
 				slog.Info("userspace dataplane helper started", "pid", cmd.Process.Pid, "socket", cfg.ControlSocket)
+				m.notifyHelperSupervisorLocked()
 				return nil
 			}
 		}
@@ -622,6 +662,10 @@ func (m *Manager) stopLocked() {
 	// re-fences its next attempt on whatever `m.procGen` reads after the failed
 	// spawn.
 	m.procGen++
+	// This record bit describes a currently running supervisor retry, not
+	// durable episode history; an intentional stop makes that claim stale.
+	m.helperCrash.RecoveredSinceCrash = false
+	m.helperCrash.RecoveredAt = time.Time{}
 	// Retire the helper-session epoch before teardown so a watchdog sender that
 	// passed its snapshot check cannot reach this generation after the stop.
 	// Do not wait on sessionMu here: explicit fail-closed disarm must happen
@@ -657,6 +701,7 @@ func (m *Manager) stopLocked() {
 		m.haDegradedHaveLastSent = false
 		m.haDegradedMu.Unlock()
 		m.publishHAWatchdogSnapshotLocked()
+		m.notifyHelperSupervisorLocked()
 		return
 	}
 	// Disable userspace forwarding BEFORE stopping the helper. Without this,
@@ -695,6 +740,7 @@ func (m *Manager) stopLocked() {
 	m.proc = nil
 	m.procSup = nil
 	m.resetAfterHelperGoneLocked()
+	m.notifyHelperSupervisorLocked()
 }
 
 // helperExitedChanLocked returns the channel the current generation's waiter

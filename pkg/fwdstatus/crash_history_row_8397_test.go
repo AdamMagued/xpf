@@ -14,8 +14,8 @@ import (
 // The crash block returns early on `!LastExitWasCrash && !RestartPending`,
 // which is correct for every CURRENT-episode row. A history row placed after
 // that guard renders in every case EXCEPT the one it was written for: history
-// exists precisely for the helper that crashed repeatedly and is running now,
-// and at that moment `restartHelperAfterCrash` has already wiped the record, so
+// exists precisely for the helper that completed episodes and is running now:
+// its episode record has cleared at the quiet-window or Compile boundary, so
 // both flags are false.
 //
 // That failure is invisible to review and to a naive test. A clean crash
@@ -32,8 +32,8 @@ func TestCrashEpisodeRowRendersForAHealthyHelper8397(t *testing.T) {
 	oldest := time.Date(2026, 9, 4, 9, 30, 0, 0, time.UTC)
 	fs := ForwardingStatus{
 		HelperCrashKnown: true,
-		// The post-recovery state: the record has been wiped, so BOTH flags are
-		// false. This is the case the row exists for.
+		// The post-episode state: the record has been cleared at the episode
+		// boundary, so BOTH flags are false. This is the case the row exists for.
 		LastExitWasCrash:          false,
 		RestartPending:            false,
 		HelperCrashEpisodes:       4,
@@ -42,8 +42,8 @@ func TestCrashEpisodeRowRendersForAHealthyHelper8397(t *testing.T) {
 	out := renderFor8397(fs)
 	if !strings.Contains(out, "Helper crash episodes") {
 		t.Fatalf("a helper that recovered from 4 crashes must still report them.\n"+
-			"This is #8397's whole point: the record is wiped on recovery, so a "+
-			"recurring crasher presents a spotless surface.\ngot:\n%s", out)
+			"This is #8397's whole point: completed history must remain visible "+
+			"after the live episode closes.\ngot:\n%s", out)
 	}
 	if !strings.Contains(out, "4 recovered in this daemon") {
 		t.Errorf("the count must be rendered; got:\n%s", out)

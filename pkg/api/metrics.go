@@ -2090,13 +2090,11 @@ func sortedKeys6800[V any](m map[string]V) []string {
 
 // collectHelperCrashEpisodes emits #8397's
 // xpf_dataplane_helper_crash_episodes_total.
-//
 // Extracted from Collect rather than left inline so it can be driven on its
-// own. The behaviour worth binding is a three-way distinction that an inline
-// `if fn != nil` inside a 200-line Collect cannot be exercised for: 4 episodes
-// emits 4, 0 episodes emits 0 (an absent series reads as healthy to an alert
-// exactly as a zero does), and NO SOURCE emits nothing at all — because a
-// daemon with no dataplane accessor knows "unknown", not "never crashed".
+// own. The behaviour worth binding is a three-way distinction: a positive
+// readiness-reached-helper exit count emits its value, 0 such exits emits 0,
+// and NO SOURCE emits nothing at all — because a daemon with no dataplane
+// accessor knows "unknown", not "never crashed".
 func (c *xpfCollector) collectHelperCrashEpisodes(ch chan<- prometheus.Metric) {
 	if c.srv == nil || c.srv.helperCrashEpisodesFn == nil {
 		return

@@ -27,16 +27,18 @@ interface, matching the existing `Status()` probe, so `DataPlaneAccessor` stays
 the two-method surface every caller and test already implements.
 
 `HelperCrashHistory() ([]userspace.HelperCrashEpisode, int)` — the #8397
-companion, asserted independently of `HelperCrashState` because it has a
-different lifetime. `HelperCrashState` is episode-scoped and wiped by the
-successful restart that ends the episode; the history is what remains, and the
-one row it contributes to the block (`Helper crash episodes`) is emitted ABOVE
-the `!LastExitWasCrash && !RestartPending` early return. That placement is
-load-bearing: history exists for the helper that crashed repeatedly and is
-healthy now, which is precisely the state that guard returns on. A row placed
-after it renders in every case except the one it was written for, and the
-failure is invisible because a clean crash surface is what a healthy helper is
-supposed to look like.
+companion, asserted independently of `HelperCrashState` because they have
+different lifetimes. `HelperCrashState` describes the current open episode: a
+supervisor retry that proves READY keeps it open until the quiet window ends,
+while ordinary generation-advancing Compile closes it immediately. The
+completed episode is then retained in history.
+
+The one history row (`Helper crash episodes`) is emitted ABOVE the
+`!LastExitWasCrash && !RestartPending` early return. That placement is
+load-bearing: completed history exists for a helper that crashed repeatedly
+and is healthy now. A row placed after the guard would render in every case
+except the one it was written for, and the failure would be invisible because
+a clean current-crash surface is what a healthy helper is supposed to look like.
 
 Three things about it are easy to break:
 
@@ -51,25 +53,26 @@ Three things about it are easy to break:
   satisfies the `ExitCode >= 0` discriminator, so a renderer keyed on the
   record alone prints "exit code 0" for a helper that never crashed. Same
   discipline as `BufferKnown` beside `BufferPercent`.
-- `Format` renders **nothing** when there is no episode. The record is wiped on
-  a successful restart, so the block reports the current crash episode, never a
-  history.
-- #5838's "last restart timestamp" **is now backed** (#7967):
-  `HelperLastRestartAttempt`, rendered as `Helper last restart attempt`. It is
-  episode-scoped like every other field here and is cleared by the same wipe.
-  That was once given as the reason it could not exist — "wiped by the very
-  event it records" — but the same is true of `Restarts`, `NextRestart`,
-  `ExitCode`, `Detail` and `LastExitWasCrash`, every one of which is rendered.
-  A property that disqualifies six fields equally is not a reason to omit one.
-  It renders WITHOUT a `RestartPending` guard, unlike the next-restart
-  deadline: a past attempt is a fact, a future deadline is a promise.
-- What is still missing is **history across episodes** — "has this helper
-  crashed before?" — which no field on an episode-scoped record can answer and
-  which is a different requirement from the bullet. Tracked as #8397.
-- The headline is four named states over (`RestartPending` x `CrashLooping`),
-  and `RestartPending` picks it — a stopped helper reads "stopped", never
-  "CRASH LOOPING", because the loop predicate stays true after an intentional
-  stop.
+- Current-episode rows are silent when there is no open crash episode.
+  Ordinary Compile recovery journals and clears the record; a supervisor retry
+  retains the episode until its quiet window expires and renders a distinct
+  "recovered — running after a crash" headline while the helper is live. The
+  completed-episode summary above remains visible independently of that record.
+- #5838's "last restart timestamp" (#7967) is episode-scoped: a landed
+  supervisor retry preserves it with the open record, and quiet-window or
+  Compile recovery clears it at that same boundary. It renders WITHOUT a
+  `RestartPending` guard, unlike the next-restart deadline: a past attempt is a
+  fact, a future deadline is a promise.
+- The Prometheus counter `xpf_dataplane_helper_crash_episodes_total` counts
+  unexpected exits of helpers that reached readiness, including a sustained
+  loop whose quiet window has not completed an episode. Pre-readiness failures
+  are excluded. The bounded history ring separately provides completed-episode
+  detail.
+- The headline has five named states: four combinations of (`RestartPending` x
+  `CrashLooping`), plus the recovered-running state. The retry state wins while
+  the helper is running; for the other four, `RestartPending` picks the
+  headline. An intentional stop is therefore "stopped", never "CRASH LOOPING",
+  even though the open episode's record still satisfies the loop predicate.
 - `Format` is exported and takes a flat struct, so its guards must hold for
   structs `Build` did not produce. Two mutations escaped the first matrix
   because every cell reached the guard *through* `Build`, which sanitizes on the

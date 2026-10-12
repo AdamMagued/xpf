@@ -1049,3 +1049,32 @@ func TestSignalAndExitCodeAreRenderedExclusively7250(t *testing.T) {
 		t.Errorf("exited helper rendered a signal row.\n--- got ---\n%s", exited)
 	}
 }
+
+// NM-3: when a retry has landed, the current crash record remains for the
+// episode, but the operator surface must not describe the live helper as
+// stopped merely because its most recent exit was a crash.
+func TestRecoveredSupervisorRetryRendersRunning12159(t *testing.T) {
+	dp := &fakeCrashDP{
+		fakeUserspaceDP: fakeUserspaceDP{
+			fakeDP: fakeDP{loaded: true},
+			err:    errors.New("status unavailable during recovery"),
+		},
+		known: true,
+		rec: userspace.HelperCrashRecord{
+			LastExitWasCrash:    true,
+			Restarts:            3,
+			RecoveredSinceCrash: true,
+		},
+	}
+	fs := crashBuild(t, dp)
+	if !fs.HelperRecovered {
+		t.Fatalf("Build lost the recovered-running marker: %+v", fs)
+	}
+	out := Format(fs)
+	if !strings.Contains(out, "recovered — running after a crash") {
+		t.Errorf("a landed retry was not rendered as running recovery:\n%s", out)
+	}
+	if strings.Contains(out, "stopped") || strings.Contains(out, "restart pending") {
+		t.Errorf("a landed retry was rendered as stopped or pending:\n%s", out)
+	}
+}

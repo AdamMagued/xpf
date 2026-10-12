@@ -9,12 +9,10 @@ import (
 
 // #8397: xpf_dataplane_helper_crash_episodes_total.
 //
-// A COUNTER, and the counter shape is the point. `restartHelperAfterCrash`
-// wipes the helper crash record on success, so every gauge-shaped view of crash
-// state reads clean the moment the helper is healthy again — a helper that
-// crashed four times in the last hour and is running now presents a spotless
-// surface to every other signal in this collector. This is the one that does
-// not forget.
+// This is a COUNTER of unexpected exits of readiness-reached helpers, not a
+// gauge of the open episode or the bounded recovery ring. A sustained loop
+// after readiness must remain visible even when no quiet window has completed
+// an episode; failures before readiness are excluded.
 
 func collectCrashEpisodes8397(t *testing.T, c *xpfCollector) (float64, bool) {
 	t.Helper()

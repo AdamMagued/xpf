@@ -26,6 +26,19 @@ type attachedLinksNotifier interface {
 	SetAttachedLinksObserver(func())
 }
 
+// helperSupervisorStateSource is implemented by userspace runtimes that own a
+// supervised helper. Non-userspace runtimes have no helper and are healthy by
+// default.
+type helperSupervisorStateSource interface {
+	HelperSupervisorState() (running, crashLooping bool)
+}
+
+// helperSupervisorNotifier is a wake-only capability. Its callback carries no
+// state; the daemon re-reads the supervisor snapshot in the gate loop.
+type helperSupervisorNotifier interface {
+	SetHelperSupervisorObserver(func())
+}
+
 func (d *Daemon) ensureTransitGateWake() chan struct{} {
 	d.transitGateWakeOnce.Do(func() {
 		d.transitGateWake = make(chan struct{}, 1)
@@ -49,17 +62,29 @@ func (d *Daemon) attachedXDPLinks() int {
 	return count
 }
 
-func (d *Daemon) transitOpen() bool {
+func (d *Daemon) helperSupervisorState() (running, crashLooping bool) {
+	if d == nil {
+		return true, false
+	}
+	src, ok := d.dataplane().(helperSupervisorStateSource)
+	if !ok {
+		return true, false
+	}
+	return src.HelperSupervisorState()
+}
+
+func (d *Daemon) transitKernelReady() bool {
 	return d != nil && d.dataplaneArmed.Load() && d.attachedXDPLinks() > 0
 }
 
-// writeTransitGateLocked drives both transit legs from the single ready
-// predicate computed by the caller. The caller holds transitGateMu and must
-// derive open from dataplaneArmed && AttachedXDPLinkCount > 0. Closing
-// installs the appropriate forward fence before writing zero; opening installs
-// the armed fence before raising the knobs. The production dataplane lease
-// holds its XDP ownership lock across both operations, so a detach cannot
-// invalidate the allowlist between them.
+// writeTransitGateLocked drives both transit legs from the ready predicate
+// computed by the caller. The caller holds transitGateMu and derives open from
+// dataplaneArmed && AttachedXDPLinkCount > 0, additionally requiring a live
+// supervisor when the runtime has one. Closing installs the appropriate
+// forward fence before writing zero; opening installs the armed fence before
+// raising the knobs. The production dataplane lease holds its XDP ownership
+// lock across both operations, so a detach cannot invalidate the allowlist
+// between them.
 func (d *Daemon) writeTransitGateLocked(stage string, open bool) bool {
 	if open {
 		if err := d.openTransitGateLocked(); err != nil {
@@ -89,18 +114,37 @@ func (d *Daemon) writeTransitGateLocked(stage string, open bool) bool {
 }
 
 // reassertTransitGate is the one authoritative actuation path for both the
-// event wake and the periodic tick. It reads kernel truth once under
-// transitGateMu, then drives the transit gate and RG weight from that same
-// ready-to-serve verdict.
+// supervisor/link wake and periodic tick. Under transitGateMu it snapshots
+// kernel attachment and helper state, closes transit unless both are healthy,
+// preserves the separate kernel-arm debt, and applies full election debt only
+// while a restart-pending helper has reached its crash-loop cap.
 func (d *Daemon) reassertTransitGate(stage string) {
 	if d == nil || !d.shouldManageTransitGate() {
 		return
 	}
 	d.transitGateMu.Lock()
 	defer d.transitGateMu.Unlock()
-	ready := d.dataplaneArmed.Load() && d.attachedXDPLinks() > 0
-	opened := d.writeTransitGateLocked(stage, ready)
-	d.applyDataplaneReadyTrack(opened)
+	kernelReady := d.transitKernelReady()
+	helperRunning, crashLooping := d.helperSupervisorState()
+	opened := d.writeTransitGateLocked(stage, kernelReady && helperRunning)
+	// F2: a dead helper must neither INSTALL arm debt (a short restart is
+	// not a kernel failure — weight stays 255) nor WIPE unrelated arm debt
+	// (a fence/kernel failure predating the death must survive it: the old
+	// `(!helperRunning || opened)` disjunct reported dataplaneReady=true
+	// whenever the helper was down, flipping a fenced 1 → 255, fail-open).
+	// So when the helper is down and NOT looping, leave the arm-debt bit
+	// exactly as it is (pass through the current state); otherwise follow
+	// kernel readiness. Persistent loops carry their own full election debt
+	// via crashLooping regardless.
+	if !helperRunning && !crashLooping {
+		d.applyTransitElectionDebtKeepArm(false, false, true)
+	} else {
+		// Helper running (or looping): dataplaneReady follows whether the
+		// gate actually OPENED. A fence-install failure with the helper up
+		// reports not-ready (arm debt at weight 1); only a live opened
+		// gate reports ready.
+		d.applyTransitElectionDebt(kernelReady && opened, crashLooping)
+	}
 }
 
 // closeTransitUntilAttached establishes the boot fence without changing the
@@ -132,6 +176,24 @@ func (d *Daemon) clearAttachedLinksObserver() {
 	}
 	if src, ok := d.dataplane().(attachedLinksNotifier); ok {
 		src.SetAttachedLinksObserver(nil)
+	}
+}
+
+func (d *Daemon) registerHelperSupervisorObserver() {
+	if d == nil {
+		return
+	}
+	if src, ok := d.dataplane().(helperSupervisorNotifier); ok {
+		src.SetHelperSupervisorObserver(d.signalTransitGateWake)
+	}
+}
+
+func (d *Daemon) clearHelperSupervisorObserver() {
+	if d == nil {
+		return
+	}
+	if src, ok := d.dataplane().(helperSupervisorNotifier); ok {
+		src.SetHelperSupervisorObserver(nil)
 	}
 }
 
