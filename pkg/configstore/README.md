@@ -873,26 +873,35 @@ per-path:
   deadline that can survive reboot.
 
   Before a FIRST rollback writes the never-committed active marker (#12167),
-  it first persists `confirm.json` with a past deadline sentinel. If the
+  it first persists `confirm.json` with a past-deadline sentinel. If the
   subsequent teardown-marker write fails or the process exits, the retained
   record still proves the rollback across clock correction or a cleared
   #10875 alarm. A failed sentinel write does not abort recovery: the store
   rolls back in memory, marks persistence degraded and teardown owed, and
   retains the original active marker until retry writes the sentinel before
-  active rollback marker. Every confirmation path (`clearPendingConfirmLocked` —
-  plain commit / HA sync / explicit confirm / demotion) and timeout rollback
-  (`PromoteRollback`) remove `confirm.json`; a nested `commit confirmed` replaces it with the extended
-  deadline. Removal is a **durable transition** too (#4864): `DeleteConfirm`
-  unlinks `confirm.json` and fsyncs the parent directory
-  (`fsatomic.SyncDir`), matching `WriteConfirm` — a bare `os.Remove` is not
-  durable, so a crash before the dirent removal flushes could replay a stale
-  record and revert an already-confirmed config. The unlink and dir fsync route
-  through package durability seams (`rbRemove`/`rbSyncDir`) so a dropped dir
-  sync fails a test RED. A clean restart inside the window keeps the hatch
-  (Junos parity: the pending confirm persists across reboot and rolls back if
-  not confirmed); the former `writeActive`-to-record loss window is closed
-  (#10696).
+  the active rollback marker. Retries start after 1 second and back off
+  exponentially to a 60-second cap.
 
+  If `commit confirmed` runs while the sentinel is still owed, its provisional
+  `PreviousDeadline` binds to the in-memory past-dated intent, not the original
+  future deadline still on disk. A restart with the clock still behind thus
+  completes the owed rollback instead of re-arming the abandoned FIRST config
+  for roughly 720 hours. Once a newer `commit confirmed` is promoted, a sync
+  durably applies its replacement, or a timeout rollback is durably written,
+  the old intent is cleared so retry cannot overwrite a newer confirm record.
+  Every confirmation path
+  (`clearPendingConfirmLocked` — plain commit / HA sync / explicit confirm /
+  demotion) and timeout rollback (`PromoteRollback`) remove `confirm.json`;
+  a nested `commit confirmed` replaces it with the extended deadline.
+  Removal is a **durable transition** too (#4864): `DeleteConfirm` unlinks
+  `confirm.json` and fsyncs the parent directory (`fsatomic.SyncDir`),
+  matching `WriteConfirm` — a bare `os.Remove` is not durable, so a crash
+  before the dirent removal flushes could replay a stale record and revert an
+  already-confirmed config. The unlink and dir fsync route through package
+  durability seams (`rbRemove`/`rbSyncDir`) so a dropped dir sync fails a
+  test RED. A clean restart inside the window keeps the hatch (Junos parity:
+  the pending confirm persists across reboot and rolls back if not confirmed);
+  the former `writeActive`-to-record loss window is closed (#10696).
   **The re-armed timer dispatches into a HALF-BUILT daemon (#6739).**
   `recoverPendingConfirmLocked` runs at the tail of `Load`, which the daemon
   calls in startup **phase 1**; the daemon's managers are not constructed until

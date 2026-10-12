@@ -1395,61 +1395,14 @@ func (s *Store) persistRetryLoop(backoff, maxBackoff time.Duration) {
 		if s.persistRefusedTree != nil && s.persistRefusedTree != s.active {
 			s.persistRefusedTree = nil
 		}
-		if s.persistDegraded && s.persistRefusedTree != s.active &&
-			s.firstCommitRecoveryIntent != nil {
-			if err := s.db.WriteConfirm(s.firstCommitRecoveryIntent); err != nil {
-				slog.Warn("FIRST-rollback recovery intent retry failed", "err", err,
-					"retry_in", backoff*2, "issue", "#12167")
-			} else {
-				s.firstCommitRecoveryIntent = nil
-			}
-		}
-		if s.persistDegraded && s.persistRefusedTree != s.active &&
-			s.firstCommitRecoveryIntent == nil {
-			// #1922: re-write with the marker the failing path requested
-			// (committed=false only for a first-commit rollback). For every
-			// other path persistMarkerCommitted is true, so this matches the
-			// pre-#1922 committed=1 write exactly.
-			if err := s.writeActiveMarker(s.active, s.persistMarkerCommitted); err == nil {
-				s.persistDegraded = false
-				// #5473: the active config is now durable. If a commit-confirmed
-				// resolution (rollback / boot recovery / sync supersede) deferred
-				// its confirm.json removal because the resolving write failed, that
-				// replacement target is exactly what just landed durably — drop the
-				// crash-recovery record now (via resolveConfirmRemovalLocked, which
-				// re-arms retry debt if the delete itself fails). No-op unless a
-				// removal was deferred.
-				s.clearConfirmResolutionPendingLocked()
-				s.journalLog(&JournalEntry{
-					Action:    "persist_recovered",
-					Detail:    "active config persisted after earlier write failure",
-					Principal: "system:configstore",
-				})
-				slog.Info("active config persisted after earlier write failure", "issue", "#1799")
-			} else if errors.Is(err, ErrPersistExceedsReadCeiling) {
-				// #9617: a size refusal is deterministic for this tree, so
-				// retrying it only re-serializes a >16 MiB config every tick
-				// and warns each time. Record the refused tree and stop
-				// attempting it; persistence stays degraded until a DIFFERENT
-				// active config is written. Every promotion installs a new tree
-				// object, so the pointer compare resumes retries on its own.
-				s.persistRefusedTree = s.active
-				slog.Error("active config cannot be persisted: it serializes past the read ceiling, so no retry can succeed; persistence stays degraded until a smaller config is applied",
-					"err", err, "issue", "#9617")
-			} else {
-				slog.Warn("active config persist retry failed", "err", err, "retry_in", backoff*2)
-			}
-		}
+		s.retryActiveConfigPersistLocked(backoff)
 
 		if s.confirmRemoveDegraded && s.confirmRemovalSupersededLocked() {
 			// #7675: a NEWER `commit confirmed` durably replaced the record this
 			// debt was taken for. WriteConfirm is temp+fsync+rename+dir-fsync, so
 			// the record we owed a removal for is already gone and the debt is
-			// satisfied. Re-driving DeleteConfirm here would delete the LIVE
-			// window's crash-recovery file — measured deterministic on master:
-			// the in-memory timer stays armed so nothing looks wrong, and a
-			// restart before the new deadline then leaves the UNCONFIRMED config
-			// standing with no rollback (#4577).
+			// satisfied by construction: the retry clears the debt instead of
+			// deleting whatever confirm.json now contains.
 			s.confirmRemoveDegraded = false
 			s.confirmRemoveDebtID = ""
 			s.journalLog(&JournalEntry{
@@ -1511,6 +1464,55 @@ func (s *Store) persistRetryLoop(backoff, maxBackoff time.Duration) {
 		backoff *= 2
 		if backoff > maxBackoff {
 			backoff = maxBackoff
+		}
+	}
+}
+
+// retryActiveConfigPersistLocked publishes a deferred FIRST-rollback
+// sentinel before the active marker; a failed sentinel write leaves the intent
+// non-nil, so the marker retry remains blocked. The caller holds s.mu.
+func (s *Store) retryActiveConfigPersistLocked(backoff time.Duration) {
+	if s.persistDegraded && s.persistRefusedTree != s.active &&
+		s.firstCommitRecoveryIntent != nil {
+		if err := s.db.WriteConfirm(s.firstCommitRecoveryIntent); err != nil {
+			slog.Warn("FIRST-rollback recovery intent retry failed", "err", err,
+				"retry_in", backoff*2, "issue", "#12167")
+		} else {
+			s.firstCommitRecoveryIntent = nil
+		}
+	}
+	if s.persistDegraded && s.persistRefusedTree != s.active &&
+		s.firstCommitRecoveryIntent == nil {
+		// #1922: re-write with the marker the failing path requested
+		// (committed=false only for a first-commit rollback). For every
+		// other path persistMarkerCommitted is true, so this matches the
+		// pre-#1922 committed=1 write exactly.
+		if err := s.writeActiveMarker(s.active, s.persistMarkerCommitted); err == nil {
+			s.persistDegraded = false
+			// #5473: the active config is now durable. If a commit-confirmed
+			// resolution (rollback / boot recovery / sync supersede) deferred
+			// its confirm.json removal because the resolving write failed, that
+			// replacement target is exactly what just landed durably — drop the
+			// crash-recovery record now. No-op unless a removal was deferred.
+			s.clearConfirmResolutionPendingLocked()
+			s.journalLog(&JournalEntry{
+				Action:    "persist_recovered",
+				Detail:    "active config persisted after earlier write failure",
+				Principal: "system:configstore",
+			})
+			slog.Info("active config persisted after earlier write failure", "issue", "#1799")
+		} else if errors.Is(err, ErrPersistExceedsReadCeiling) {
+			// #9617: a size refusal is deterministic for this tree, so
+			// retrying it only re-serializes a >16 MiB config every tick
+			// and warns each time. Record the refused tree and stop
+			// attempting it; persistence stays degraded until a DIFFERENT
+			// active config is written. Every promotion installs a new tree
+			// object, so the pointer compare resumes retries on its own.
+			s.persistRefusedTree = s.active
+			slog.Error("active config cannot be persisted: it serializes past the read ceiling, so no retry can succeed; persistence stays degraded until a smaller config is applied",
+				"err", err, "issue", "#9617")
+		} else {
+			slog.Warn("active config persist retry failed", "err", err, "retry_in", backoff*2)
 		}
 	}
 }
