@@ -508,6 +508,120 @@ else
 	printf '%s\n' "$out" | sed 's/^/         /' >&2
 fi
 
+# ── cell M — the CI-invoked census rejects a fresh undeclared harness ────
+# Keep the workflow command and the behavior it gates together: this is the
+# exact command in test.yml, pointed at an isolated fixture via the census's
+# supported environment overrides.
+CI_WORKFLOW="${REPO_ROOT}/.github/workflows/test.yml"
+# Slice the census job block through the next top-level job so checks are
+# scoped to the gated job, not other workflow jobs.
+CENSUS_JOB="$(awk 'BEGIN{in_job=0} /^  census:/{in_job=1; print; next} /^  [A-Za-z0-9_.-]+:/{if (in_job) exit} in_job{print}' "$CI_WORKFLOW")"
+# Allowlist: the census job must equal this literal byte for byte. A
+# deny-list cannot enumerate every fail-open edit (if:, continue-on-error,
+# shell:, needs:, env:, ref:, || true, || :, heredoc decoys), so any
+# deviation -- including a renamed job or moved run line -- fails closed.
+# The C# WorkflowParser accepted both quoted-scalar and non-LF-break probes;
+# the first-job and printable-byte checks below reject those parser-valid
+# decoys before they can make the skipped job look like the allowlist.
+EXPECTED_CENSUS_JOB="$(cat <<'EXPECTED_CENSUS_JOB_EOF'
+  census:
+    name: Harness census and self-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Census runnable-harness reachability
+        run: sh scripts/harness-census.sh
+      - name: Self-test the census
+        run: bash ./test/incus/harness-census-selftest.sh
+EXPECTED_CENSUS_JOB_EOF
+)"
+# The workflow frame around the census job is pinned too: all seven gate
+# checks must pass. The ordered column-0 lines must equal the expected
+# four: an explicit `? defaults` key or any extra top-level key changes
+# them while a key-name grep misses colon-less explicit keys. The `on:`
+# block must be exactly `pull_request:`: retargeting the trigger would
+# silently stop the check from running on PRs. There must be exactly one
+# `  census:` line, and every jobs-level line must be a plain two-space
+# job key: a copy of the literal inside a block or quoted scalar would
+# otherwise satisfy the slice while the real job fails open. Lines must
+# also be printable ASCII (GitHub's parser breaks lines at CR, NEL, LS
+# and PS too, which could hide a top-level key), and census must be the
+# first job (a quote opened in an earlier job body could carry the
+# literal while the renamed real job is skipped).
+TOP_LEVEL_LINES="$(grep -vE '^([[:space:]]|#|$)' "$CI_WORKFLOW" 2>/dev/null)"
+EXPECTED_TOP_LEVEL_LINES="$(cat <<'EXPECTED_TOP_LEVEL_LINES_EOF'
+name: CI tests
+on:
+permissions:
+jobs:
+EXPECTED_TOP_LEVEL_LINES_EOF
+)"
+ON_BLOCK="$(awk '/^on:/{p=1; print; next} /^[^[:space:]#]/{p=0} p' "$CI_WORKFLOW" 2>/dev/null)"
+EXPECTED_ON_BLOCK="$(cat <<'EXPECTED_ON_BLOCK_EOF'
+on:
+  pull_request:
+EXPECTED_ON_BLOCK_EOF
+)"
+CENSUS_JOB_COUNT="$(grep -c '^  census:' "$CI_WORKFLOW" 2>/dev/null || true)"
+# Every jobs-level line must be a plain two-space job key; deeper lines are
+# job bodies. A re-indented or flow-style jobs map can otherwise hide the
+# real census job behind a quoted-scalar copy of the literal. Indent-2
+# scalar content still looks like a job key, so census must also come
+# first, where no earlier job body can open the quote. GitHub-valid
+# styles such as three-space bodies, quoted ids, or flow-style jobs
+# fail closed here instead of passing silently.
+JOB_KEY_SHAPE="$(awk '
+	/^jobs:$/ { in_jobs = 1; first = 1; next }
+	!in_jobs { next }
+	/^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+	/^    / && !first { next }
+	!/^  [A-Za-z_][A-Za-z0-9_-]*:$/ { bad = 1 }
+	{ first = 0 }
+	END { print ((in_jobs && !bad) ? "ok" : "bad") }' "$CI_WORKFLOW" 2>/dev/null)"
+# GitHub's YAML parser also breaks lines at CR, NEL, LS and PS, which grep
+# and awk treat as ordinary bytes, so a comment or indented line could hide
+# a top-level key. Require printable ASCII on LF-terminated lines.
+WORKFLOW_NONPRINT="$(LC_ALL=C grep -c '[^[:print:]]' "$CI_WORKFLOW" 2>/dev/null || true)"
+# The census job must be the first job: GitHub's parser does not enforce
+# continuation indentation for quoted scalars, so a quote opened in an
+# earlier job body could carry the literal while the real job is renamed.
+FIRST_JOB_LINE="$(awk '/^jobs:$/ { in_jobs = 1; next } in_jobs && !/^[[:space:]]*(#|$)/ { print; exit }' "$CI_WORKFLOW" 2>/dev/null)"
+CENSUS_WIRING_OK=0
+if [[ "$CENSUS_JOB" == "$EXPECTED_CENSUS_JOB" &&
+	"$TOP_LEVEL_LINES" == "$EXPECTED_TOP_LEVEL_LINES" &&
+	"$ON_BLOCK" == "$EXPECTED_ON_BLOCK" &&
+	"$CENSUS_JOB_COUNT" -eq 1 &&
+	"$JOB_KEY_SHAPE" == ok &&
+	"$WORKFLOW_NONPRINT" == 0 &&
+	"$FIRST_JOB_LINE" == "  census:" ]]; then
+	CENSUS_WIRING_OK=1
+fi
+if [[ $CENSUS_WIRING_OK -eq 1 ]]; then
+	FX_CI="$(new_fixture ci-undeclared)"
+	add_harness "$FX_CI" ctl.sh 'echo control'
+	add_harness "$FX_CI" fresh-undeclared-harness.sh 'echo gate'
+	cat >"$FX_CI/Makefile" <<'MK'
+control:
+	./test/incus/ctl.sh
+MK
+	out="$(cd "$REPO_ROOT" && CENSUS_ROOT="$FX_CI" \
+		CENSUS_HARNESS_GLOBS='test/incus/*.sh' \
+		CENSUS_SCAN_GLOBS='test/incus/*.sh' CENSUS_LIBRARIES='' \
+		CENSUS_POSITIVE_CONTROL='test/incus/ctl.sh' \
+		sh scripts/harness-census.sh 2>&1)" && rc=0 || rc=$?
+	if [[ $rc -ne 0 &&
+		"$out" == *"UNREACHED and undeclared"* &&
+		"$out" == *"test/incus/fresh-undeclared-harness.sh"* ]]; then
+		ok "the CI-invoked census rejects a fresh undeclared harness"
+	else
+		bad "the CI-invoked census passed a fresh undeclared harness (rc=$rc)"
+		printf '%s\n' "$out" | sed 's/^/         /' >&2
+	fi
+else
+	bad "test.yml census wiring differs from the exact allowlist (including || true or || :)"
+fi
+
 # ── cell L — the real tree must be GREEN ──────────────────────────────────
 # This is what `make harness-census` runs. Kept here so the self-test and the
 # gate cannot drift into testing different things.
