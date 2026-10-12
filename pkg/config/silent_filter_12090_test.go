@@ -187,10 +187,90 @@ func TestFilterKeywordPopulationCannotCommitUnbound12090(t *testing.T) {
 			}
 		})
 	}
+	for _, tc := range []struct {
+		name string
+		text string
+	}{
+		{
+			name: "braced-unit-family-inet",
+			text: "interfaces { ge-0/0/0 { unit { 0 family inet filter input f; } } }",
+		},
+		{
+			name: "braced-unit-family-inet6",
+			text: "interfaces { ge-0/0/0 { unit { 0 family inet6 simple-filter output f; } } }",
+		},
+		{
+			name: "braced-unit-family-mpls",
+			text: "interfaces { ge-0/0/0 { unit { 0 family mpls filter input f; } } }",
+		},
+		{
+			name: "braced-sampling-instance-family-inet",
+			text: "forwarding-options { sampling { instance { s family inet filter input f; } } }",
+		},
+	} {
+		t.Run("multi-level-compact/"+tc.name, func(t *testing.T) {
+			tree := hierTree(t, tc.text)
+			if _, err := CompileConfig(tree); err == nil || !strings.Contains(err.Error(), "#12090") {
+				t.Fatalf("multi-level packed filter must reject with #12090; got %v", err)
+			}
+			cfg, err := CompileConfigLenient(tree)
+			if err != nil {
+				t.Fatalf("lenient multi-level packed filter: %v", err)
+			}
+			if !strings.Contains(strings.Join(cfg.Warnings, "\n"), "#12090") {
+				t.Fatalf("lenient multi-level packed filter warnings = %q; want #12090", cfg.Warnings)
+			}
+		})
+	}
 	// Keyword-looking values and apply statements are outside this gate's
 	// keyword-head population and must keep their Junos value semantics.
 	testFilterKeywordValueCases12090(t)
 
+}
+
+func TestMemberlessRangeFilterInputListConsumerRemainsAccepted12090(t *testing.T) {
+	text := "firewall { family inet { filter f { term t { then accept; } } } } " +
+		"interfaces { interface-range r { unit 0 family inet filter input-list [ f g ]; } }"
+	cfg, err := CompileConfig(hierTree(t, text))
+	if err != nil {
+		t.Fatalf("memberless range input-list consumer was rejected: %v", err)
+	}
+	for _, warning := range cfg.Warnings {
+		if strings.Contains(warning, "#12090") {
+			t.Fatalf("memberless range input-list emitted #12090: %q", cfg.Warnings)
+		}
+	}
+}
+
+func TestPackedCompoundFamilyFilterConsumersRetainHooks12090(t *testing.T) {
+	for _, family := range []string{"inet", "inet6"} {
+		for _, direction := range []string{"input", "output"} {
+			t.Run(family+"/"+direction, func(t *testing.T) {
+				text := fmt.Sprintf(
+					"firewall { family %s { filter f { term t { then accept; } } } } "+
+						"interfaces { ge-0/0/0 { unit 0 { family %s filter %s f; } } }",
+					family, family, direction)
+				cfg, err := CompileConfig(hierTree(t, text))
+				if err != nil {
+					t.Fatalf("packed %s %s consumer rejected: %v", family, direction, err)
+				}
+				unit := cfg.Interfaces.Interfaces["ge-0/0/0"].Units[0]
+				got := unit.FilterInputV4
+				if direction == "output" {
+					got = unit.FilterOutputV4
+				}
+				if family == "inet6" {
+					got = unit.FilterInputV6
+					if direction == "output" {
+						got = unit.FilterOutputV6
+					}
+				}
+				if got != "f" {
+					t.Fatalf("packed %s %s hook = %q, want f", family, direction, got)
+				}
+			})
+		}
+	}
 }
 
 func TestCompactFilterHeadsRejectAndWarn12090(t *testing.T) {
@@ -578,6 +658,25 @@ func TestSplitFamilyPackedFilterConsumerRemainsAccepted12090(t *testing.T) {
 	}}
 	if _, err := validateUnsupportedInterfaceStanzasAST(nodes, false); err != nil {
 		t.Fatalf("packed filter under the inet child of a bare family is the supported split-family consumer: %v", err)
+	}
+}
+
+func TestCompoundFamilyPackedFilterConsumerRemainsAccepted12090(t *testing.T) {
+	nodes := []*Node{{
+		Keys: []string{"interfaces"},
+		Children: []*Node{{
+			Keys: []string{"ge-0/0/0"},
+			Children: []*Node{{
+				Keys: []string{"unit", "0"},
+				Children: []*Node{{
+					Keys:   []string{"family", "inet", "filter", "input", "f"},
+					IsLeaf: true,
+				}},
+			}},
+		}},
+	}}
+	if _, err := validateUnsupportedInterfaceStanzasAST(nodes, false); err != nil {
+		t.Fatalf("compound family packed filter is the supported unit consumer: %v", err)
 	}
 }
 

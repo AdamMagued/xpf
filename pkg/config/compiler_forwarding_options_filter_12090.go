@@ -20,8 +20,8 @@ func validateUnsupportedForwardingOptionsFiltersAST(nodes []*Node, lenient bool)
 		return nil
 	}
 
-	var walk func(*Node, *schemaNode, []*Node) error
-	walk = func(n *Node, parentSchema *schemaNode, ancestors []*Node) error {
+	var walk func(*Node, *schemaNode, []*Node, bool) error
+	walk = func(n *Node, parentSchema *schemaNode, ancestors []*Node, isIdentity bool) error {
 		if n == nil {
 			return nil
 		}
@@ -29,24 +29,28 @@ func validateUnsupportedForwardingOptionsFiltersAST(nodes []*Node, lenient bool)
 		if isApplyStatementKeyword(n.Name()) {
 			return nil
 		}
-		instanceName := isDHCPRelayInstanceName12090(n, ancestors)
+		instanceName := isIdentity || isDHCPRelayInstanceName12090(n, ancestors)
 		if !instanceName && (n.Name() == "filter" || n.Name() == "simple-filter") {
 			if err := emit(filterKeywordLabel12090(n)); err != nil {
 				return err
 			}
 		}
 		nodeSchema, identity := schemaNodeAndIdentity12090(parentSchema, n)
-		if !instanceName && inspectPackedHead12090(n, nodeSchema, ancestors) {
-			if head, rest, ok := packedHead12090(n, identity); ok &&
-				(head == "filter" || head == "simple-filter") {
-				if err := emit(packedFilterKeywordLabel12090(head, rest)); err != nil {
+		if inspectPackedHead12090(n, nodeSchema, ancestors) && identity < len(n.Keys) {
+			tail := n.Keys[identity:]
+			for _, p := range filterKeywordPositions12090(nodeSchema, tail) {
+				if err := emit(packedFilterKeywordLabel12090(tail[p], tail[p+1:])); err != nil {
 					return err
 				}
 			}
 		}
+		// A bare args-bearing keyword (`instance { s { ... } }`) has braced
+		// identity children: their names are instance values, not keywords.
+		childIdentity := !isIdentity && len(n.Keys) == 1 && nodeSchema != nil &&
+			nodeSchema.args > 0 && schemaChildFor(parentSchema, n.Name()) == nodeSchema
 		next := append(ancestors, n)
 		for _, child := range n.Children {
-			if err := walk(child, nodeSchema, next); err != nil {
+			if err := walk(child, nodeSchema, next, childIdentity); err != nil {
 				return err
 			}
 		}
@@ -56,7 +60,7 @@ func validateUnsupportedForwardingOptionsFiltersAST(nodes []*Node, lenient bool)
 		if node == nil || node.Name() != "forwarding-options" {
 			continue
 		}
-		if err := walk(node, setSchema, nil); err != nil {
+		if err := walk(node, setSchema, nil, false); err != nil {
 			return nil, err
 		}
 	}

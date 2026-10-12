@@ -26,6 +26,14 @@ func TestBracedFilterSchemaSlotsReject12090(t *testing.T) {
 			text: "forwarding-options { dhcp-relay { server-group sg { 10.0.0.1; } group { lan filter input f; lan { active-server-group sg; interface ge-0/0/0.0; } } } }",
 		},
 		{
+			name: "relay-group-filter-named-packed-filter",
+			text: "forwarding-options { dhcp-relay { server-group sg { 10.0.0.1; } group { filter filter input f; filter { active-server-group sg; interface ge-0/0/0.0; } } } }",
+		},
+		{
+			name: "relay-group-simple-filter-named-packed-simple-filter",
+			text: "forwarding-options { dhcp-relay { server-group sg { 10.0.0.1; } group { simple-filter simple-filter input f; simple-filter { active-server-group sg; interface ge-0/0/0.0; } } } }",
+		},
+		{
 			name: "flat-unit-control",
 			text: "interfaces { ge-0/0/0 { unit 0 filter input f; } }",
 		},
@@ -44,6 +52,22 @@ func TestBracedFilterSchemaSlotsReject12090(t *testing.T) {
 		{
 			name: "relay-filter-child-control",
 			text: "forwarding-options { dhcp-relay { server-group sg { 10.0.0.1; } group lan { active-server-group sg; interface ge-0/0/0.0; filter { input f; } } } }",
+		},
+		{
+			name: "braced-unit-filter-input-list-value",
+			text: "interfaces { ge-0/0/0 { unit { 0 { family inet { filter { input [ f g ]; } } } } } }",
+		},
+		{
+			name: "braced-unit-filter-duplicate-input",
+			text: "interfaces { ge-0/0/0 { unit { 0 { family inet { filter { input f; input g; } } } } } }",
+		},
+		{
+			name: "braced-unit-empty-filter",
+			text: "interfaces { ge-0/0/0 { unit { 0 { family inet { filter; } } } } }",
+		},
+		{
+			name: "braced-unit-filter-valued-input-child",
+			text: "interfaces { ge-0/0/0 { unit { 0 { family inet { filter { input f { x; } } } } } } }",
 		},
 	}
 
@@ -268,6 +292,141 @@ func TestBracedUnitIdentityPackedFilterTailsRemainRejected12090(t *testing.T) {
 				text := "interfaces { ge-0/0/0 { unit { 0 { " + binding + " } } } }"
 				if _, err := CheckText(text, -1); err == nil || !strings.Contains(err.Error(), "#12090") {
 					t.Fatalf("unconsumed packed filter tail error = %v; want #12090", err)
+				}
+			})
+		}
+	}
+}
+
+func TestForwardingOptionsFilterNamedBracedIdentitiesRemainAccepted12090(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		text     string
+		kind     string
+		instance string
+	}{
+		{
+			name:     "sampling-braced-filter",
+			text:     "forwarding-options { sampling { instance { filter { input { rate 100; } } } } }",
+			kind:     "sampling",
+			instance: "filter",
+		},
+		{
+			name:     "sampling-flat-filter",
+			text:     "forwarding-options { sampling { instance filter { input { rate 100; } } } }",
+			kind:     "sampling",
+			instance: "filter",
+		},
+		{
+			name:     "sampling-braced-simple-filter",
+			text:     "forwarding-options { sampling { instance { simple-filter { input { rate 100; } } } } }",
+			kind:     "sampling",
+			instance: "simple-filter",
+		},
+		{
+			name:     "sampling-flat-simple-filter",
+			text:     "forwarding-options { sampling { instance simple-filter { input { rate 100; } } } }",
+			kind:     "sampling",
+			instance: "simple-filter",
+		},
+		{
+			name:     "port-mirroring-braced-filter",
+			text:     "forwarding-options { port-mirroring { instance { filter { input { rate 1; ingress { interface ge-0/0/0.0; } } output { interface ge-0/0/1.0; } } } } }",
+			kind:     "port-mirroring",
+			instance: "filter",
+		},
+		{
+			name:     "port-mirroring-flat-filter",
+			text:     "forwarding-options { port-mirroring { instance filter { input { rate 1; ingress { interface ge-0/0/0.0; } } output { interface ge-0/0/1.0; } } } }",
+			kind:     "port-mirroring",
+			instance: "filter",
+		},
+		{
+			name:     "port-mirroring-braced-simple-filter",
+			text:     "forwarding-options { port-mirroring { instance { simple-filter { input { rate 1; ingress { interface ge-0/0/0.0; } } output { interface ge-0/0/1.0; } } } } }",
+			kind:     "port-mirroring",
+			instance: "simple-filter",
+		},
+		{
+			name:     "port-mirroring-flat-simple-filter",
+			text:     "forwarding-options { port-mirroring { instance simple-filter { input { rate 1; ingress { interface ge-0/0/0.0; } } output { interface ge-0/0/1.0; } } } }",
+			kind:     "port-mirroring",
+			instance: "simple-filter",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := CheckText(tc.text, -1)
+			if err != nil {
+				t.Fatalf("filter-named forwarding instance rejected: %v", err)
+			}
+			if strings.Contains(strings.Join(cfg.Warnings, "\n"), "#12090") {
+				t.Fatalf("filter-named forwarding instance warned #12090: %q", cfg.Warnings)
+			}
+			switch tc.kind {
+			case "sampling":
+				if cfg.ForwardingOptions.Sampling == nil ||
+					cfg.ForwardingOptions.Sampling.Instances[tc.instance] == nil {
+					t.Fatalf("sampling instance %q was not compiled: %+v", tc.instance, cfg.ForwardingOptions.Sampling)
+				}
+			case "port-mirroring":
+				if cfg.ForwardingOptions.PortMirroring == nil ||
+					cfg.ForwardingOptions.PortMirroring.Instances[tc.instance] == nil {
+					t.Fatalf("port-mirroring instance %q was not compiled: %+v", tc.instance, cfg.ForwardingOptions.PortMirroring)
+				}
+			}
+
+			store := newTestStoreAt(t, filepath.Join(t.TempDir(), "xpf.conf"))
+			if err := store.EnterConfigure(); err != nil {
+				t.Fatalf("EnterConfigure: %v", err)
+			}
+			defer store.ExitConfigure()
+			if err := store.LoadOverride(tc.text); err != nil {
+				t.Fatalf("LoadOverride: %v", err)
+			}
+			if _, err := store.Commit(); err != nil {
+				t.Fatalf("Store Commit rejected filter-named forwarding instance: %v", err)
+			}
+		})
+	}
+}
+
+func TestPackedCompoundFamilyFilterConsumersRetainHooks12090(t *testing.T) {
+	for _, family := range []string{"inet", "inet6"} {
+		for _, direction := range []string{"input", "output"} {
+			t.Run(family+"/"+direction, func(t *testing.T) {
+				text := "firewall { family " + family +
+					" { filter f { term t { then accept; } } } } " +
+					"interfaces { ge-0/0/0 { unit 0 { family " + family +
+					" filter " + direction + " f; } } }"
+				cfg, err := CheckText(text, -1)
+				if err != nil {
+					t.Fatalf("packed %s %s consumer rejected: %v", family, direction, err)
+				}
+				unit := cfg.Interfaces.Interfaces["ge-0/0/0"].Units[0]
+				got := unit.FilterInputV4
+				if direction == "output" {
+					got = unit.FilterOutputV4
+				}
+				if family == "inet6" {
+					got = unit.FilterInputV6
+					if direction == "output" {
+						got = unit.FilterOutputV6
+					}
+				}
+				if got != "f" {
+					t.Fatalf("packed %s %s hook = %q, want f", family, direction, got)
+				}
+
+				store := newTestStoreAt(t, filepath.Join(t.TempDir(), "xpf.conf"))
+				if err := store.EnterConfigure(); err != nil {
+					t.Fatalf("EnterConfigure: %v", err)
+				}
+				defer store.ExitConfigure()
+				if err := store.LoadOverride(text); err != nil {
+					t.Fatalf("LoadOverride: %v", err)
+				}
+				if _, err := store.Commit(); err != nil {
+					t.Fatalf("Store Commit rejected packed %s %s consumer: %v", family, direction, err)
 				}
 			})
 		}
