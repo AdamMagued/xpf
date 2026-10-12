@@ -2557,7 +2557,7 @@ ownership) while `ctrl.Enabled == 1`. If the publish then fails, the
 freshly-mutated maps can be a generation *ahead* of the snapshot the helper is
 actually enforcing while the shim is still enabled: a fail-**open**
 classifier/snapshot mismatch (wrong kernel delivery / wrong XSK steering). The
-publish therefore routes through `publishSnapshotFailClosedLocked` with the
+publish therefore routes through `publishPreparedSnapshotFailClosedLocked` with the
 `samePlanRefresh` flag.
 
 **#7468 splits that response by error class, and the reason is a claim this
@@ -2640,7 +2640,7 @@ success. The status loop then completes the publish via `syncSnapshotLocked`
 (`process_status.go`). An address-only commit landing inside that window is
 exactly this case: the maps are already a generation ahead, so a rejected
 deferred publish is the identical fail-open. `syncSnapshotLocked` therefore
-routes its publish through `publishSnapshotFailClosedLocked` with
+routes its publish through `publishPreparedSnapshotFailClosedLocked` with
 `mapsMutatedInPlace=true`. That flag is unconditional there because the
 `pendingXSKStartup` branch is the **sole producer** of an unpublished
 `m.lastSnapshot` ahead of `m.publishedSnapshot` — every other publish site
@@ -3624,7 +3624,7 @@ were already mutated in place, the shim would be redirecting transit to
 XSK against maps a generation ahead of what the helper is enforcing. So
 `disarmSnapshotProtocolFailClosedLocked` additionally drives
 `userspace_ctrl` to `Enabled=0` on exactly the two paths that pass
-`mapsMutatedInPlace=true` to `publishSnapshotFailClosedLocked` (Compile's
+`mapsMutatedInPlace=true` to `publishPreparedSnapshotFailClosedLocked` (Compile's
 `samePlanRefresh` and `syncSnapshotLocked`), dropping transit to the
 kernel-only fail-closed posture. The wrap preserves the gate sentinel, so
 the commit still aborts.

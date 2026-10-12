@@ -234,14 +234,15 @@ func TestRejectedPublishRollsMapsBackOnlyForAnInBandRefusal7468(t *testing.T) {
 			m.controlRequestHook = func(ControlRequest, *ProcessStatus) error { return tc.publishErr }
 
 			var status ProcessStatus
-			err := m.publishSnapshotFailClosedLocked(refused, &status, true)
+			prepareSnapshotForApply(refused)
+			err := m.publishPreparedSnapshotFailClosedLocked(refused, &status, true)
 			if m.syncCancel != nil {
 				defer m.syncCancel()
 			}
 
 			// The apply still fails closed either way.
 			if err == nil {
-				t.Fatal("publishSnapshotFailClosedLocked returned nil on a rejected publish")
+				t.Fatal("prepared fail-closed publish returned nil on a rejected publish")
 			}
 			if !errors.Is(err, tc.publishErr) {
 				t.Fatalf("returned error = %v, want it to wrap the publish failure", err)
@@ -289,12 +290,14 @@ func TestRollbackFailureFallsBackToTheCtrlDisable7468(t *testing.T) {
 	m.controlRequestHook = func(ControlRequest, *ProcessStatus) error { return publishErr }
 
 	var status ProcessStatus
-	err := m.publishSnapshotFailClosedLocked(&ConfigSnapshot{Generation: 42}, &status, true)
+	publishSnap := &ConfigSnapshot{Generation: 42}
+	prepareSnapshotForApply(publishSnap)
+	err := m.publishPreparedSnapshotFailClosedLocked(publishSnap, &status, true)
 	if m.syncCancel != nil {
 		defer m.syncCancel()
 	}
 	if err == nil {
-		t.Fatal("publishSnapshotFailClosedLocked returned nil after a failed rollback")
+		t.Fatal("prepared fail-closed publish returned nil after a failed rollback")
 	}
 	if !errors.Is(err, rollbackErr) {
 		t.Fatalf("returned error = %v, want it to carry the ROLLBACK failure; "+
@@ -333,10 +336,10 @@ func TestRejectedFirstPublishStartsTheReconcileWorker7468(t *testing.T) {
 				return newHelperRejection("integrity preflight rejected")
 			}
 			var status ProcessStatus
-			if err := m.publishSnapshotFailClosedLocked(
-				&ConfigSnapshot{Generation: 1}, &status, mapsMutatedInPlace,
-			); err == nil {
-				t.Fatal("publishSnapshotFailClosedLocked returned nil on a rejected publish")
+			publishSnap := &ConfigSnapshot{Generation: 1}
+			prepareSnapshotForApply(publishSnap)
+			if err := m.publishPreparedSnapshotFailClosedLocked(publishSnap, &status, mapsMutatedInPlace); err == nil {
+				t.Fatal("prepared fail-closed publish returned nil on a rejected publish")
 			}
 			if m.syncCancel == nil {
 				t.Fatal("no reconcile worker after a rejected publish (syncCancel == nil): " +

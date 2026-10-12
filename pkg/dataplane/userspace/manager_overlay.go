@@ -293,7 +293,6 @@ func (m *Manager) PublishRouteOverlaySnapshotWithLatch(cfg *config.Config, overl
 	if err := m.requestApplySnapshotPreparedLocked(&publishSnap, &status); err != nil {
 		return false, fmt.Errorf("publish route overlay snapshot: %w", err)
 	}
-	next.Interfaces = publishSnap.Interfaces
 	// The helper accepted the overlay snapshot, so commit any scheduler state
 	// it carries to the applied/show cache. Error returns above leave that
 	// cache at the previous enforced state.
@@ -325,10 +324,10 @@ func (m *Manager) PublishRouteOverlaySnapshotWithLatch(cfg *config.Config, overl
 
 // RepublishCurrentCaptureAuthority republishes the manager's retained snapshot
 // with the current capture provider result. It is the rollback-heal surface:
-// unlike a route-only publish, this clones the retained snapshot and changes
-// only its generation/time and capture-authority fields. It does not rebuild
-// routes or policy sections; the standard #9684 unresolved-partial repair is
-// retained so an unknown partial update cannot be rolled back.
+// it clones retained authority, updates generation/time and capture-authority
+// fields, and revalidates interface rows before the content-hash dedup. It does
+// not rebuild routes or policy sections; the standard #9684 unresolved-partial
+// repair remains so an unknown partial update cannot be rolled back.
 func (m *Manager) RepublishCurrentCaptureAuthority() (bool, error) {
 	if m == nil {
 		return false, nil
@@ -370,7 +369,6 @@ func (m *Manager) RepublishCurrentCaptureAuthority() (bool, error) {
 	if err := m.requestApplySnapshotPreparedLocked(&publishSnap, &status); err != nil {
 		return false, fmt.Errorf("republish capture authority: %w", err)
 	}
-	next.Interfaces = publishSnap.Interfaces
 
 	// The helper accepted the cloned snapshot. Use the same success bookkeeping
 	// as the other partial publishers, but do not pretend routes or policy were

@@ -222,7 +222,7 @@ func TestSnapshotProtocolDisarmFailureFailsClosed5488(t *testing.T) {
 // so a revert cannot re-inline the bare disarm at either publish site and slip
 // past the behavioral test above (which drives the extracted helper directly).
 //
-// The two sites are exactly the two callers of publishSnapshotFailClosedLocked —
+// The two sites are exactly the two callers of publishPreparedSnapshotFailClosedLocked —
 // the codebase's oracle for "the classifier maps are ahead of the applied
 // snapshot" — and each must pass the SAME mapsMutatedInPlace value to both
 // calls, or the fail-closed action and the publish would disagree about whether

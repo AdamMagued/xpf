@@ -841,7 +841,7 @@ func compileNPTv6(dp DataPlane, cfg *config.Config) error {
 			// `Nptv6State::try_from_snapshots`, which rejects the WHOLE snapshot
 			// on any unparseable / length-mismatched / host-bits-set prefix
 			// (userspace-dp/src/nptv6.rs, #2240/#4519). That rejection lands in
-			// publishSnapshotFailClosedLocked -- AFTER compileZones has created
+			// publishPreparedSnapshotFailClosedLocked -- AFTER compileZones has created
 			// VLANs and reconciled addresses -- so warning and skipping here left
 			// the #4960 validate-before-mutate pre-pass ACCEPTING a config the
 			// real backend then rejects post-mutation, which is the precise shape
@@ -983,7 +983,7 @@ func compileNPTv6(dp DataPlane, cfg *config.Config) error {
 	// overlap within a conflicting zone scope (#2241, zone-partitioned per
 	// #5176). Without this the #4960 pre-pass ACCEPTS such a config, compileZones
 	// mutates the host, and the helper then rejects at
-	// publishSnapshotFailClosedLocked with no rollback — the exact shape the
+	// publishPreparedSnapshotFailClosedLocked with no rollback — the exact shape the
 	// pre-pass exists to prevent, still live for this input.
 	//
 	// This is checked AFTER the per-rule loop because it is a property of the

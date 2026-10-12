@@ -12,7 +12,7 @@
 // dropping transit to the kernel-only fail-closed posture until a subsequent
 // good commit re-publishes and re-enables it.
 //
-// FAIL-ON-REVERT: neutralizing publishSnapshotFailClosedLocked back to
+// FAIL-ON-REVERT: neutralizing publishPreparedSnapshotFailClosedLocked back to
 // `return result, fmt.Errorf("publish userspace snapshot: %w", err)` (i.e.
 // dropping the failClosedUserspaceCtrlMapLocked call on the mapsMutatedInPlace
 // path) leaves ctrl at Enabled=1 after the rejected publish, so
@@ -156,10 +156,11 @@ func TestAddressOnlyCommitRejectedPublishFailsClosed4959(t *testing.T) {
 
 		var status ProcessStatus
 		m.mu.Lock()
-		err := m.publishSnapshotFailClosedLocked(&snap, &status, true /*mapsMutatedInPlace*/)
+		prepareSnapshotForApply(&snap)
+		err := m.publishPreparedSnapshotFailClosedLocked(&snap, &status, true /*mapsMutatedInPlace*/)
 		m.mu.Unlock()
 		if err == nil {
-			t.Fatal("publishSnapshotFailClosedLocked must return the rejection error")
+			t.Fatal("publishPreparedSnapshotFailClosedLocked must return the rejection error")
 		}
 		if got := readCtrlEnabled4959(t, ctrlMap); got != 0 {
 			t.Fatalf("ctrl.Enabled = %d after a rejected same-plan publish, want 0 (fail closed); "+
@@ -178,10 +179,11 @@ func TestAddressOnlyCommitRejectedPublishFailsClosed4959(t *testing.T) {
 
 		var status ProcessStatus
 		m.mu.Lock()
-		err := m.publishSnapshotFailClosedLocked(&snap, &status, true /*mapsMutatedInPlace*/)
+		prepareSnapshotForApply(&snap)
+		err := m.publishPreparedSnapshotFailClosedLocked(&snap, &status, true /*mapsMutatedInPlace*/)
 		m.mu.Unlock()
 		if err != nil {
-			t.Fatalf("publishSnapshotFailClosedLocked on the success path returned %v, want nil", err)
+			t.Fatalf("publishPreparedSnapshotFailClosedLocked on the success path returned %v, want nil", err)
 		}
 		if got := readCtrlEnabled4959(t, ctrlMap); got != 1 {
 			t.Fatalf("ctrl.Enabled = %d after a successful publish, want 1 (unchanged)", got)
@@ -199,10 +201,11 @@ func TestAddressOnlyCommitRejectedPublishFailsClosed4959(t *testing.T) {
 
 		var status ProcessStatus
 		m.mu.Lock()
-		err := m.publishSnapshotFailClosedLocked(&snap, &status, false /*mapsMutatedInPlace*/)
+		prepareSnapshotForApply(&snap)
+		err := m.publishPreparedSnapshotFailClosedLocked(&snap, &status, false /*mapsMutatedInPlace*/)
 		m.mu.Unlock()
 		if err == nil {
-			t.Fatal("publishSnapshotFailClosedLocked must return the rejection error on the bootstrap path too")
+			t.Fatal("publishPreparedSnapshotFailClosedLocked must return the rejection error on the bootstrap path too")
 		}
 		if got := readCtrlEnabled4959(t, ctrlMap); got != 1 {
 			t.Fatalf("ctrl.Enabled = %d, want 1 unchanged; the bootstrap-path publish must not "+
@@ -241,12 +244,10 @@ func TestCompileRoutesPublishThroughFailClosedHelper4959(t *testing.T) {
 // otherwise the shim runs classifier maps a generation ahead of the applied Rust
 // snapshot — the exact #4959 fail-open, as a residual on this second site.
 //
-// FAIL-ON-REVERT: neutralizing the syncSnapshotLocked publish back to a bare
-// `m.requestLocked(ControlRequest{Type: "apply_snapshot", ...}, &status)` (i.e.
-// dropping the publishSnapshotFailClosedLocked(..., true) wrap) leaves ctrl at
-// Enabled=1 after the rejected deferred publish, so
-// TestDeferredPublishRejectedFailsClosed4959/rejected_deferred_publish_disables_ctrl
-// goes RED on its "ctrl.Enabled must be 0" assertion.
+// FAIL-ON-REVERT: replacing the prepared publisher with bare requestLocked
+// skips fail-closed handling, leaving ctrl.Enabled=1 after rejection.
+// TestDeferredPublishRejectedFailsClosed4959 asserts ctrl.Enabled=0 and
+// goes RED on that assertion.
 func TestDeferredPublishRejectedFailsClosed4959(t *testing.T) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		t.Skipf("RemoveMemlock: %v", err)

@@ -150,8 +150,7 @@ func (m *Manager) RefreshInterfaceRowsForLink(cfg *config.Config, linuxName stri
 	if err := m.requestApplySnapshotPreparedLocked(&publishSnap, &status); err != nil {
 		return false, fmt.Errorf("publish interface-link refresh: %w", err)
 	}
-	// Retain exactly the interface rows sampled and sent above.
-	next.Interfaces = publishSnap.Interfaces
+	// next already owns the interface rows sampled before this publish.
 	m.commitPolicySchedulerActiveStateFromSnapshotLocked(&next)
 	m.logWgEndpointSetTransitionLocked(&publishSnap, "interface-link")
 	m.adoptPublishedGenerationLocked(&next, publishSnap.Generation)

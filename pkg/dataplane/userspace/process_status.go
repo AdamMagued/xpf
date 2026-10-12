@@ -116,14 +116,11 @@ func (m *Manager) syncSnapshotLocked() error {
 		m.rebuildMonitoredIfindexes()
 		return nil
 	}
-	// Plan gating and the eventual send must use the same interface sample.
 	// Keep the retained authority detached until the publish is acknowledged.
 	retained := *m.lastSnapshot
 	if !m.pendingFullSnapshotMetadata {
 		stripSingleUseCommitMetadata(&retained)
 	}
-	prepareSnapshotForApply(&retained)
-	planKey := snapshotBindingPlanKey(&retained)
 	// Publish the initial snapshot immediately so the helper can plan its
 	// bindings. After that, defer newer snapshots until the first XSK
 	// liveness outcome is known. HA startup can emit several snapshots in
@@ -142,7 +139,18 @@ func (m *Manager) syncSnapshotLocked() error {
 	// liveness needs — so deferring a changed-plan debt waits for liveness the
 	// debt itself prevents. Non-debt publishes are unaffected (predicate false
 	// ⇒ condition bit-identical).
-	if xskStartup && !m.snapshotRetryDebtLocked() && (m.publishedPlanKey == "" || m.publishedPlanKey != planKey) {
+	deferPlan := func(key string) bool {
+		return xskStartup && !m.snapshotRetryDebtLocked() && (m.publishedPlanKey == "" || m.publishedPlanKey != key)
+	}
+	// #9684: deferred ticks gate on the retained rows first, which Compile
+	// already revalidated. An admitted publish then samples once and re-gates
+	// so its plan decision and send use the same interface rows.
+	if deferPlan(snapshotBindingPlanKey(&retained)) {
+		return nil
+	}
+	prepareSnapshotForApply(&retained)
+	planKey := snapshotBindingPlanKey(&retained)
+	if deferPlan(planKey) {
 		return nil
 	}
 	// #9684: re-sample unresolved sections only after the plan gate admits this
@@ -210,7 +218,7 @@ func (m *Manager) syncSnapshotLocked() error {
 	publishSnap := retained
 	publishSnap.Neighbors = filterPublishableNeighbors(retained.Neighbors)
 	// #5488 (F7): mapsMutatedInPlace is unconditionally true here for the same
-	// reason the publishSnapshotFailClosedLocked call below passes true — the
+	// reason the publishPreparedSnapshotFailClosedLocked call below passes true — the
 	// only producer of an unpublished lastSnapshot is Compile's pendingXSKStartup
 	// branch, which ALWAYS mutated the classifier maps in place first. So a
 	// failed disarm here must also drive ctrl to 0 rather than leave the shim
@@ -233,8 +241,7 @@ func (m *Manager) syncSnapshotLocked() error {
 	// interface-NAT classifier BPF maps IN PLACE first
 	// (syncUserspaceClassifierMapsFailClosedLocked(snap)) with ctrl still
 	// enabled. Besides the deferral above, the retry-debt adopt arm in
-	// publishSnapshotFailClosedLocked (#9642) is the only other producer of an
-	// unpublished lastSnapshot — and on both arms the maps are likewise already
+	// publishPreparedSnapshotFailClosedLocked (#9642) is the only other producer of an
 	// at the attempted plan (mutated in place on the same-plan arm, freshly
 	// programmed on the bootstrap arm), so the conclusion below stands for
 	// debt retries too: every other publish site (Compile normal path,
@@ -246,7 +253,7 @@ func (m *Manager) syncSnapshotLocked() error {
 	// is unconditionally true here: if the helper REJECTS this publish it keeps
 	// enforcing the previous-good snapshot, so leaving ctrl enabled would run
 	// the shim against classifier maps a generation ahead of the applied Rust
-	// snapshot (fail OPEN). publishSnapshotFailClosedLocked disables ctrl on a
+	// snapshot (fail OPEN). publishPreparedSnapshotFailClosedLocked disables ctrl on a
 	// rejection so transit drops to the kernel-only fail-closed posture.
 	if err := m.publishPreparedSnapshotFailClosedLocked(&publishSnap, &status, true); err != nil {
 		return err
@@ -275,7 +282,6 @@ func (m *Manager) syncSnapshotLocked() error {
 	m.rebuildMonitoredIfindexes()
 	m.publishedSnapshot = m.lastSnapshot.Generation
 	m.publishedPlanKey = snapshotBindingPlanKey(&publishSnap)
-	hash, hashOK = snapshotContentHash(&publishSnap)
 	// #2079: deferred full apply_snapshot succeeded — record applied.
 	m.markAppliedSnapshotLocked()
 	if hashOK {

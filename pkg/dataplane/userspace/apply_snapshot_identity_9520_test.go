@@ -715,7 +715,7 @@ func TestOnlyASuccessfulApplyClearsAnUnknownOutcome9520(t *testing.T) {
 
 // TestAFailedRetryAfterAConflictStillFailsClosed9520 (Codex review finding 3):
 // when the republish after a content conflict fails, the deferred-sync publish
-// still applies publishSnapshotFailClosedLocked's split to that failure. The
+// still applies the prepared fail-closed publish path's split to that failure. The
 // maps are not rolled back and ctrl is disabled, exactly as for a first-attempt
 // failure (the #9337 cells).
 func TestAFailedRetryAfterAConflictStillFailsClosed9520(t *testing.T) {

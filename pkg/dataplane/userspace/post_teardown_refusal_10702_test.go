@@ -122,7 +122,8 @@ func TestPostTeardownRefusalDisablesCtrlAndArmsRetryDebt10702(t *testing.T) {
 	attempted := &ConfigSnapshot{Version: ProtocolVersion, Generation: 42}
 
 	m.mu.Lock()
-	err := m.publishSnapshotFailClosedLocked(attempted, &ProcessStatus{}, true)
+	prepareSnapshotForApply(attempted)
+	err := m.publishPreparedSnapshotFailClosedLocked(attempted, &ProcessStatus{}, true)
 	m.mu.Unlock()
 	if m.syncCancel == nil {
 		t.Fatal("post-teardown refusal left no reconcile worker to consume retry debt")

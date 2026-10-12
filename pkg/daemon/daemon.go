@@ -1163,7 +1163,7 @@ type Daemon struct {
 	// AVAILABILITY NOTE (not authorization): a deferred success renders
 	// accept-less until the NEXT apply republishes (feed onUpdate
 	// re-applies bound this in practice); a rejected deferred publish
-	// disables ctrl via publishSnapshotFailClosedLocked, so no reinject can
+	// disables ctrl via publishPreparedSnapshotFailClosedLocked, so no reinject can
 	// reach the accept at all (residual in-flight drain only).
 	hostInboundDataplaneFresh atomic.Bool
 
