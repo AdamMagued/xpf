@@ -10,7 +10,7 @@
 | Connectivity | `make test-connectivity` | ~60s | After deploy |
 | Failover | `make test-failover` | ~120s | Cluster/VRRP/session sync changes |
 | Hard crash | `make test-ha-crash` | ~120s | Cluster state machine changes |
-| Private RG | `./test/incus/test-private-rg.sh` | ~5min | Private RG election changes |
+| Private RG | `./test/incus/test-private-rg.sh` | varies; three raw deploys for `full` | Private RG election changes |
 | Restart | `make test-restart-connectivity` | ~30s | Shutdown/startup changes |
 
 ## Test Categories
@@ -127,13 +127,18 @@ Scenarios:
 
 ### 5. Private RG Election Test (`./test/incus/test-private-rg.sh`)
 
-Validates private-rg-election feature (VRRP elimination).
+Validates private-rg-election feature (VRRP elimination) on the shared `loss`
+cluster. Use the destructive cluster-cell runner; `full` performs three raw
+deploys (private mode, legacy VRRP mode, and the saved file configuration) and
+can take substantially longer than a single deploy.
 
 Modes:
-- `full` — Complete cycle: enable -> test -> disable -> test backward compat
-- `enable` — Enable private-rg-election and validate
-- `disable` — Disable and verify VRRP returns
-- `check` — Inspect current state
+- `full` — Snapshot `CONF`, enable and test private mode, disable and test
+  legacy mode, then restore and redeploy the saved config if the saved
+  bytes are restored successfully.
+- `enable` — Enable private-rg-election and validate; leave it enabled.
+- `disable` — Disable and verify VRRP returns; leave it disabled.
+- `check` — Inspect current state.
 
 Tests with private-rg-election enabled:
 - No VRRP instances running
@@ -146,6 +151,16 @@ Tests with private-rg-election disabled:
 - VRRP instances start and reach MASTER
 - VIPs present via VRRP
 - Full connectivity preserved
+
+The `full` cleanup redeploys `CONF` and attests its file-derived mode on both
+nodes after restoring the saved bytes. A failed restore skips redeploy, keeps
+the private snapshot, and prints its recovery path. It does not restore
+configuration databases or rollback history, nor revert binaries replaced by
+the raw deploy. The raw deployment removes `/etc/xpf/.configdb`,
+`/etc/xpf/rescue.conf`, and numbered rollback slots. The shared cluster is
+temporarily in legacy mode during the cycle; `SIGKILL`, host loss, or another
+interrupt during cleanup can leave it in legacy or split mode. Do not run
+against an unattended cluster.
 
 ### 6. Restart Connectivity Test (`make test-restart-connectivity`)
 

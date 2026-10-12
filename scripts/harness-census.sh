@@ -143,6 +143,7 @@ test/incus/iperf-throughput-lib.sh
 test/incus/ha-smoke-iperf-lib.sh
 test/incus/mouse-elephant-lib.sh
 test/incus/newflow-ceiling-lib.sh
+test/incus/private-rg-lib.sh
 test/incus/screen-probe-lib.sh
 test/incus/wire-gate-lib.sh
 test/incus/wire-config-snapshot-lib.sh
