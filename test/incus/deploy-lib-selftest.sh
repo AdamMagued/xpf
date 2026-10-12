@@ -1684,6 +1684,191 @@ test_manifest_write_wired_after_cluster_deploy() {
 	fi
 }
 
+
+# #12203: committed regression cells for the scoped dual-active role reader.
+DUAL_ACTIVE_CHAINED_CRASH="${DUAL_ACTIVE_CHAINED_CRASH:-$SCRIPT_DIR/test-chained-crash.sh}"
+DUAL_ACTIVE_HA_CRASH="${DUAL_ACTIVE_HA_CRASH:-$SCRIPT_DIR/test-ha-crash.sh}"
+
+dual_active_status() {
+	local lid="$1" spec="$2" peer="${3:-}" pid=$((1 - $1))
+	local tok rg role peer_role
+	for tok in $spec; do
+		rg=${tok%%=*}
+		role=${tok#*=}
+		printf 'Redundancy group: %s , Failover count: 1\n' "$rg"
+		printf '%-6s %-8d %-14s %-8s %-8s %s\n' "node$lid" 200 "$role" no no None
+		if [[ -n "$peer" ]]; then
+			peer_role=$(tr ' ' '\n' <<<"$peer" | awk -F= -v r="$rg" '$1 == r { print $2 }')
+			if [[ -n "$peer_role" ]]; then
+				printf '%-6s %-8d %-14s %-8s %-8s %s\n' "node$pid" 100 "$peer_role" no no None
+			fi
+		fi
+		printf '\n'
+	done
+}
+
+dual_active_assert_row() {
+	local smoke="$1" label="$2" rc0="$3" out0="$4" rc1="$5" out1="$6"
+	local expected="$7" needle="$8" expected_fails="${9:-}" fn_src output sub_rc pass_count fail_count
+	fn_src=$(awk '/^check_no_dual_active\(\) \{$/ { capture=1 } capture { print } capture && /^}$/ { exit }' "$smoke")
+	if [[ -z "$fn_src" ]]; then
+		bad "$label: could not extract check_no_dual_active from $smoke"
+		return
+	fi
+	output=$(
+		export FW0=fw0 FW1=fw1 RC0="$rc0" OUT0="$out0" RC1="$rc1" OUT1="$out1"
+		PASS=0 FAIL=0
+		incus() {
+			case "$2" in
+			fw0) printf '%s' "$OUT0"; return "$RC0" ;;
+			fw1) printf '%s' "$OUT1"; return "$RC1" ;;
+			esac
+			return 99
+		}
+		pass() { PASS=$((PASS + 1)); printf '  PASS  %s\n' "$*"; }
+		fail() { FAIL=$((FAIL + 1)); printf '  FAIL  %s\n' "$*"; }
+		set -euo pipefail
+		eval "$fn_src"
+		check_no_dual_active "$label"
+		printf 'RESULT pass=%d fail=%d CONTINUED\n' "$PASS" "$FAIL"
+	)
+	sub_rc=$?
+	if [[ "$output" != *CONTINUED* ]]; then
+		bad "$label: check aborted under set -e (rc=$sub_rc)"
+		return
+	fi
+	if [[ "$output" =~ RESULT\ pass=([0-9]+)\ fail=([0-9]+)\ CONTINUED ]]; then
+		pass_count=${BASH_REMATCH[1]}
+		fail_count=${BASH_REMATCH[2]}
+	else
+		bad "$label: missing result marker"
+		return
+	fi
+	if [[ "$expected" == PASS ]]; then
+		if [[ "$pass_count" -gt 0 && "$fail_count" -eq 0 && "$output" == *"$needle"* ]]; then
+			ok "$label: PASS as expected"
+		else
+			bad "$label: expected PASS only with '$needle'; got pass=$pass_count fail=$fail_count"
+		fi
+	elif [[ "$pass_count" -eq 0 && "$fail_count" -gt 0 && "$output" == *"$needle"* ]] &&
+		{ [[ -z "$expected_fails" ]] || [[ "$fail_count" -eq "$expected_fails" ]]; }; then
+		ok "$label: FAIL as expected"
+	else
+		bad "$label: expected FAIL only with '$needle'; got pass=$pass_count fail=$fail_count"
+	fi
+}
+
+test_dual_active_scoped_reader() {
+	local primary='Redundancy group: 0 , Failover count: 1
+node0   200       primary        no       no       None
+'
+	local rg10='Redundancy group: 10 , Failover count: 1
+node0   200       secondary      no       no       None
+'
+	local duplicate='Redundancy group: 1 , Failover count: 1
+node0   200       primary        no       no       None
+node0   200       secondary      no       no       None
+'
+	local missing_row='Redundancy group: 1 , Failover count: 1
+node1   100       primary        no       no       None
+'
+	local got
+	if got=$(printf '%s' "$primary" | deploy_node_rg_role node0 0) &&
+		[[ "$got" == primary ]] &&
+		! printf '%s' "" | deploy_node_rg_role node0 0 >/dev/null &&
+		! printf '   \n' | deploy_node_rg_role node0 0 >/dev/null &&
+		! printf '%s' 'Cluster not configured' | deploy_node_rg_role node0 0 >/dev/null &&
+		! printf '%s' "$missing_row" | deploy_node_rg_role node0 1 >/dev/null &&
+		! printf '%s' "$duplicate" | deploy_node_rg_role node0 1 >/dev/null &&
+		! printf '%s' 'Redundancy group: 0 , Failover count: 1
+node0   200
+' | deploy_node_rg_role node0 0 >/dev/null &&
+		! printf '%s' "$rg10" | deploy_node_rg_role node0 1 >/dev/null &&
+		[[ $(printf '%s' "$rg10" | deploy_node_rg_role node0 10) == secondary ]]; then
+		ok "dual-active scoped reader: exact node/RG role, empty/missing/duplicate fail, RG10 does not match RG1"
+	else
+		bad "dual-active scoped reader: exact node/RG role contract failed"
+	fi
+}
+
+test_dual_active_committed_rows() {
+	local allp='0=primary 1=primary 2=primary'
+	local alls='0=secondary 1=secondary 2=secondary'
+	local p0 p1 s0 s1 ok0 ok1
+	p0=$(dual_active_status 0 "$allp")
+	p1=$(dual_active_status 1 "$allp")
+	s0=$(dual_active_status 0 "$alls" "$allp")
+	s1=$(dual_active_status 1 "$alls" "$alls")
+	ok0=$(dual_active_status 0 "$alls" "$allp")
+	ok1=$(dual_active_status 1 "$allp" "$alls")
+	for smoke in "$DUAL_ACTIVE_CHAINED_CRASH" "$DUAL_ACTIVE_HA_CRASH"; do
+		local name
+		name=$(basename "$smoke")
+		dual_active_assert_row "$smoke" "$name row1 both-primary" 0 "$p0" 0 "$p1" FAIL "dual-active detected"
+		dual_active_assert_row "$smoke" "$name row2 exactly-one" 0 "$s0" 0 "$ok1" PASS "no dual-active"
+		dual_active_assert_row "$smoke" "$name row3 fw0-unreadable" 1 "" 0 "$ok1" FAIL "fw0 cluster status unreadable" 1
+		dual_active_assert_row "$smoke" "$name row4 both-unreadable" 1 "" 1 "" FAIL "fw0 cluster status unreadable" 2
+		dual_active_assert_row "$smoke" "$name row4 fw1 also read" 1 "" 1 "" FAIL "fw1 cluster status unreadable" 2
+		dual_active_assert_row "$smoke" "$name row8 fw1-empty" 0 "$ok0" 0 "" FAIL "fw1 cluster status empty" 1
+		dual_active_assert_row "$smoke" "$name row5 no-owner" 0 "$s0" 0 "$s1" FAIL "no primary detected"
+		dual_active_assert_row "$smoke" "$name row16 whitespace-only" 0 "   " 0 "$ok1" FAIL "role unreadable"
+		dual_active_assert_row "$smoke" "$name row17 duplicate-node-row" 0 "$(dual_active_status 0 '0=secondary 1=primary 1=primary 2=secondary')" 0 "$(dual_active_status 1 '0=primary 1=secondary 2=primary')" FAIL "RG1 role unreadable"
+		dual_active_assert_row "$smoke" "$name row18 not-configured" 0 "Cluster not configured" 0 "$p1" FAIL "RG0 role unreadable"
+		dual_active_assert_row "$smoke" "$name row19 missing-RG2" 0 "$(dual_active_status 0 '0=secondary 1=secondary')" 0 "$ok1" FAIL "RG2 role unreadable"
+		dual_active_assert_row "$smoke" "$name row20 zero-RG-blocks" 0 "Status has no redundancy groups" 0 "$ok1" FAIL "RG0 role unreadable"
+		dual_active_assert_row "$smoke" "$name row21 RG10" 0 "$(dual_active_status 0 '0=primary 1=primary 2=primary 10=primary')" 0 "$(dual_active_status 1 '0=secondary 1=secondary 2=secondary 10=secondary')" PASS "no dual-active"
+		dual_active_assert_row "$smoke" "$name row24 fw0-rc1-nonempty" 1 "$ok0" 0 "$ok1" FAIL "fw0 cluster status unreadable" 1
+		dual_active_assert_row "$smoke" "$name row25 fw1-rc1-nonempty" 0 "$ok0" 1 "$ok1" FAIL "fw1 cluster status unreadable" 1
+	done
+}
+
+test_dual_active_retired_grep_counterfactual() {
+	local fw0="Cluster not configured" fw1
+	local old0 old1 rg
+	fw1=$(dual_active_status 1 '0=primary 1=primary 2=primary')
+	for rg in 0 1 2; do
+		old0=$(printf '%s\n' "$fw0" | grep -A2 "Redundancy group: $rg" | grep node0 | grep -c primary || true)
+		old1=$(printf '%s\n' "$fw1" | grep -A2 "Redundancy group: $rg" | grep node1 | grep -c primary || true)
+		if [[ "$old0/$old1" != 0/1 ]]; then
+			bad "dual-active retired-grep counterfactual: row18 fixture stopped producing vacuous 0/1 on RG$rg"
+			return
+		fi
+	done
+	dual_active_assert_row "$DUAL_ACTIVE_CHAINED_CRASH" "retired-grep counterfactual" 0 "$fw0" 0 "$fw1" FAIL "role unreadable"
+}
+
+test_dual_active_smoke_site_pins() {
+	local chain ha chain_fn ha_fn missing=()
+	chain=$(grep -v '^[[:space:]]*#' "$DUAL_ACTIVE_CHAINED_CRASH")
+	ha=$(grep -v '^[[:space:]]*#' "$DUAL_ACTIVE_HA_CRASH")
+	chain_fn=$(awk '/^check_no_dual_active\(\) \{$/ { capture=1 } capture { print } capture && /^}$/ { exit }' "$DUAL_ACTIVE_CHAINED_CRASH")
+	ha_fn=$(awk '/^check_no_dual_active\(\) \{$/ { capture=1 } capture { print } capture && /^}$/ { exit }' "$DUAL_ACTIVE_HA_CRASH")
+	for code in "$chain" "$ha"; do
+		[[ "$code" == *'source "${SCRIPT_DIR}/deploy-lib.sh"'* ]] || missing+=("deploy-lib source")
+		[[ "$code" == *'deploy_node_rg_role node0 "$rg"'* ]] || missing+=("node0 scoped reader")
+		[[ "$code" == *'deploy_node_rg_role node1 "$rg"'* ]] || missing+=("node1 scoped reader")
+	done
+	[[ "$chain_fn" == "$ha_fn" ]] || missing+=("smoke check copies differ")
+	[[ "$chain_fn" == *'return 0'* ]] || missing+=("explicit return 0")
+	if grep -Eq '^[[:space:]]*return([[:space:]]+1)?[[:space:]]*$' <<<"$chain_fn"; then
+		missing+=("bare/nonzero return")
+	fi
+	if (( ${#missing[@]} == 0 )); then
+		ok "dual-active smoke pins: both smokes source the shared scoped reader and use byte-identical fail-closed checks"
+	else
+		bad "dual-active smoke pins: ${missing[*]}"
+	fi
+}
+test_dual_active_scoped_reader
+test_dual_active_committed_rows
+test_dual_active_retired_grep_counterfactual
+test_dual_active_smoke_site_pins
+if [[ "${DEPLOY_LIB_SELFTEST_DUAL_ACTIVE_ONLY:-0}" == 1 ]]; then
+	echo "----------------------------------------"
+	echo "deploy-lib selftest (dual-active cells): $PASS passed, $FAIL failed"
+	[[ $FAIL -eq 0 ]]
+	exit $?
+fi
 # ── Run ───────────────────────────────────────────────────────────────
 test_rolling_secondary_node0_primary
 test_rolling_secondary_node0_secondary
