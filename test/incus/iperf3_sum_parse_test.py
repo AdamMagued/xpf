@@ -326,6 +326,24 @@ class FailoverTelemetryTests(unittest.TestCase):
                     if expected is None:
                         self.assertIn("no per-stream interval", reason)
 
+    def test_client_ending_before_crash_is_fail_not_void(self):
+        for duration in (8, 10):
+            text = self.log(duration=duration, failback_dip=False)
+            for payload, json_stream in (
+                (text, False),
+                (self.json_stream(text), True),
+            ):
+                with self.subTest(duration=duration, json_stream=json_stream):
+                    ok, reason = failover_stream_verdict(
+                        payload,
+                        10,
+                        8,
+                        json_stream=json_stream,
+                        event_label="crash",
+                    )
+                    self.assertIs(ok, False)
+                    self.assertIn("before the crash event", reason)
+
     def test_failover_cli_emits_interval_and_stream_verdicts(self):
         parser = os.path.join(os.path.dirname(__file__), "iperf3_sum_parse.py")
         text = self.log(dead_after_crash=(9, 10, 11, 12))

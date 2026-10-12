@@ -130,7 +130,9 @@ grep -q -- '--failback-at "$failback_at_seconds"' "$FAILOVER" \
 	|| bad "test-failover.sh does not pass the measured last-RG-moved instant to the second stream oracle"
 grep -q 'failback_at_seconds=$((SECONDS - iperf_start_seconds))' "$FAILOVER" \
 	|| bad "test-failover.sh does not record failback against the iperf start clock"
-grep -q 'void "iperf3 completed before manual failback' "$FAILOVER" \
+(( $(grep -c 'void "iperf3 completed before manual failback' "$FAILOVER") == 2 )) \
+	|| bad "test-failover.sh must void early client completion in both the rejoin (:1611) and failback (:1688) cells"
+! grep -q 'pass "iperf3 completed successfully (finished before' "$FAILOVER" \
 	|| bad "test-failover.sh accepts an iperf client that ended before failback"
 ok "test-failover wires crash and last-RG-moved timestamps and rejects early client completion"
 
