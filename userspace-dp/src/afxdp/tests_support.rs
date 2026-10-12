@@ -1656,6 +1656,8 @@ pub(super) fn txn_run_descriptor_inner_with_slow_path(
         },
         None,
         None,
+        -1,
+        -1,
     )
 }
 
@@ -1695,6 +1697,8 @@ pub(super) fn txn_run_descriptor_with_event_stream(
         },
         None,
         Some(event_stream),
+        -1,
+        -1,
     )
 }
 
@@ -1733,6 +1737,8 @@ pub(super) fn txn_run_descriptor_with_shared_nat(
         },
         None,
         None,
+        -1,
+        -1,
     )
 }
 
@@ -1778,6 +1784,8 @@ pub(super) fn txn_run_descriptor_at(
         },
         None,
         None,
+        -1,
+        -1,
     )
 }
 
@@ -1814,6 +1822,47 @@ pub(super) fn txn_run_descriptor_with_validation(
         validation,
         None,
         None,
+        -1,
+        -1,
+    )
+}
+
+/// #12191: drive the production descriptor path with caller-supplied conntrack
+/// map fds, so tests can observe the revalidation call-site wiring.
+pub(super) fn txn_run_descriptor_with_conntrack_fds(
+    binding: &mut BindingWorker,
+    sessions: &mut SessionTable,
+    forwarding: &ForwardingState,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    validation: ValidationState,
+    conntrack_v4_fd: std::os::raw::c_int,
+    conntrack_v6_fd: std::os::raw::c_int,
+) -> (BatchCounters, DebugPollCounters) {
+    let local_tunnel_deliveries = Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    txn_run_descriptor_inner_with_slow_path_impl(
+        binding,
+        sessions,
+        forwarding,
+        ha_state,
+        frame,
+        meta,
+        &local_tunnel_deliveries,
+        &shared_sessions,
+        None,
+        None,
+        None,
+        None,
+        None,
+        123_000_000_000,
+        123,
+        validation,
+        None,
+        None,
+        conntrack_v4_fd,
+        conntrack_v6_fd,
     )
 }
 
@@ -1853,6 +1902,8 @@ pub(super) fn txn_run_descriptor_with_screen_state(
         },
         Some(screen),
         None,
+        -1,
+        -1,
     )
 }
 
@@ -1892,6 +1943,8 @@ pub(super) fn txn_run_descriptor_inner_with_slow_path_and_ike(
         },
         None,
         None,
+        -1,
+        -1,
     )
 }
 
@@ -1914,6 +1967,8 @@ fn txn_run_descriptor_inner_with_slow_path_impl(
     validation: ValidationState,
     screen_state: Option<&mut ScreenState>,
     event_stream: Option<&crate::event_stream::EventStreamWorkerHandle>,
+    conntrack_v4_fd: std::os::raw::c_int,
+    conntrack_v6_fd: std::os::raw::c_int,
 ) -> (BatchCounters, DebugPollCounters) {
     let meta_len = std::mem::size_of::<UserspaceDpMeta>();
     let frame_offset = 128;
@@ -2005,8 +2060,8 @@ fn txn_run_descriptor_inner_with_slow_path_impl(
         now_secs,
         0,
         0,
-        -1,
-        -1,
+        conntrack_v4_fd,
+        conntrack_v6_fd,
         &worker_ctx,
         &mut telemetry,
     );

@@ -10121,23 +10121,21 @@ fn worker_loop_routes_expiry_overflow_to_close_flush_10309() {
     );
 }
 
-/// #3416 FAIL-ON-REVERT (call-site WIRING pin): the permit-side RT_FLOW
-/// SESSION_CREATE / SESSION_CLOSE application id is resolved INSIDE
-/// `flush_session_deltas` via `AppCatalog::lookup_admitted`, which substitutes
-/// the post-NAT (DNAT-rewritten) destination port for the forward service slot.
-/// The helper-level test (`app_catalog_lookup_admitted_uses_post_nat_dst_port`)
-/// proves `lookup_admitted` in isolation; this drives the PRODUCTION drain loop
-/// end to end against a port-forwarded session and decodes the emitted RT_FLOW
-/// frames, so reverting EITHER session_delta.rs call site back to
-/// `lookup_directional` (dropping the `rewrite_dst_port` argument) makes the
-/// stamped `application_id` resolve UNKNOWN(0) from the pre-NAT public port and
-/// the assertions below go red.
+/// #12191 / #3416 end-to-end: create and close RT_FLOW records resolve AppID
+/// from the live catalog using the post-NAT destination port. The fixture
+/// emits SESSION_CREATE while A owns the post-NAT TCP/22 tuple, then redefines
+/// the catalog so A moves to 8443 and B owns TCP/22 before SESSION_CLOSE. The
+/// emitted labels must therefore be A then B while retaining the same stable
+/// session ID. Driving the production drain loop also makes reverting either
+/// call site to pre-NAT `lookup_directional` resolve UNKNOWN(0).
 #[test]
-fn flush_session_deltas_rt_flow_app_id_uses_post_nat_dst_port() {
+fn flush_session_deltas_rt_flow_app_id_tracks_redefinition_by_session_id_12191() {
     // junos-ssh stand-in: app_id 22 on TCP/22 (the INTERNAL/post-NAT port).
     // Nothing is registered on the PUBLIC :2222, so a pre-NAT resolution yields
     // UNKNOWN(0) — exactly the #3416 mislabel the wiring must avoid.
     const JUNOS_SSH: u16 = 22;
+    const OTHER_APP: u16 = 23;
+    const SESSION_ID: u64 = 0x0001_0000_0000_0001;
     let mut forwarding = ForwardingState::default();
     forwarding.app_catalog = crate::policy::AppCatalog::from_snapshot(&[crate::AppCatalogEntry {
         app_id: JUNOS_SSH,
@@ -10159,8 +10157,8 @@ fn flush_session_deltas_rt_flow_app_id_uses_post_nat_dst_port() {
         dst_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
         src_port: 51000,
         dst_port: 2222,
-            discriminator: Default::default(),
-            routing_domain: 0,
+        discriminator: Default::default(),
+        routing_domain: 0,
     };
     let mut decision = test_decision();
     decision.nat.rewrite_dst = Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10)));
@@ -10170,23 +10168,27 @@ fn flush_session_deltas_rt_flow_app_id_uses_post_nat_dst_port() {
     // log selection; SESSION_CLOSE always emits.
     metadata.log_session_init = true;
 
-    let make_delta = |kind| SessionDelta { provenance: crate::session::ExportProvenance::Incremental, kind,
-    key: key.clone(),
-    decision,
-    metadata: metadata.clone(),
-    policy_generation: 41,
-    origin: SessionOrigin::ForwardFlow,
-    fabric_redirect_sync: false,
-    created_ns: 0,
-    last_seen_ns: 0,
-    counters: crate::session::SessionCounters::default(),
-    observed_tos: 0,
-    observed_tcp_flags: 0,
-    session_id: 0,
-    bulk_resync: false,
-    tcp_close_class: 0,
-    tcp_handshake_state: 0,
-    purge_retirement: false, source_nat_static: None };
+    let make_delta = |kind| SessionDelta {
+        provenance: crate::session::ExportProvenance::Incremental,
+        kind,
+        key: key.clone(),
+        decision,
+        metadata: metadata.clone(),
+        policy_generation: 41,
+        origin: SessionOrigin::ForwardFlow,
+        fabric_redirect_sync: false,
+        created_ns: 0,
+        last_seen_ns: 0,
+        counters: crate::session::SessionCounters::default(),
+        observed_tos: 0,
+        observed_tcp_flags: 0,
+        session_id: SESSION_ID,
+        bulk_resync: false,
+        tcp_close_class: 0,
+        tcp_handshake_state: 0,
+        purge_retirement: false,
+        source_nat_static: None,
+    };
 
     // Drive the production drain loop and return the stamped application_id off
     // the emitted RT_FLOW frame. `want_event_type` is the RT_FLOW event-type
@@ -10198,84 +10200,111 @@ fn flush_session_deltas_rt_flow_app_id_uses_post_nat_dst_port() {
     // deny/screen/filter kinds (`from_rt_flow_event_type` rejects the session
     // event types), so app_id is read from the payload [132:134] slot directly,
     // exactly as the codec/Go side reads it.
-    let stamped_app = |delta: SessionDelta, want_event_type: u8| -> u16 {
-        let want_policy_generation = delta.policy_generation;
-        let (handle, rx) = crate::event_stream::test_worker_handle(
-            8,
-            // Unlimited (events_per_second == 0) — the proven RT_FLOW-emit test
-            // harness config; the default carries a real per-bucket rate limit.
-            crate::event_stream::DataplaneEventRateLimitConfig {
-                events_per_second: 0,
-                burst: 0,
-            },
-        );
-        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
-        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
-        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
-        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
-        let recent_session_deltas = Arc::new(Mutex::new(VecDeque::new()));
-        let peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = Vec::new();
-        let ident = BindingIdentity {
-            slot: 0,
-            queue_id: 0,
-            worker_id: 0,
-            interface: Arc::<str>::from("ge-0-0-2"),
-            ifindex: 7,
+    let stamped_app =
+        |forwarding: &ForwardingState, delta: SessionDelta, want_event_type: u8| -> (u16, u64) {
+            let want_policy_generation = delta.policy_generation;
+            let (handle, rx) = crate::event_stream::test_worker_handle(
+                8,
+                // Unlimited (events_per_second == 0) — the proven RT_FLOW-emit test
+                // harness config; the default carries a real per-bucket rate limit.
+                crate::event_stream::DataplaneEventRateLimitConfig {
+                    events_per_second: 0,
+                    burst: 0,
+                },
+            );
+            let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+            let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+            let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+            let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+            let recent_session_deltas = Arc::new(Mutex::new(VecDeque::new()));
+            let peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = Vec::new();
+            let ident = BindingIdentity {
+                slot: 0,
+                queue_id: 0,
+                worker_id: 0,
+                interface: Arc::<str>::from("ge-0-0-2"),
+                ifindex: 7,
+            };
+            let dnat_fds = crate::afxdp::checksum::DnatTableFds::default();
+            let mut worker_lossless_wedged = false;
+            let __r3_channel = crate::afxdp::types::RuntimeViewChannel::default();
+            let __r3_reader = __r3_channel.reader();
+            flush_session_deltas(
+                &ident,
+                None,
+                SteeringMap::unshared_for_test(-1),
+                -1,
+                -1,
+                &dnat_fds,
+                &[delta],
+                &shared_sessions,
+                &shared_nat_sessions,
+                &shared_forward_wire_sessions,
+                &shared_owner_rg_indexes,
+                &recent_session_deltas,
+                &peer_worker_commands,
+                crate::afxdp::empty_worker_commands_by_id(),
+                &Some(handle),
+                forwarding,
+                &__r3_reader,
+                &mut worker_lossless_wedged,
+                None,
+            );
+            let frames: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            let payload = frames
+                .iter()
+                .find_map(|f| f.dataplane_event_payload())
+                .expect("an RT_FLOW dataplane-event frame on the channel");
+            assert_eq!(
+                payload[52], want_event_type,
+                "RT_FLOW frame must carry the expected session event type at [52]"
+            );
+            assert_eq!(
+                u64::from_le_bytes(payload[160..168].try_into().unwrap()),
+                want_policy_generation,
+                "RT_FLOW session frame must keep the generation paired with its policy ID"
+            );
+            (
+                u16::from_le_bytes([payload[132], payload[133]]),
+                u64::from_le_bytes(payload[152..160].try_into().unwrap()),
+            )
         };
-        let dnat_fds = crate::afxdp::checksum::DnatTableFds::default();
-        let mut worker_lossless_wedged = false;
-        let __r3_channel = crate::afxdp::types::RuntimeViewChannel::default();
-        let __r3_reader = __r3_channel.reader();
-        flush_session_deltas(
-            &ident,
-            None,
-            SteeringMap::unshared_for_test(-1),
-            -1,
-            -1,
-            &dnat_fds,
-            &[delta],
-            &shared_sessions,
-            &shared_nat_sessions,
-            &shared_forward_wire_sessions,
-            &shared_owner_rg_indexes,
-            &recent_session_deltas,
-            &peer_worker_commands,
-            crate::afxdp::empty_worker_commands_by_id(),
-            &Some(handle),
-            &forwarding,
-            &__r3_reader,
-            &mut worker_lossless_wedged,
-            None,
-        );
-        let frames: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
-        let payload = frames
-            .iter()
-            .find_map(|f| f.dataplane_event_payload())
-            .expect("an RT_FLOW dataplane-event frame on the channel");
-        assert_eq!(
-            payload[52], want_event_type,
-            "RT_FLOW frame must carry the expected session event type at [52]"
-        );
-        assert_eq!(
-            u64::from_le_bytes(payload[160..168].try_into().unwrap()),
-            want_policy_generation,
-            "RT_FLOW session frame must keep the generation paired with its policy ID"
-        );
-        u16::from_le_bytes([payload[132], payload[133]])
-    };
 
+    let (create_app_id, create_session_id) =
+        stamped_app(&forwarding, make_delta(SessionDeltaKind::Open), 1);
     assert_eq!(
-        stamped_app(make_delta(SessionDeltaKind::Open), 1),
-        JUNOS_SSH,
-        "SESSION_CREATE RT_FLOW must stamp the post-NAT app (junos-ssh/22), \
-         not UNKNOWN(0) resolved from the pre-NAT public :2222"
+        create_app_id, JUNOS_SSH,
+        "SESSION_CREATE must resolve A from the post-NAT destination port"
     );
+    assert_eq!(create_session_id, SESSION_ID);
+
+    // AppID redefinition is live while the admitted session survives: A moves
+    // off the post-NAT TCP/22 tuple and B takes its place.
+    forwarding.app_catalog = crate::policy::AppCatalog::from_snapshot(&[
+        crate::AppCatalogEntry {
+            app_id: JUNOS_SSH,
+            protocol: PROTO_TCP,
+            dst_port_low: 8443,
+            dst_port_high: 8443,
+            src_port_low: 0,
+            src_port_high: 0,
+        },
+        crate::AppCatalogEntry {
+            app_id: OTHER_APP,
+            protocol: PROTO_TCP,
+            dst_port_low: 22,
+            dst_port_high: 22,
+            src_port_low: 0,
+            src_port_high: 0,
+        },
+    ]);
+    let (close_app_id, close_session_id) =
+        stamped_app(&forwarding, make_delta(SessionDeltaKind::Close), 2);
     assert_eq!(
-        stamped_app(make_delta(SessionDeltaKind::Close), 2),
-        JUNOS_SSH,
-        "SESSION_CLOSE RT_FLOW must stamp the post-NAT app (junos-ssh/22), \
-         not UNKNOWN(0) resolved from the pre-NAT public :2222"
+        close_app_id, OTHER_APP,
+        "SESSION_CLOSE must resolve B from the live catalog and post-NAT port"
     );
+    assert_eq!(close_session_id, create_session_id);
 }
 
 #[test]

@@ -41,8 +41,8 @@ use crate::session::{SessionDecision, SessionKey, SessionMetadata, SessionOrigin
 use crate::tcp_flags::{TCP_ACK, TCP_SYN};
 use crate::test_zone_ids::*;
 use crate::{
-    FirewallFilterSnapshot, FirewallTermSnapshot, InterfaceSnapshot, NatAppTermWire,
-    NeighborSnapshot, PolicyRuleSnapshot, RouteSnapshot, SourceNATRuleSnapshot,
+    AppCatalogEntry, FirewallFilterSnapshot, FirewallTermSnapshot, InterfaceSnapshot,
+    NatAppTermWire, NeighborSnapshot, PolicyRuleSnapshot, RouteSnapshot, SourceNATRuleSnapshot,
     StaticNATRuleSnapshot,
 };
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -2291,6 +2291,158 @@ fn dnat_frames() -> (Vec<u8>, UserspaceDpMeta, Vec<u8>, UserspaceDpMeta) {
     );
     let meta_ack = txn_meta_v4(WAN_INGRESS_IFINDEX as u32, TCP_ACK, ack.len() as u16);
     (syn, meta_syn, ack, meta_ack)
+}
+
+/// #12191: exercise the conntrack refresh through the real descriptor call
+/// site. The DNAT service is :443 -> :8443; a competing :443 catalog entry
+/// makes losing the forward NAT rewrite observable.
+#[test]
+fn descriptor_path_stale_dnat_hit_restamps_conntrack_app_id_12191() {
+    let _publish_guard = crate::afxdp::bpf_map::take_conntrack_publish_guard();
+    crate::afxdp::bpf_map::clear_conntrack_rows_for_test();
+    use crate::policy::AppCatalog;
+    let entry = |app_id, port| AppCatalogEntry {
+        app_id,
+        protocol: crate::ip_proto::PROTO_TCP,
+        dst_port_low: port,
+        dst_port_high: port,
+        ..Default::default()
+    };
+    let catalog1 = AppCatalog::from_snapshot(&[entry(11, 8443), entry(33, 443)]);
+    let mut snapshot = inbound_dnat_snapshot(wan_to_lan_permit(DNAT_REAL, "permit-internal"));
+    snapshot.app_catalog = vec![entry(22, 8443), entry(33, 443)];
+    let forwarding = build_forwarding_state(&snapshot);
+    let key = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: crate::ip_proto::PROTO_TCP,
+        src_ip: IpAddr::V4(DNAT_CLIENT),
+        dst_ip: IpAddr::V4(DNAT_VIP),
+        src_port: 54_321,
+        dst_port: 443,
+        discriminator: crate::session::TunnelDiscriminator::None,
+        routing_domain: 0,
+    };
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: LAN_IFINDEX,
+            tx_ifindex: LAN_IFINDEX,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 61, 102))),
+            neighbor_mac: Some([0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x01]),
+            src_mac: None,
+            tx_vlan_id: 0,
+            route_mtu: 0,
+            transport_route_mtu: 0,
+        },
+        nat: NatDecision {
+            rewrite_dst: Some(IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 61, 102))),
+            rewrite_dst_port: Some(8443),
+            ..NatDecision::default()
+        },
+        install_table_domain: 0,
+        install_table_check: 0,
+    };
+    let metadata = SessionMetadata {
+        ingress_zone: TEST_WAN_ZONE_ID,
+        egress_zone: TEST_LAN_ZONE_ID,
+        ingress_zone_check: 0,
+        egress_zone_check: 0,
+        ingress_ifindex: WAN_INGRESS_IFINDEX as u32,
+        ingress_vlan_id: 0,
+        owner_rg_id: 0,
+        fabric_ingress: false,
+        is_reverse: false,
+        nat64_reverse: None,
+        log_session_init: false,
+        log_session_close: false,
+        policy_id: 0,
+        inactivity_timeout_ns: None,
+        policy_counter_idx: 0,
+        policy_counter: None,
+    };
+    let mut sessions = SessionTable::new();
+    assert!(sessions.install_with_protocol_with_origin(
+        key.clone(),
+        decision,
+        metadata.clone(),
+        SessionOrigin::ForwardFlow,
+        1_000_000_000,
+        crate::ip_proto::PROTO_TCP,
+        TCP_ACK,
+    ));
+    sessions.set_policy_revalidation_gen(7);
+    assert!(matches!(
+        sessions.policy_revalidation_target(&key),
+        crate::session::PolicyRevalidationTarget::Stale(_)
+    ));
+    let session_id = sessions.session_id_for(&key);
+    let timeout_secs = sessions.timeout_secs_for(&key);
+    assert_eq!(
+        crate::afxdp::bpf_map::publish_bpf_conntrack_entry(
+            crate::afxdp::bpf_map::CONNTRACK_TEST_MAP_FD,
+            -1,
+            &key,
+            decision,
+            &metadata,
+            &FastMap::default(),
+            0,
+            catalog1.lookup_admitted(
+                key.protocol,
+                key.src_port,
+                key.dst_port,
+                false,
+                decision.nat.rewrite_dst_port,
+            ),
+            session_id,
+            timeout_secs,
+            SessionOrigin::ForwardFlow,
+        ),
+        crate::afxdp::bpf_map::ConntrackPublishResult::Written
+    );
+    let before = crate::afxdp::bpf_map::conntrack_row_for_test(&key)
+        .expect("the fixture publishes the initial forward conntrack row");
+    assert_eq!(
+        before.app_id, 11,
+        "the stored label is the post-DNAT :8443 app"
+    );
+
+    let (_syn, _meta_syn, ack, mut meta_ack) = dnat_frames();
+    meta_ack.config_generation = 8;
+    // #11297: reth0.80 is tagged-only even though this fixture frame is
+    // untagged; the metadata carries the logical VLAN identity.
+    meta_ack.ingress_vlan_id = 80;
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, WAN_INGRESS_IFINDEX, 0);
+    binding.interface = Arc::<str>::from("reth0.80");
+    let (_batch, dbg) = txn_run_descriptor_with_conntrack_fds(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &ack,
+        meta_ack,
+        ValidationState {
+            snapshot_installed: true,
+            config_generation: 8,
+            fib_generation: 9,
+        },
+        crate::afxdp::bpf_map::CONNTRACK_TEST_MAP_FD,
+        -1,
+    );
+    assert_eq!(
+        dbg.session_hit, 1,
+        "the stale ACK must take the descriptor hit path"
+    );
+    assert_eq!(dbg.tx, 1, "a permitted stale hit must continue forwarding");
+    let after = crate::afxdp::bpf_map::conntrack_row_for_test(&key)
+        .expect("stale revalidation must preserve the forward row");
+    assert_eq!(
+        after.app_id, 22,
+        "descriptor revalidation must use post-DNAT :8443 and the v4 fd"
+    );
+    assert_eq!(after.session_id, before.session_id);
 }
 
 /// THE DOMINANT, ORDINARY-OPERATIONS CASE, and it is FAIL-CLOSED. The policy is

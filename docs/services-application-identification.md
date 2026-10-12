@@ -54,11 +54,13 @@ upfront what they're getting and not getting.
 
    The id is a pure function of the NAME (never of the catalog set or
    compile order), so an ordinary catalog edit that inserts an
-   earlier-sorting application no longer renumbers existing
-   applications — a RETAINED session's frozen `app_id` keeps
-   resolving to the application it was stamped under. This replaces
-   the legacy sorted `1..N` positional assignment, whose ids shifted
-   on any such edit and mis-labeled retained sessions (#5296); it is
+   earlier-sorting application does not renumber existing names. A
+   retained conntrack row keeps its stored `app_id` until an eligible
+   stale-session permit re-resolves it from the live catalog; after an
+   application redefinition, that permit can update the row to the
+   newly matching application (or to 0 when there is no match). This
+   replaces the legacy sorted `1..N` positional assignment, whose ids
+   shifted on any such edit and mis-labeled retained sessions (#5296);
    the same name-hash pattern zone ids use (`config.StableZoneID`,
    #3075). Predefined applications are a FIXED, mutually
    collision-free set (frozen by `TestPredefinedAppIDsCollisionFree`)
@@ -141,13 +143,18 @@ upfront what they're getting and not getting.
    > on — decouples identity from precedence but is a cross-language
    > change, tracked as a possible follow-up beyond this bounded fix.
 
-   **Note**: only the local
-   session-owner stamps `app_id` in the conntrack map (the same
-   property as `alg_type`); an HA-synced session on the standby
-   peer is not mirrored into the conntrack map, and a session
-   re-created locally after failover is re-stamped from the
-   catalog (the catalog is shipped to both nodes), so `app_id`
-   is re-derived rather than carried on the session-sync wire.
+   **Stale-permit refresh (#12191):** an eligible local session hit that
+   passes live zone-policy revalidation re-resolves the flow against the
+   current catalog and updates only the canonical forward conntrack
+   row's `app_id`. This is best-effort and packet-driven, not eager:
+   idle sessions remain unchanged until an eligible hit; no refresh is
+   done for `NoLocalEntry`/a lone reverse hit without an authoritative
+   forward companion, type-dependent ICMP, `LocalDelivery`, `Decline`,
+   or the `stored_pair_only` permit path. AppID is not carried on the
+   HA session-sync wire. An HA-imported local row published with
+   `app_id == 0` (`UNKNOWN`) receives a current label after its first
+   eligible local stale-permit hit following failover, so show/clear
+   application filters can change for that flow at that point.
 4. **Show output**:
    `pkg/appid/runtime.go:ResolveSessionName` resolves the
    `app_id` back to a name via the `compiler.go` `AppNames`
