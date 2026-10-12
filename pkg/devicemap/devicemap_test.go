@@ -218,6 +218,53 @@ func TestResolveMovedOriginalCardStillRefusesSlotSwap(t *testing.T) {
 	}
 }
 
+func TestResolveRETHPinnedMACSlotSwapRefusesViaPCIArm(t *testing.T) {
+	// #12206: precheck (b) skips RETH members, so for an admitted PCI-keyed
+	// RETH entry that pins a MAC the in-loop PCI cross-check is the SOLE
+	// card-swap refusal — the twin's distinct oracle.
+	moved := []PresentNIC{
+		nic("enp9s0", "0000:09:00.0", "de:ad:be:ef:00:01"),
+		nic("enp10s0", "0000:0a:00.0", "00:11:22:33:44:55"),
+	}
+	gone := []PresentNIC{
+		nic("enp9s0", "0000:09:00.0", "de:ad:be:ef:00:01"),
+	}
+	reth := map[string]bool{"ge-0/0/2": true}
+	for _, shape := range []struct {
+		name string
+		nics []PresentNIC
+	}{
+		{name: "moved-card", nics: moved},
+		{name: "gone-card", nics: gone},
+	} {
+		for _, ko := range []string{"", config.DeviceMapKeyPCIThenMAC, config.DeviceMapKeyPCI} {
+			name := ko
+			if name == "" {
+				name = "default"
+			}
+			t.Run(shape.name+"/"+name, func(t *testing.T) {
+				entries := []config.DeviceMapEntry{{LogicalName: "ge-0/0/2", PCIAddr: "0000:09:00.0",
+					MAC: "00:11:22:33:44:55", KeyOrder: ko}}
+				got := Resolve(entries, shape.nics, reth)
+				if got[0].Status != BindRefusedAmbig || got[0].CurrentNIC != "" || got[0].Logical != "" {
+					t.Fatalf("RETH %s key %q slot swap must REFUSE via the PCI arm, got %+v", shape.name, ko, got[0])
+				}
+			})
+		}
+	}
+}
+
+// TestResolveKeyMACGoneCardSlotSwapRefuses pins the other (b)-only shape:
+// `key mac` with the original card GONE (MAC arm misses; PCI arm never runs).
+func TestResolveKeyMACGoneCardSlotSwapRefuses(t *testing.T) {
+	nics := []PresentNIC{nic("enp9s0", "0000:09:00.0", "de:ad:be:ef:00:01")}
+	entries := []config.DeviceMapEntry{{LogicalName: "ge-0/0/3", PCIAddr: "0000:09:00.0",
+		MAC: "00:11:22:33:44:55", KeyOrder: config.DeviceMapKeyMAC}}
+	if got := Resolve(entries, nics, nil); got[0].Status != BindRefusedAmbig {
+		t.Fatalf("key mac gone-card slot swap must REFUSE, got %v", got[0].Status)
+	}
+}
+
 func TestResolveKeyOrderMACThenPCI(t *testing.T) {
 	// mac-then-pci tries MAC first; a MAC hit binds as primary (not flagged
 	// as "via MAC fallback" — MAC IS the primary key here).
