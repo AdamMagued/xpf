@@ -142,16 +142,16 @@ func compilePolicies(node *Node, sec *SecurityConfig) error {
 				}
 				for _, fzSub := range child.Children {
 					if len(child.Keys) == 1 {
+						// #11346 mixed node: only its direct policies lack a
+						// destination. Fall through so policies under a nested
+						// `to-zone` child still compile into their pair below.
 						if to, mixed := keysCarryToZone12231(fzSub); mixed {
 							if len(fzSub.FindChildren("policy")) > 0 {
 								sec.MalformedZonePairs = append(sec.MalformedZonePairs,
-									fmt.Sprintf("from-zone { %s to-zone %s { ... } } mixes the container and keyed zone-pair spellings (#11346); the policy context is skipped and not enforced (#12231)",
-										fzSub.Name(), to))
+									mixedKeyedZonePairError11346(fzSub.Name(), to).Error())
 							}
-							continue
-						}
-						if bodyHasToZoneLessPolicy12231(fzSub) {
-							sec.MalformedZonePairs = append(sec.MalformedZonePairs, toZoneLess12231(fzSub.Name()))
+						} else if bodyHasToZoneLessPolicy12231(fzSub) {
+							sec.MalformedZonePairs = append(sec.MalformedZonePairs, containerToZoneLess12231(fzSub.Name()))
 						}
 					}
 					tzNode := fzSub.FindChild("to-zone")
@@ -742,6 +742,17 @@ func LenientDroppedPolicyLocator(cfg *Config) string {
 
 func toZoneLess12231(from string) string {
 	return fmt.Sprintf("from-zone %q has no to-zone context; the policy context is skipped and not enforced (#12231)", from)
+}
+
+// containerToZoneLess12231 describes a to-zone-less child of the from-zone
+// container. A child spelled `to-zone` is the destination keyword written
+// without a source zone (`from-zone { to-zone { B { ... } } }`), not a source
+// zone named "to-zone".
+func containerToZoneLess12231(from string) string {
+	if from == "to-zone" {
+		return "from-zone container has no source zone before to-zone; the policy context is skipped and not enforced (#12231)"
+	}
+	return toZoneLess12231(from)
 }
 
 // bodyHasToZoneLessPolicy12231 reports whether ctx carries a policy without a

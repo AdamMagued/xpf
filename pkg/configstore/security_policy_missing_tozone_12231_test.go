@@ -131,6 +131,40 @@ func TestStoreLoadPoisonsToZoneLessShapes12231(t *testing.T) {
 	}
 }
 
+func TestStoreLoadKeepsNestedDenyUnderMixedNode12231(t *testing.T) {
+	deny := `policy p1 { match { source-address any; destination-address any; application any; } then { deny; } }`
+	tree, errs := config.NewParser(securityPolicyShapeText12231(`from-zone { A to-zone B { to-zone { B { ` + deny + ` } } } }`)).Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse X03 shape: %v", errs)
+	}
+	store := newTestStoreAt(t, filepath.Join(t.TempDir(), "xpf.conf"))
+	if err := store.db.WriteActive(tree); err != nil {
+		t.Fatalf("write active config: %v", err)
+	}
+	if err := store.Load(); err != nil {
+		t.Fatalf("Store.Load must remain bootable: %v", err)
+	}
+	active := store.ActiveConfig()
+	if active == nil {
+		t.Fatal("ActiveConfig is nil after Store.Load")
+	}
+	if len(active.Security.Policies) != 1 {
+		t.Fatalf("Store.Load installed %d zone pairs, want the nested A->B deny", len(active.Security.Policies))
+	}
+	pair := active.Security.Policies[0]
+	if pair.FromZone != "A" || pair.ToZone != "B" || len(pair.Policies) != 1 ||
+		pair.Policies[0].Name != "p1" || pair.Policies[0].Action != config.PolicyDeny || pair.Policies[0].LenientContentDropped {
+		t.Fatalf("Store.Load dropped the nested deny under the mixed node: %+v", pair)
+	}
+	if len(active.Security.MalformedZonePairs) != 0 || config.LenientDroppedPolicyLocator(active) != "" {
+		t.Fatalf("enforced nested deny was poisoned: malformed=%q poison=%q",
+			active.Security.MalformedZonePairs, config.LenientDroppedPolicyLocator(active))
+	}
+	if !strings.Contains(strings.Join(active.Warnings, "\n"), "#11346") {
+		t.Fatalf("Store.Load lost the mixed-shape warning: %q", active.Warnings)
+	}
+}
+
 func TestCheckTextReports11346BeforeOtherPolicyDiagnostics12231(t *testing.T) {
 	deny := `policy p1 { match { source-address any; destination-address any; application any; } then { deny; } }`
 	text := securityPolicyShapeText12231(`from-zone { A to-zone B { ` + deny + ` } }`)
@@ -139,13 +173,16 @@ func TestCheckTextReports11346BeforeOtherPolicyDiagnostics12231(t *testing.T) {
 		t.Fatal("CheckText accepted the mixed container/keyed zone-pair spelling")
 	}
 	message := err.Error()
-	if !strings.HasPrefix(strings.ToLower(message), "commit check failed: security policies from-zone") {
-		t.Fatalf("CheckText first-error slot does not contain the mixed-zone diagnostic: %q", message)
+	if !strings.HasPrefix(strings.ToLower(message), "commit check failed: security policies contain a mixed zone-pair brace spelling:") {
+		t.Fatalf("CheckText first-error slot does not contain the shared mixed-zone diagnostic: %q", message)
 	}
-	for _, want := range []string{"commit check failed", "#11346", "mixes", "to-zone B"} {
-		if !strings.Contains(strings.ToLower(message), strings.ToLower(want)) {
+	for _, want := range []string{"commit check failed", "#11346", "MIXED", "to-zone B", "Write the combined", "fully nested"} {
+		if !strings.Contains(message, want) {
 			t.Errorf("CheckText first error %q does not contain %q", message, want)
 		}
+	}
+	if strings.Contains(message, "security policies security policies") {
+		t.Fatalf("CheckText duplicated the shared mixed-shape prefix: %q", message)
 	}
 	if strings.Contains(message, "no to-zone context") {
 		t.Fatalf("CheckText reported the wrong #12231 diagnostic before #11346: %q", message)

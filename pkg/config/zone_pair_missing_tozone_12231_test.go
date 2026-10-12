@@ -210,3 +210,107 @@ func TestToZoneLessFromZoneControlsRemainClean12231(t *testing.T) {
 		})
 	}
 }
+
+func TestMixedZonePairTolerantContent12231(t *testing.T) {
+	deny := `policy p1 { match { source-address any; destination-address any; application any; } then { deny; } }`
+	ok := `policy ok { match { source-address any; destination-address any; application any; } then { permit; } }`
+	for _, tc := range []struct {
+		name       string
+		fromZone   string
+		wantFrom   string
+		wantTo     string
+		wantPolicy string
+		wantAction PolicyAction
+		wantPoison bool
+	}{
+		{"X03-keys-carry-nested-to-zone", `from-zone { A to-zone B { to-zone { B { ` + deny + ` } } } }`, "A", "B", "p1", PolicyDeny, false},
+		{"M8-policy-less-mixed", `from-zone { A to-zone B; }`, "", "", "", PolicyDeny, false},
+		{"S07-mixed-direct-policy", `from-zone { A to-zone B { ` + deny + ` } }`, "", "", "", PolicyDeny, true},
+		{"X15-mixed-and-valid-sibling", `from-zone { A to-zone B { ` + deny + ` } B { to-zone { A { ` + ok + ` } } } }`, "B", "A", "ok", PolicyPermit, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tree := toZoneLessShapeTree12231(t, tc.fromZone)
+			if _, err := CompileConfig(tree); err == nil || !strings.Contains(err.Error(), "#11346") {
+				t.Fatalf("strict mixed-shape diagnostic = %v, want #11346", err)
+			}
+			cfg, err := CompileConfigLenient(tree)
+			if err != nil {
+				t.Fatalf("tolerant mixed shape must remain bootable: %v", err)
+			}
+			wantPairs := 0
+			if tc.wantPolicy != "" {
+				wantPairs = 1
+			}
+			if got := len(cfg.Security.Policies); got != wantPairs {
+				t.Fatalf("compiled zone-pair count=%d, want %d", got, wantPairs)
+			}
+			if wantPairs != 0 {
+				pair := cfg.Security.Policies[0]
+				if pair.FromZone != tc.wantFrom || pair.ToZone != tc.wantTo || len(pair.Policies) != 1 {
+					t.Fatalf("compiled pair = %+v, want %s->%s(1)", pair, tc.wantFrom, tc.wantTo)
+				}
+				policy := pair.Policies[0]
+				if policy.Name != tc.wantPolicy || policy.Action != tc.wantAction || policy.LenientContentDropped {
+					t.Fatalf("compiled policy = %+v, want enforceable %s action %v", policy, tc.wantPolicy, tc.wantAction)
+				}
+			}
+			wantRecords := 0
+			if tc.wantPoison {
+				wantRecords = 1
+			}
+			if len(cfg.Security.MalformedZonePairs) != wantRecords || (LenientDroppedPolicyLocator(cfg) != "") != tc.wantPoison {
+				t.Fatalf("malformed=%q poison=%q, want records=%d poison=%v",
+					cfg.Security.MalformedZonePairs, LenientDroppedPolicyLocator(cfg), wantRecords, tc.wantPoison)
+			}
+			if tc.wantPoison {
+				want := mixedKeyedZonePairError11346("A", "B").Error()
+				if cfg.Security.MalformedZonePairs[0] != want {
+					t.Fatalf("mixed diagnostic = %q, want shared remediation %q", cfg.Security.MalformedZonePairs[0], want)
+				}
+			}
+			warnings := strings.Join(cfg.Warnings, "\n")
+			if !strings.Contains(warnings, "#11346") {
+				t.Fatalf("mixed-shape warning lost: %q", cfg.Warnings)
+			}
+			if strings.Contains(warnings, "security policies security policies") {
+				t.Fatalf("mixed-shape warning duplicated the shared prefix: %q", cfg.Warnings)
+			}
+			if tc.wantPoison && !strings.Contains(warnings, mixedKeyedZonePairError11346("A", "B").Error()+" (downgraded to warning on tolerant path") {
+				t.Fatalf("tolerant warning does not carry the shared mixed-shape diagnostic: %q", cfg.Warnings)
+			}
+		})
+	}
+}
+
+func TestToZoneLessSourceLessContainerDiagnostic12231(t *testing.T) {
+	deny := `policy p1 { match { source-address any; destination-address any; application any; } then { deny; } }`
+	for _, tc := range []struct {
+		name     string
+		fromZone string
+	}{
+		{"X02-container-to-zone-no-source", `from-zone { to-zone { B { ` + deny + ` } } }`},
+		{"X02-keyed-to-zone-no-source", `from-zone { to-zone B { ` + deny + ` } }`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tree := toZoneLessShapeTree12231(t, tc.fromZone)
+			_, strictErr := CompileConfig(tree)
+			if strictErr == nil {
+				t.Fatal("source-less container accepted by bare CompileConfig")
+			}
+			cfg, err := CompileConfigLenient(tree)
+			if err != nil {
+				t.Fatalf("tolerant source-less container must remain bootable: %v", err)
+			}
+			if len(cfg.Security.Policies) != 0 || len(cfg.Security.MalformedZonePairs) != 1 || LenientDroppedPolicyLocator(cfg) == "" {
+				t.Fatalf("source-less policy was not quarantined: pairs=%v malformed=%q poison=%q",
+					cfg.Security.Policies, cfg.Security.MalformedZonePairs, LenientDroppedPolicyLocator(cfg))
+			}
+			for _, message := range []string{strictErr.Error(), cfg.Security.MalformedZonePairs[0]} {
+				if strings.Contains(message, `from-zone "to-zone"`) || strings.Contains(message, "no to-zone context") ||
+					!strings.Contains(message, "has no source zone before to-zone") || !strings.Contains(message, "#12231") {
+					t.Fatalf("X02 diagnostic does not report the missing source zone: %q", message)
+				}
+			}
+		})
+	}
+}

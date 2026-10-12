@@ -1,6 +1,9 @@
 package config
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // runUniformGatesPolicy runs the policy sub-run of the P6b uniform
 // fail-open gate phase. It is a verbatim contiguous slice of the
@@ -49,19 +52,27 @@ func runUniformGatesPolicy(tree *ConfigTree, cfg *Config, opts compileOpts) erro
 	// win the first-error slot before a zone-reference error.
 	// #9246 records bracketed zone lists before the undefined-zone gate so a
 	// shifted literal "to-zone" cannot hide the malformed shape. #12231 adds
-	// active from-zone policy contexts without a destination; #11346 adds the
-	// mixed container/keyed spelling whose destination is carried in node keys.
-	// Neither malformed form is expanded into guessed zone-pair rules on
-	// tolerant loads. Instead, a poison carrier uses the existing
-	// LenientContentDropped lowering: the userspace snapshot builder emits the
-	// __unsupported__ application sentinel and the helper rejects the whole
-	// snapshot rather than letting traffic fall through to a global/default permit.
+	// active from-zone policy contexts without a destination, and also records
+	// the #11346 mixed container/keyed spelling whose destination is carried in
+	// node keys. None of these three malformed forms is expanded into guessed
+	// zone-pair rules on tolerant loads. Instead, a poison carrier uses the
+	// existing LenientContentDropped lowering: the userspace snapshot builder
+	// emits the __unsupported__ application sentinel and the helper rejects
+	// the whole snapshot rather than letting traffic fall through to a
+	// global/default permit.
 	if len(cfg.Security.MalformedZonePairs) > 0 {
-		err := fmt.Errorf("security policies %s", cfg.Security.MalformedZonePairs[0])
+		message := cfg.Security.MalformedZonePairs[0]
+		if !strings.HasPrefix(message, "security policies ") {
+			message = "security policies " + message
+		}
+		err := fmt.Errorf("%s", message)
 		if opts.lenientPolicyZoneRefs {
 			for _, m := range cfg.Security.MalformedZonePairs {
+				if !strings.HasPrefix(m, "security policies ") {
+					m = "security policies " + m
+				}
 				cfg.Warnings = append(cfg.Warnings,
-					fmt.Sprintf("security policies %s (downgraded to warning on tolerant path; this context is not enforced and the userspace policy snapshot is refused)", m))
+					fmt.Sprintf("%s (downgraded to warning on tolerant path; this context is not enforced and the userspace policy snapshot is refused)", m))
 			}
 			// The malformed source was skipped before compilePolicy could
 			// produce an object to flag. Keep this carrier after authored global
