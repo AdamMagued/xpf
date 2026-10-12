@@ -205,6 +205,7 @@ use self::checksum::*;
 use self::event_emit::*;
 use self::flow_cache::*;
 use self::forwarding::*;
+pub(crate) use self::forwarding_build::neighbor_family_mismatch;
 use self::forwarding_build::*;
 use self::frame::*;
 use self::gre::{encapsulate_native_gre_frame, try_native_gre_decap_from_frame};
