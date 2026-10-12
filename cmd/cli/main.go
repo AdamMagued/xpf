@@ -714,12 +714,12 @@ func (c *ctl) handleTest(args []string) error {
 func (c *ctl) testPolicy(args []string) error {
 	// #3696: parse the selector grammar through the single strict SSOT parser
 	// (policymatch.ParseSelectorArgs) shared by all four CLI surfaces + the gRPC
-	// test-policy bridge. A value-taking selector present WITHOUT a value, an
-	// UNKNOWN selector token, an explicit-empty typed value, and a malformed
-	// IP / port / protocol / icmp value are HARD ERRORS instead of silently
-	// degrading to the wildcard — the remote CLI no longer builds a
-	// silently-widened test-policy topic. Per-value validation (#3116 / #3108 /
-	// #3284 / #1711) now lives in the parser.
+	// test-policy bridge. A value-taking selector with no value, an unknown
+	// selector token, an explicit-empty typed value, and a malformed IP / port /
+	// protocol / ICMP value are hard errors; they cannot silently become an
+	// omitted (unspecified) selector. The remote CLI returns the parse error
+	// rather than sending a test-policy topic with that selector omitted.
+	// Per-value validation (#3116 / #3108 / #3284 / #1711) lives in the parser.
 	sel, err := policymatch.ParseSelectorArgs(args)
 	if err != nil {
 		return err

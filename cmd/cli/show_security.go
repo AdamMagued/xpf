@@ -543,10 +543,11 @@ func (c *ctl) showMatchPolicies(args []string) error {
 	// (policymatch.ParseSelectorArgs) shared by the local CLI, the remote CLI,
 	// and the gRPC test-policy bridge. A value-taking selector present WITHOUT a
 	// value, an UNKNOWN selector token, an explicit-empty typed value, and a
-	// malformed IP / port / protocol / icmp value are all HARD ERRORS — the
-	// remote CLI no longer forwards a silently-widened query to the typed
-	// MatchPolicies RPC. Per-value validation (#3354 / #3108 / #3284 / #1711)
-	// now lives in the parser, so this surface fails closed before any RPC.
+	// malformed IP / port / protocol / ICMP value are hard errors; they cannot
+	// silently become an omitted (unspecified) selector. The remote CLI returns
+	// the parse error rather than sending a MatchPolicies RPC with that selector
+	// omitted. Per-value validation (#3354 / #3108 / #3284 / #1711) lives in the
+	// parser, so this surface fails closed before any RPC.
 	sel, err := policymatch.ParseSelectorArgs(args)
 	if err != nil {
 		return err

@@ -26,6 +26,11 @@ func TestMatchPoliciesUsageAdvertisesAllSelectors(t *testing.T) {
 		"protocol", "number", // protocol accepts a name OR a 0-255 number
 		"icmp-type", "icmp-code",
 		"icmp6", // an ICMPv6 example, not just tcp|udp
+		"omitted source/destination IP matches", "any address.",
+		"An omitted protocol, port, or icmp-type/code never matches",
+		"a term constrained on that dimension; unconstrained terms may match.",
+		"A verdict for a partly specified query is not exhaustive — a skipped",
+		"deny can let a later permit match.",
 	}
 
 	surfaces := map[string]string{

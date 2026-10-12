@@ -748,20 +748,20 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// #5316: reject an UNKNOWN / misspelled selector key (fail closed). The
-	// handler reads ONLY matchPoliciesSelectorKeys; any other key is never
-	// examined, so a typo such as `protcol` for `protocol` silently degrades
-	// that dimension to the wildcard-any default — q.Get("protocol") returns
-	// "" — and the shared simulator can certify a broad PERMIT for a packet
-	// class the caller never intended to test. That is a FAIL-OPEN on a
-	// security-verification endpoint. Enumerate every key the caller supplied
-	// and 400 any that is not in the selector allowlist, naming the offender.
+	// handler reads ONLY matchPoliciesSelectorKeys, so a typo such as `protcol`
+	// for `protocol` would otherwise silently become an omitted (unspecified)
+	// selector (`q.Get("protocol")` returns ""). The shared simulator may then
+	// report a broad PERMIT for a packet class the caller never intended to test.
+	// That is a FAIL-OPEN on a security-verification endpoint. Enumerate every
+	// key the caller supplied and 400 any that is not in the selector allowlist.
 	// The allowlist is the SAME slice the reads use, so adding a selector later
-	// cannot re-open the gap. Absent keys are unchanged: an unspecified
-	// dimension is still the intentional match-any wildcard — only UNKNOWN keys
-	// are rejected, not missing ones. Reached AFTER the duplicate check so a
-	// repeated known selector still surfaces its #3709 duplicate error, and
-	// (like the checks above) BEFORE the cfg == nil verdict so the boot window
-	// rejects an unknown key identically to the config-present path.
+	// cannot re-open the gap. Absent keys stay unspecified: an omitted IP matches
+	// any address, while an omitted protocol/port/ICMP value never matches a term
+	// constrained on it (#12227). Only UNKNOWN keys are rejected, not missing
+	// ones. Reached AFTER the duplicate check so a repeated known selector still
+	// surfaces its #3709 duplicate error, and (like the checks above) BEFORE the
+	// cfg == nil verdict so the boot window rejects an unknown key identically to
+	// the config-present path.
 	var unknown []string
 	for key := range q {
 		if !isMatchPoliciesSelector(key) {
@@ -806,12 +806,12 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 
 	srcIP := net.ParseIP(srcIPStr)
 	dstIP := net.ParseIP(dstIPStr)
-	// A malformed dst_port/src_port must not silently become 0 (the "any
-	// port" wildcard) — that yields a misleading PERMIT/DENY verdict in the
-	// simulator (#2934). Fail closed with 400. queryIntStrict rejects
-	// malformed/negative values; policymatch.ValidatePort additionally
-	// rejects an out-of-range port (>65535) that cannot describe a real
-	// packet (#3116). 0/absent stays the unspecified wildcard.
+	// A malformed dst_port/src_port must not silently become 0 (unspecified):
+	// a port-constrained term would then never match, while an unconstrained term
+	// could still match and yield a misleading verdict (#2934). Fail closed with
+	// 400. queryIntStrict rejects malformed/negative values;
+	// policymatch.ValidatePort additionally rejects an out-of-range port (>65535)
+	// that cannot describe a real packet (#3116). An absent/0 port is unspecified.
 	dstPort, ok := queryIntStrict(r, "dst_port", 0)
 	if !ok {
 		writeError(w, http.StatusBadRequest, "invalid dst_port: "+r.URL.Query().Get("dst_port"))
@@ -831,11 +831,10 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// A non-empty but unknown/out-of-range protocol token (e.g. "tcpp", "999")
-	// must NOT silently become "any protocol" — the shared matcher's matchApp
-	// short-circuits to match-any for an empty/unresolvable protocol, yielding a
-	// misleading PERMIT/DENY verdict for a policy using `application any`
-	// (#3108). Reject it with 400. An empty value still means "unspecified"
-	// (match any protocol), unchanged.
+	// must NOT silently become unspecified: constrained terms would never match,
+	// but `application any` could still match and conceal invalid input (#3108).
+	// Reject it with 400. An empty value leaves the query protocol unspecified;
+	// constrained terms never match, while unconstrained terms may still match.
 	proto := r.URL.Query().Get("protocol")
 	if err := policymatch.ValidateProtocol(proto); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
