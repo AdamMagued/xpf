@@ -173,15 +173,27 @@ yet. Here is what is true today:
   closing the gap bought far less than the theory predicted, and the spread
   between two identical runs is a third of what is left. Tracked as #9484.
 
-  The gate now has the third case it was missing, beside peer LOSS and cold
-  BOOT: a peer that is ALIVE and reports NON-OWNERSHIP — `secondary-hold` (an
-  explicit transfer-out) or weight 0 (a resignation, which election forces to
-  secondary unconditionally). That case fails OPEN like peer loss, because the
-  cold-boot argument does not apply (there IS established forwarding and it stops
-  when the peer steps down) and there is no split-brain to weigh against it (the
-  peer is not claiming the RG). A peer that is merely SECONDARY with weight > 0
-  still HOLDS — that is the cold-boot shape. The promotion is marked
-  `DegradedPromoted` and names its reason in the RG event history.
+  The gate now recognizes a third reported shape beside peer LOSS and cold
+  BOOT: a live peer that reports NON-OWNERSHIP — `secondary-hold` (explicit
+  transfer-out) or weight 0. An explicitly zero-weight peer is forced to
+  SECONDARY by election. A kernel-upgrade-held peer instead advertises weight
+  0 as a wire clamp without changing its local weight, so the receiver cannot
+  infer why the peer reports zero from this field alone.
+
+  For explicit non-ownership, the cold-boot argument does not apply:
+  established forwarding stops when the peer steps down. A SECONDARY/weight-1
+  peer with observed PRIMARY history in its current session is also a yielded
+  shape (#12164), so a not-ready receiver may promote DEGRADED. Without that
+  history, SECONDARY/weight-1 remains the cold-boot shape and the gate holds.
+  The held-peer weight-zero shape can also promote a not-ready receiver
+  DEGRADED. These are intentional availability gains over remaining ownerless,
+  despite the receiver's inability to distinguish the hold clamp from
+  resignation. `DegradedPromoted` history says "peer reports weight 0"; it does
+  not claim a held peer chose to resign.
+  After `ClearKernelUpgradeHold`, the not-ready node may keep the RG over a
+  recovered ready peer; clearing the hold does not automatically return
+  ownership. The same keep can follow the two-minute degraded-promotion timeout
+  if the hold lasts longer than that timeout.
 
   **The 30s hold is in contract and was not changed.**
   `daemon_ha_noreth_hold.go` states it releases on its own timer regardless of

@@ -543,18 +543,38 @@ own comment states the two it knew about, and both are right:
 | **peer YIELDED** | **peer alive and reports non-ownership** | **fail OPEN (degraded)** | **the cold-boot argument does not apply — there IS established forwarding and it stops the instant the peer steps down — and unlike peer loss there is no split-brain to weigh, because the peer is not claiming the RG** |
 
 `peerYieldedOwnership` (`election.go`) is the third row's predicate. It is TRUE
-for exactly the two ways a live peer reports it is not the owner:
+for exactly the three ways a live peer reports it is not the owner:
 
 - `StateSecondaryHold` — an explicit transfer-out, which is what
   `ManualFailover` writes.
-- `Weight <= 0` — a resignation. `electRG`'s `localWeight <= 0` branch forces a
-  weight-0 node SECONDARY unconditionally, so a peer advertising it *cannot* be
-  primary.
+- `Weight <= 0` — the peer reports the weight-zero non-owner shape.
+  `electRG` forces a local weight-zero node SECONDARY unconditionally. This can
+  be an explicit resignation or a kernel-upgrade hold's wire clamp.
+- `StateSecondary` at weight exactly 1 with `peerWasPrimaryThisSession` —
+  an arm-debt yield (#12164). The observed-primary bit is load-bearing:
+  every fresh HA RG starts SECONDARY at weight 1 until XDP is proven, so
+  without it a cold-booting peer would read as yielded and skip the
+  cold-boot hold.
 
-It is FALSE for a peer that is merely `StateSecondary` with weight > 0 (that is
-the cold-boot shape, where the gate must still hold) and for `peerGroup == nil`
-(peer loss or an unreported RG: a partitioned peer may still be forwarding as
-primary, so promoting a not-ready node there risks a dual-active).
+**Held-peer DEGRADED promotion (#12164 F4).** A kernel-upgrade-held node is
+blocked from election locally, so `buildHeartbeat` advertises weight 0 without
+changing its actual RG weight or the wire format. The receiver cannot
+distinguish that clamp from an explicit resignation: a not-ready receiver
+treats either as a yielded peer and may promote DEGRADED. This is an
+availability gain over leaving the RG ownerless, but the event reason now says
+only that the peer reports weight 0; it does not imply the held peer chose to
+resign.
+
+After `ClearKernelUpgradeHold`, the not-ready receiver may keep the RG over a
+recovered ready peer; clearing the hold does not automatically return
+ownership. The same keep can follow the two-minute degraded-promotion timeout
+if the hold lasts longer than that timeout.
+
+It is FALSE for a peer that is merely `StateSecondary` with weight > 1, or
+at weight 1 without observed PRIMARY history (both are cold-boot shapes,
+where the gate must still hold), and for `peerGroup == nil` (peer loss or
+an unreported RG: a partitioned peer may still be forwarding as primary,
+so promoting a not-ready node there risks a dual-active).
 
 **What the missing row cost, measured.** `request chassis cluster failover
 redundancy-group N` demotes the local primary immediately and the peer's

@@ -47,7 +47,7 @@ MUTANTS = [
     ("M3 weight-0 resignation arm removed from the predicate", [
         (ELECTION,
          '''	if peerGroup.Weight <= 0 {
-		return "peer resigned (weight 0)", true
+		return "peer reports weight 0", true
 	}
 ''', '', 1, 0),
     ]),

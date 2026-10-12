@@ -1405,6 +1405,13 @@ type PeerGroupState struct {
 	// until explicitly cleared, whereas a commit-grace window expires on its
 	// own. Empty when StateOverriddenLocally is false.
 	OverrideReason string
+	// peerWasPrimaryThisSession records that this peer, in its current
+	// heartbeat session, has been observed PRIMARY for this RG. Set on
+	// receipt of a PRIMARY frame; cleared on session change. Local-only
+	// history (never on the wire): gates the #12164 weight-1 yield arm so
+	// a cold-booting secondary at the arm floor is not mistaken for a
+	// peer that yielded (MAJOR-2).
+	peerWasPrimaryThisSession bool
 }
 
 // heartbeatSender sends periodic heartbeat packets.

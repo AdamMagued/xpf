@@ -526,10 +526,20 @@ func (m *Manager) buildHeartbeat() *HeartbeatPacket {
 		}
 	}
 	for _, rg := range m.groups {
+		// A kernel-upgrade hold parks this node SECONDARY unconditionally
+		// (electRG returns NoChange before any gate), so it cannot promote.
+		// Advertise weight 0 — the wire non-owner shape shared with explicit
+		// resignation — so an arm-debt incumbent does not yield an RG to a
+		// peer that cannot take it (MAJOR-3). Local weight is untouched; only
+		// the wire advertisement is clamped.
+		wireWeight := rg.Weight
+		if m.kernelUpgradeHold {
+			wireWeight = 0
+		}
 		pkt.Groups = append(pkt.Groups, HeartbeatGroup{
 			GroupID:  wireRGID(rg.GroupID),
 			Priority: clampWirePriority(rg.LocalPriority),
-			Weight:   clampWireWeight(rg.Weight),
+			Weight:   clampWireWeight(wireWeight),
 			State:    uint8(rg.State),
 		})
 	}
@@ -734,16 +744,22 @@ func (m *Manager) handlePeerHeartbeat(pkt *HeartbeatPacket) {
 		if freshPeerEcho {
 			leaseUntil = now.Add(echoLease)
 		}
+		// Carry the PRIMARY history bit across frames of the same peer
+		// session; a new session (peer restart) clears it. Set below
+		// when this frame reports PRIMARY.
+		wasPrimary := hadPrevious && previous.heartbeatSession == peerSession &&
+			previous.peerWasPrimaryThisSession
 		newPeerGroups[localID] = PeerGroupState{
-			GroupID:                 localID,
-			Priority:                int(g.Priority),
-			Weight:                  int(g.Weight),
-			State:                   NodeState(g.State),
-			heartbeatSession:        peerSession,
-			heartbeatSequence:       peerSequence,
-			heartbeatEchoSession:    peerEchoSession,
-			heartbeatEchoSequence:   peerEchoSequence,
-			heartbeatEchoLeaseUntil: leaseUntil,
+			GroupID:                   localID,
+			Priority:                  int(g.Priority),
+			Weight:                    int(g.Weight),
+			State:                     NodeState(g.State),
+			heartbeatSession:          peerSession,
+			heartbeatSequence:         peerSequence,
+			heartbeatEchoSession:      peerEchoSession,
+			heartbeatEchoSequence:     peerEchoSequence,
+			heartbeatEchoLeaseUntil:   leaseUntil,
+			peerWasPrimaryThisSession: wasPrimary || NodeState(g.State) == StatePrimary,
 		}
 	}
 	// Apply pending transfer-commit overrides + expire transfer-grace
