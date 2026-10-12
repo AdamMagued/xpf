@@ -149,9 +149,10 @@ func TestPeerTransferOutPromotionNamesItsReason9452(t *testing.T) {
 	}
 }
 
-// The second way a live peer reports non-ownership. Weight 0 is a resignation
-// and electRG forces a weight-0 node secondary unconditionally, so the peer
-// cannot be primary — the same "nobody owns it" argument applies.
+// The second wire shape for live-peer non-ownership. Weight 0 can mean an
+// explicit resignation or a kernel-upgrade hold clamp; a held peer may still
+// be unable to promote. The local zero-weight election rule makes an explicit
+// resignation unable to claim primary, so either report means no owner.
 func TestPeerResignedWeightZeroPromotesDespiteStartupHold9452(t *testing.T) {
 	for _, preempt := range []bool{false, true} {
 		t.Run(preemptName(preempt), func(t *testing.T) {
@@ -243,7 +244,7 @@ func TestPeerYieldedOwnershipVerdicts9452(t *testing.T) {
 	}{
 		{"nil peer group is peer loss, not this case", nil, false, ""},
 		{"explicit transfer-out", &PeerGroupState{State: StateSecondaryHold, Weight: 100}, true, "transferred out"},
-		{"resigned with weight 0", &PeerGroupState{State: StateSecondary, Weight: 0}, true, "resigned"},
+		{"weight-zero non-owner shape", &PeerGroupState{State: StateSecondary, Weight: 0}, true, "reports weight 0"},
 		{"healthy secondary is the cold-boot shape", &PeerGroupState{State: StateSecondary, Weight: 100}, false, ""},
 		{"live primary has not yielded", &PeerGroupState{State: StatePrimary, Weight: 100}, false, ""},
 	} {

@@ -761,7 +761,9 @@ Gap audit: `docs/archived/userspace-forwarding-and-failover-gap-audit.md` (PR #3
   - Peer lost + weight > 0 → primary; weight = 0 → always secondary
   - Peer alive: compare effective priorities
   - **Preempt mode:** Higher effective priority wins immediately
-  - **Non-preempt mode:** Incumbent stays unless weight drops to 0
+  - **Non-preempt mode:** Incumbent stays unless weight reaches 0. The narrow
+    dataplane-arm exception (#12164) yields only to a greater-raw-weight peer
+    that wins receiver effective-priority/node-ID ordering. RG0 is excluded.
   - **Split-brain:** Both primary → lower node ID wins
   - **Tie-breaking:** Lower node ID wins on equal effective priority
   - Skips disabled and manually failed-over groups

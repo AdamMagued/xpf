@@ -298,7 +298,10 @@ func (d *Daemon) markDataplaneArmed(stage string) {
 // helper crash-loop state into their independent synthetic monitor debts.
 // Kernel/XDP-not-ready debt remains sub-total (weight 1) so standalone nodes
 // stay eligible; a helper crash loop uses full debt to resign even a
-// non-preempt incumbent. Both transitions share one RG snapshot per gate pass.
+// non-preempt incumbent. With arm debt on a data RG (RG0 is excluded), a
+// greater-raw-weight peer that wins receiver effective-priority/node-ID
+// ordering can take over (#12164). Both
+// transitions share one RG snapshot per gate pass.
 // MAJOR-2: RG0 (config authority, no data VIP) is EXCLUDED from crash-loop
 // resignation. Full debt on every GroupState incl. RG0 → weight 0 →
 // secondary everywhere → ConfirmPendingOnDemotion + SetClusterReadOnly →

@@ -35,7 +35,8 @@ const (
 //   - If peer is lost, local becomes primary (if weight > 0)
 //   - If peer is alive, compare effective priorities
 //   - Preempt: higher effective priority wins immediately
-//   - Non-preempt: incumbent stays unless weight drops to 0
+//   - Non-preempt: incumbent stays, except a dataplane-unready data-RG
+//     incumbent (RG0 excluded) yields to a healthier peer
 //   - Split-brain (both primary): lower node ID wins
 func (m *Manager) electRG(rg *RedundancyGroupState, peerGroup *PeerGroupState) (electionResult, string) {
 	// Skip disabled groups entirely.
@@ -192,7 +193,29 @@ func (m *Manager) electRG(rg *RedundancyGroupState, peerGroup *PeerGroupState) (
 	if rg.transferCommitRolePinned {
 		switch rg.transferCommitRole {
 		case StatePrimary:
-			if peerGroup.State == StatePrimary {
+			// Arm-debt exception (F3): a committed owner that lost its
+			// dataplane must hand back to a healthy old owner instead of
+			// blackholing behind the pin. Same gate as the non-preempt
+			// yield below (positive local arm debt + greater peer weight
+			// + a peer that wins the receiver ordering + live echo
+			// lease): fall through to normal election so the yield rule
+			// can fire, keeping the pin only while no verified peer
+			// exists. The ordering conjunct is load-bearing: without it
+			// the pin drops on an effective tie the yield refuses, and
+			// with preempt the recovered old owner then retakes an
+			// operator-committed RG (F1).
+			// RG0 (config authority, no data VIP) is excluded: demoting
+			// it would move config authority and auto-confirm a pending
+			// commit (#12164 N5).
+			if rg.GroupID != 0 && m.dataplaneArmDebtLocked(rg.GroupID) > 0 &&
+				peerGroup.State == StateSecondary &&
+				peerWeight > localWeight &&
+				(peerEff > localEff || (peerEff == localEff && m.peerNodeID < m.nodeID)) &&
+				peerGroup.heartbeatEchoSession == m.LocalProcessToken() &&
+				peerGroup.heartbeatEchoSequence > 0 &&
+				time.Now().Before(peerGroup.heartbeatEchoLeaseUntil) {
+				rg.transferCommitRolePinned = false
+			} else if peerGroup.State == StatePrimary {
 				// The peer has explicitly reclaimed primary. Return to normal
 				// election so the requester can yield.
 				rg.transferCommitRolePinned = false
@@ -203,13 +226,28 @@ func (m *Manager) electRG(rg *RedundancyGroupState, peerGroup *PeerGroupState) (
 				return electNoChange, ""
 			}
 		case StateSecondary:
-			if peerGroup.State == StatePrimary || time.Now().Before(m.localTransferOutHoldUntil[rg.GroupID]) {
+			// Arm-debt handover inside the grace (MINOR-1): the committed
+			// new owner unpins and yields when its dataplane fails. If it
+			// is now offering the RG back from the arm-debt floor, the
+			// grace has served its purpose (suppressing stale-heartbeat
+			// flaps, not blocking a live handover) — release it and let
+			// normal election reclaim, instead of sitting the grace out
+			// ownerless. The floor + observed-primary shape is the same
+			// one peerYieldedOwnership trusts, so a cold-booting peer
+			// (never observed primary) still holds the grace.
+			if peerGroup.State == StateSecondary && peerGroup.Weight == 1 &&
+				peerGroup.peerWasPrimaryThisSession &&
+				peerGroup.heartbeatEchoSession == m.LocalProcessToken() &&
+				time.Now().Before(peerGroup.heartbeatEchoLeaseUntil) {
+				rg.transferCommitRolePinned = false
+			} else if peerGroup.State == StatePrimary || time.Now().Before(m.localTransferOutHoldUntil[rg.GroupID]) {
 				if rg.State != StateSecondary {
 					return electLocalSecondary, "Committed transfer keeps secondary"
 				}
 				return electNoChange, ""
+			} else {
+				rg.transferCommitRolePinned = false
 			}
-			rg.transferCommitRolePinned = false
 		}
 	}
 
@@ -260,11 +298,37 @@ func (m *Manager) electRG(rg *RedundancyGroupState, peerGroup *PeerGroupState) (
 		return electNoChange, ""
 	}
 
-	// Non-preempt: incumbent stays unless weight drops to 0.
-	// If we are currently secondary and peer is primary, we stay secondary.
-	// If we are currently primary, we stay primary (peer can't preempt us).
-	// If neither is primary (both secondary, e.g. initial state), use priority.
+	// Non-preempt: incumbent stays, except an unready data-RG incumbent
+	// (RG0 excluded) yields on arm debt only when the peer has greater raw
+	// weight AND wins receiver effective-priority/node-ID ordering
+	// (greater effective priority or a tie won by the lower peer node ID).
+	// A raw-weight-only yield hands the RG to a peer whose electRG
+	// returns NoChange on an effective tie it loses — the yielder re-promotes
+	// on the tie and yields again next frame, flapping at heartbeat rate
+	// (MAJOR-1). Ties the peer wins (lower peer node ID) also yield. The frame
+	// must echo this node's current incarnation (fresh bidirectional proof —
+	// a stale or replayed announcement, or one from a peer that failed after
+	// announcing, must not strand the RG ownerless, F1). The arm debt remains
+	// above zero so an isolated node keeps management/VIP ownership; with a
+	// healthier peer present, retaining a blackholed RG is worse than the
+	// usual non-preempt priority rule (#12164).
 	if rg.State == StatePrimary {
+		// Only the reserved arm-debt marker carries this exception. Ordinary
+		// monitor debt retains the established non-preempt behavior.
+		// A kernel-hold peer (MAJOR-3) advertises weight 0 and is handled
+		// by the earlier Peer weight 0 branch, before this yield block.
+		// This arm-debt rule therefore applies only to positive-weight peers.
+		// RG0 is excluded: demotion would move config authority and
+		// auto-confirm a pending commit (#12164 N5).
+		if rg.GroupID != 0 && m.dataplaneArmDebtLocked(rg.GroupID) > 0 &&
+			(peerGroup.State == StatePrimary || peerGroup.State == StateSecondary) &&
+			peerWeight > localWeight &&
+			(peerEff > localEff || (peerEff == localEff && m.peerNodeID < m.nodeID)) &&
+			peerGroup.heartbeatEchoSession == m.LocalProcessToken() &&
+			peerGroup.heartbeatEchoSequence > 0 &&
+			time.Now().Before(peerGroup.heartbeatEchoLeaseUntil) {
+			return electLocalSecondary, "Local dataplane not ready; verified peer takes over"
+		}
 		if peerGroup.State == StatePrimary {
 			// DUAL-ACTIVE: resolve by effective priority, then node ID.
 			if localEff < peerEff {
@@ -727,6 +791,12 @@ func (m *Manager) SetMonitorWeight(rgID int, iface string, down bool, weight int
 	m.recalcWeight(rg)
 }
 
+// dataplaneArmDebtLocked returns the authoritative arm-monitor debt. Marker
+// presence in MonitorFails is not sufficient because a configured cost may be 0.
+func (m *Manager) dataplaneArmDebtLocked(rgID int) int {
+	return m.monitorWeights[monitorKey{rgID: rgID, iface: DataplaneArmMonitorIface}]
+}
+
 // maxRedundancyGroupWeight is the full (no-debt) redundancy-group weight AND
 // the largest value the weight domain admits. It is both the Junos starting
 // weight and the ceiling of the single-byte heartbeat weight field
@@ -743,20 +813,15 @@ const maxRedundancyGroupWeight = 255
 const DataplaneArmMonitorIface = "__dataplane-arm__"
 
 // DataplaneArmMonitorCost is the weight debt a dataplane that is not ready to
-// serve contributes: enough to lose to any peer that IS ready, but NOT enough
-// to reach weight 0.
+// serve contributes: enough to lose to a healthier peer, but NOT enough to
+// reach weight 0.
 //
-// #7178/#9842: the floor is the design, not an implementation detail. A node
-// whose dataplane failed to arm, or whose arm has not yet yielded a kernel-
-// proven XDP link, forwards no transit (#5275/#9725 close kernel forwarding)
-// while deliberately keeping management up, so on a cluster the right answer
-// is "let the peer have it" — which a large debt achieves, because the election
-// is RELATIVE and a ready peer at 255 outbids this node at 1.
-//
-// But driving the weight to 0 would also demote a STANDALONE node that has no
-// ready dataplane, and there nothing else picks up the VIPs. Landing at 1 keeps
-// a lone node primary and lets a healthy peer win, from one rule rather than a
-// special case.
+// #7178/#9842: the floor is intentional. An unready node closes kernel transit
+// but keeps management reachable; with no peer, it must retain primary/VIP
+// ownership rather than resign. For data RGs only (RG0 excluded), the arm-debt
+// exception yields only to a peer with greater raw weight that wins the
+// receiver's effective-priority/node-ID ordering, even in non-preempt mode
+// (#12164). Other monitor debt follows the normal non-preempt rule.
 //
 // The floor of 1 also mirrors the VRRP `track-interface priority-cost` clamp of
 // [1,254]: that machinery already settled that "demoted" means the bottom of
@@ -1027,13 +1092,28 @@ func (m *Manager) readinessGateVerdictLocked(rg *RedundancyGroupState) (bool, st
 // itself a third of the remaining gap. A separate signal, tracked as #9484,
 // and recorded here because the coincidence is convincing.
 //
-// Note the two arms are the two ways a live peer can report non-ownership, and
-// both are safe for the same reason. StateSecondaryHold is an explicit
-// transfer-out. Weight 0 is a resignation, and election forces a weight-0 node
-// SECONDARY unconditionally (see the localWeight <= 0 branch in electRG), so a
-// peer advertising it cannot be primary. A peer that is merely SECONDARY with
-// weight > 0 is NOT included: that is the cold-boot shape, where both nodes are
-// coming up and the gate must still hold.
+// Note the arms are ways a live peer can report non-ownership. StateSecondaryHold
+// is an explicit transfer-out. Weight 0 is a wire non-owner shape: it can be
+// an explicit resignation or a kernel-upgrade hold's advertisement clamp. An
+// explicitly zero-weight local node is forced SECONDARY unconditionally by
+// electRG. A held node keeps its local weight; its hold blocks election before
+// readiness gates, while buildHeartbeat advertises weight 0. A not-ready
+// receiver therefore fails open and may promote DEGRADED from a held peer
+// (F4), improving availability over remaining ownerless. The unchanged wire
+// format cannot distinguish the clamp from explicit resignation, so the
+// reported reason names the peer's weight rather than claiming it chose to
+// resign.
+//
+// A secondary peer at the intentional arm-debt floor (weight 1, #12164) is the
+// third arm when this node observed it PRIMARY earlier in the peer's current
+// session. This history bit is not a proof of a particular transition; the
+// current secondary/floor state is consistent with a holder that has yielded.
+// The observed-primary gate is load-bearing: every fresh HA RG starts
+// SECONDARY at weight 1 until XDP is proven, so without it a cold-booting peer
+// would read as "yielded" and a not-ready node would promote DEGRADED
+// immediately, skipping the #7161/#9452 cold-boot and #7162 startup holds
+// (MAJOR-2). A secondary peer never observed primary — cold boot, or a standby
+// that never held the RG — is NOT included.
 func peerYieldedOwnership(peerGroup *PeerGroupState) (string, bool) {
 	if peerGroup == nil {
 		// No peer group info is peer LOSS or a peer that has not reported this
@@ -1046,7 +1126,14 @@ func peerYieldedOwnership(peerGroup *PeerGroupState) (string, bool) {
 		return "peer transferred out (secondary-hold)", true
 	}
 	if peerGroup.Weight <= 0 {
-		return "peer resigned (weight 0)", true
+		return "peer reports weight 0", true
+	}
+	// #12164 F1: a live secondary at the arm-debt floor, observed PRIMARY
+	// earlier in this peer session, has yielded. The yield rule that
+	// produced this shape requires a live echo lease, so a stale frame
+	// cannot fabricate it.
+	if peerGroup.State == StateSecondary && peerGroup.Weight == 1 && peerGroup.peerWasPrimaryThisSession {
+		return "peer yielded at the arm-debt floor (weight 1)", true
 	}
 	return "", false
 }
