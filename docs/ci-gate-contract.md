@@ -40,7 +40,7 @@ record; see `test/incus/harness-result.sh:2-10`).
 
 | Gate | Command | Results |
 |---|---|---|
-| `make test-rust` | Pinned-toolchain `cargo check --benches` (leg 0), full release `cargo test --bins --tests` with `--test-threads=1` (leg 1), debug-leg oracle census + one debug argv (leg 2); see `Makefile:397-406` | Terminal output; no wire-ledger row. Durable result location is described below. |
+| `make test-rust` | Pinned-toolchain `cargo check --benches` (leg 0), full release `cargo test --bins --tests` with `--test-threads=1` (leg 1), debug-leg oracle census + one debug argv (leg 2); see the `test-rust` recipe in `Makefile` | Terminal output; no wire-ledger row. Durable result location is described below. |
 
 Record each manual Rust run durably in the associated `docs/log/<issue>.md`
 entry: include the commit SHA, exact command, PASS/FAIL, and a concise result
@@ -70,15 +70,15 @@ it still needs those instances; see `test/incus/test-wire-properties.sh:25-31`.
 
 | Gate | Makefile target | Wire proof |
 |---|---|---|
-| Host-inbound smoke (matrix) | `make test-host-inbound` (`Makefile:1017-1021`) | On-wire host-inbound probes against committed config; separate gate from the failover leg |
-| Host-inbound smoke (failover) | `make test-host-inbound-failover` (`Makefile:1022-1026`) | Same smoke with the HA leg: RG1+RG2 move to the peer and back under the #1875 lock |
-| Wire policy-deny | `make test-wire-policy-deny` (`Makefile:1030-1034`) | Offered probes leak 0 across deny policy; `WIRE_GATE wire_policy_deny` line per invocation |
-| Wire appmatch twins | `make test-wire-appmatch-twins` (`Makefile:1038-1042`) | Twin-flow application-match agreement on the wire |
-| Wire zone matrix | `make test-wire-zone-matrix` (`Makefile:1046-1050`) | Zone-pair matrix verdicts observed on the wire |
-| Wire hostinbound-deny | `make test-wire-hostinbound-deny` (`Makefile:1054-1058`) | Host-inbound deny verdicts observed on the wire |
-| Wire conntrack lifecycle | `make test-wire-conntrack-lifecycle` (`Makefile:1062-1067`) | Create/witness/evict lifecycle observed on the wire |
-| Wire routing separation | `make test-wire-routing-separation` (`Makefile:1074-1080`) | Routing-separation probes observed on the wire |
-| Wire properties | `make test-wire-properties` (`Makefile:1300-1304`) | IPv6 transit plus a DF/1500-byte probe that accepts either PMTUD feedback or ordinary delivery (a passing run does not necessarily exercise reflection), through the local Incus hosts (see `test/incus/test-wire-properties.sh:80-98`) |
+| Host-inbound smoke (matrix) | `make test-host-inbound` (the `test-host-inbound` recipe in `Makefile`) | On-wire host-inbound probes against committed config; separate gate from the failover leg |
+| Host-inbound smoke (failover) | `make test-host-inbound-failover` (the `test-host-inbound-failover` recipe in `Makefile`) | Same smoke with the HA leg: RG1+RG2 move to the peer and back under the #1875 lock |
+| Wire policy-deny | `make test-wire-policy-deny` (the `test-wire-policy-deny` recipe in `Makefile`) | Offered probes leak 0 across deny policy; `WIRE_GATE wire_policy_deny` line per invocation |
+| Wire appmatch twins | `make test-wire-appmatch-twins` (the `test-wire-appmatch-twins` recipe in `Makefile`) | Twin-flow application-match agreement on the wire |
+| Wire zone matrix | `make test-wire-zone-matrix` (the `test-wire-zone-matrix` recipe in `Makefile`) | Zone-pair matrix verdicts observed on the wire |
+| Wire hostinbound-deny | `make test-wire-hostinbound-deny` (the `test-wire-hostinbound-deny` recipe in `Makefile`) | Host-inbound deny verdicts observed on the wire |
+| Wire conntrack lifecycle | `make test-wire-conntrack-lifecycle` (the `test-wire-conntrack-lifecycle` recipe in `Makefile`) | Create/witness/evict lifecycle observed on the wire |
+| Wire routing separation | `make test-wire-routing-separation` (the `test-wire-routing-separation` recipe in `Makefile`) | Routing-separation probes observed on the wire |
+| Wire properties | `make test-wire-properties` (the `test-wire-properties` recipe in `Makefile`) | IPv6 transit plus a DF/1500-byte probe that accepts either PMTUD feedback or ordinary delivery (a passing run does not necessarily exercise reflection), through the local Incus hosts (see `test/incus/test-wire-properties.sh:80-98`) |
 
 ### HA continuity and NAT failover gates
 
@@ -87,13 +87,13 @@ rows through `harness-result.sh`:
 
 | Gate | Makefile target | Packet-level scope |
 |---|---|---|
-| Single failover | `make test-failover` (`Makefile:1306-1309`) | Connectivity through a node reboot and HA handoff |
-| Double failover | `make test-double-failover` (`Makefile:1312-1315`) | Connectivity through sequential node failures and handoffs |
-| Active/active failover | `make test-active-active` (`Makefile:1318-1321`) | Per-RG forwarding while RG ownership is split |
-| Stress failover | `make test-stress-failover` (`Makefile:1324-1327`) | Repeated failover cycles with traffic |
-| HA crash | `make test-ha-crash` (`Makefile:1330-1333`) | Traffic behavior across a hard-crash/hung-node recovery |
-| Persistent NAT failover | `make test-persistent-nat-failover` (`Makefile:1350-1353`) | Persistent NAT behavior across RG failover |
-| Chained crash | `make test-chained-crash` (`Makefile:1387-1390`) | Traffic behavior across chained hard resets and recoveries |
+| Single failover | `make test-failover` (the `test-failover` recipe in `Makefile`) | Connectivity through a node reboot and HA handoff |
+| Double failover | `make test-double-failover` (the `test-double-failover` recipe in `Makefile`) | Connectivity through sequential node failures and handoffs |
+| Active/active failover | `make test-active-active` (the `test-active-active` recipe in `Makefile`) | Per-RG forwarding while RG ownership is split |
+| Stress failover | `make test-stress-failover` (the `test-stress-failover` recipe in `Makefile`) | Repeated failover cycles with traffic |
+| HA crash | `make test-ha-crash` (the `test-ha-crash` recipe in `Makefile`) | Traffic behavior across a hard-crash/hung-node recovery |
+| Persistent NAT failover | `make test-persistent-nat-failover` (the `test-persistent-nat-failover` recipe in `Makefile`) | Persistent NAT behavior across RG failover |
+| Chained crash | `make test-chained-crash` (the `test-chained-crash` recipe in `Makefile`) | Traffic behavior across chained hard resets and recoveries |
 
 Results for every wrapped run in the tables above live in
 `test/results/ledger.d/` (one `<run_id>.json` per run, #8346);
