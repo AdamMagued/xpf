@@ -120,9 +120,13 @@ func TestAuthThrottleFullOfLiveLockoutsLegacyInsertionRefuses12182(t *testing.T)
 	fillAuthThrottleWithLiveLockouts12182(t, tracker, now)
 
 	const victimSource = "198.51.0.0"
-	// New API-key identity: exercises the account + source legacy accessors.
+	// New API-key identity: the new source must be refused. This pins the
+	// source accessor only; an over-capacity account bucket admitted here
+	// would be evicted again by the later source insertion on the same call.
 	tracker.recordFailure("203.0.113.251", authThrottleAPIKeyAccount)
-	// New Basic identity: additionally exercises the global-account accessor.
+	// New Basic identity attempts all three accessors. The aggregate assertions
+	// only pin source refusal here; a later accessor can evict an earlier
+	// over-capacity account or global bucket.
 	const pressureBasic = authThrottleBasicAccountPrefix + "pressure-victim"
 	tracker.recordFailure("203.0.113.252", pressureBasic)
 
@@ -144,6 +148,23 @@ func TestAuthThrottleFullOfLiveLockoutsLegacyInsertionRefuses12182(t *testing.T)
 		t.Fatalf("victim lockout after legacy pressure = (%v, %v), want (true, %v): Retry-After erased", locked, wait, authThrottleBaseLockout)
 	}
 
+	// Existing-source probes pin each remaining accessor's refusal: with the
+	// source bucket already present, no later insertion can re-evict an
+	// over-capacity bucket admitted by a regressed account or global guard.
+	// Bearer has no global bucket, so this isolates the account accessor.
+	tracker.recordFailure(victimSource, authThrottleBearerAccount)
+	live, total = countLiveLockedBuckets12182(tracker, now)
+	if total != authThrottleMaxEntries || live != authThrottleMaxEntries {
+		t.Fatalf("after existing-source account pressure live/total = %d/%d, want %d/%d",
+			live, total, authThrottleMaxEntries, authThrottleMaxEntries)
+	}
+	// The claimed Basic username additionally exercises the global accessor.
+	tracker.recordFailure(victimSource, authThrottleBasicAccountPrefix+"probe")
+	live, total = countLiveLockedBuckets12182(tracker, now)
+	if total != authThrottleMaxEntries || live != authThrottleMaxEntries {
+		t.Fatalf("after existing-source global pressure live/total = %d/%d, want %d/%d",
+			live, total, authThrottleMaxEntries, authThrottleMaxEntries)
+	}
 	// Existing identities remain lookup-safe without growing the table; the
 	// live lockout drops this failure.
 	tracker.recordFailure(victimSource, authThrottleAPIKeyAccount)

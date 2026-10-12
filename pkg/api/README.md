@@ -613,10 +613,10 @@ sources” means across the HTTP and HTTPS legs sharing that `Server`; separate
 server instances, process restarts, and HA peers have fresh independent
 budgets, so this is not a cluster-wide or restart-persistent attempt quota.
 
-The shared tracker is bounded to 4096 buckets per middleware/Server; under
-high-cardinality pressure, completed buckets may be evicted after an expiry
-sweep, forgiving failures early rather than allowing attacker-chosen identities
-to grow memory without bound.
+The shared tracker is bounded to 4096 buckets per middleware/Server. Expired
+or unlocked buckets may be evicted, but live lockouts are never evicted. If no
+safe room can be made, new identities are refused with HTTP 429 and
+`Retry-After: 1`, preserving active lockouts rather than forgiving them early.
 Credentials are not accepted over clear HTTP: strict compile rejects explicit
 HTTP plus api-auth, and runtime disables the HTTP leg whenever an api-auth
 identity is active; use HTTPS for credentialed REST access.

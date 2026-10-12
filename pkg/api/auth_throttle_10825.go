@@ -31,10 +31,10 @@
 // Per-instance state keeps test servers isolated without a reset hook and
 // keeps the two legs of one server under one budget. Separate Server instances,
 // process restarts, and HA peers get independent, fresh budgets; this is
-// intentionally not a cluster-wide or restart-persistent attempt counter. The
-// table is bounded (4096 entries; expired-first sweep, then arbitrary evict)
-// so the key space — which includes attacker-influenced usernames — cannot grow
-// memory without bound; see the denyaudit fixed-bucket rationale for the doctrine.
+// intentionally not a cluster-wide or restart-persistent attempt counter.
+// The table is bounded (4096 entries): expired or unlocked buckets may be
+// evicted, but live lockouts are never evicted. At saturation, a new identity
+// is refused with HTTP 429 and Retry-After: 1 rather than erasing a lockout.
 //
 // There is deliberately NO loopback exemption. The nil-auth loopback path
 // (dynamicAuthMiddleware's pass-through) never consults the tracker at all —
