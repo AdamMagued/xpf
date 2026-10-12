@@ -33,7 +33,7 @@ locating any symbol below is now a matter of opening the named file.
   invalidated) and re-checks it under the publish lock, returning
   `ErrHeartbeatStartSuperseded` if it moved. Callers must treat that sentinel as
   terminal, not as a bind failure — retrying would resurrect a heartbeat the
-  teardown exists to remove; `startHeartbeatWithRetry` does.
+  teardown exists to remove; the daemon's `startHeartbeatWithRetryForEpoch` does.
 
   This is the same shape `publishSessionSyncIfCurrent` uses for the session-sync
   constructor, and for the same reason: the daemon's cluster-comms teardown

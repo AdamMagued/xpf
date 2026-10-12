@@ -1594,16 +1594,16 @@ loops when all 30 attempts fail, but must NOT when the context was cancelled.
 **Goroutine lifecycle: only ONE of eleven is joined.** `clusterCommsWG.Add(1)`
 appears exactly once in the tree — it tracks the session-sync constructor
 goroutine, and `stopClusterComms` joins only that one. The other ten goroutines
-this path spawns (`startHeartbeatWithRetry`, the HA watchdog ticker, the gRPC
+this path spawns (`startHeartbeatWithRetryForEpoch`, the HA watchdog ticker, the gRPC
 fabric-listener poller and its inner listener, `eventStreamFallbackLoop` /
 `runUserspaceEventStream`, `syncIPsecSAPeriodic`, `configSyncReconcileLoop`,
 `populateFabricFwd{,1}`, `monitorFabricState`) are context-cancelled only,
 never joined. That asymmetry is the structural reason **#7257** is reachable:
 `stopClusterComms` cancels the context, joins only the constructor, and then
 calls `d.cluster.StopHeartbeat()` — which nils the heartbeat handles under
-`m.mu` while an unjoined `startHeartbeatWithRetry` goroutine may still be
+`m.mu` while an unjoined `startHeartbeatWithRetryForEpoch` goroutine may still be
 inside `StartHeartbeat` dereferencing them unlocked. #6428 did not move
-`startHeartbeatWithRetry` and did not change the lifecycle; #7257 needs a
+`startHeartbeatWithRetryForEpoch` and did not change the lifecycle; #7257 needs a
 lifecycle fix, not a code move.
 
 **The wiring was unbound when #6428 measured it.** `go tool cover -func` over

@@ -179,9 +179,11 @@ func TestWarmHeartbeatRetryResolvesNewVRFMembership12168(t *testing.T) {
 	d.publishMgmtVRFIfaces(nil)
 	ctx, cancel := context.WithTimeout(d.daemonCtx, 7*time.Second)
 	defer cancel()
+	commsCtx, gen, cancelComms := d.beginClusterCommsEpoch(ctx)
+	defer cancelComms()
 	done := make(chan struct{})
 	go func() {
-		d.startHeartbeatWithRetry(ctx, "em0", "198.51.100.2")
+		d.startHeartbeatWithRetryForEpoch(commsCtx, "em0", "198.51.100.2", gen)
 		close(done)
 	}()
 	time.Sleep(150 * time.Millisecond)

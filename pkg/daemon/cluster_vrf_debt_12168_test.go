@@ -20,13 +20,13 @@ import (
 // empty tree, daemon relinquishes the cluster and owes one comms restart).
 // A #11448 reassert tick then repairs a drifted management interface before
 // the operator commits the corrected config with an identical transport key.
-func c83bBootstrapDebt(t *testing.T, reassert bool) int {
+func bootstrapDebt12168(t *testing.T, reassert bool) int {
 	t.Helper()
 	store := newConfigStore(t, filepath.Join(t.TempDir(), "config.db"))
 	lines := []string{
 		"chassis cluster cluster-id 1",
 		"chassis cluster node 0",
-		"chassis cluster authentication-key c83b-debt-12168",
+		"chassis cluster authentication-key bootstrap-debt-12168",
 		"chassis cluster control-interface em0",
 	}
 	if err := store.EnterConfigure(); err != nil {
@@ -116,14 +116,14 @@ func c83bBootstrapDebt(t *testing.T, reassert bool) int {
 	return restarts
 }
 
-func TestC83BBootstrapDebtControl12168(t *testing.T) {
-	if got := c83bBootstrapDebt(t, false); got != 1 {
+func TestBootstrapDebtControl12168(t *testing.T) {
+	if got := bootstrapDebt12168(t, false); got != 1 {
 		t.Errorf("control (no reassert): corrected commit restarts=%d, want 1", got)
 	}
 }
 
-func TestC83BBootstrapDebtSurvivesReassert12168(t *testing.T) {
-	if got := c83bBootstrapDebt(t, true); got != 1 {
+func TestBootstrapDebtSurvivesReassert12168(t *testing.T) {
+	if got := bootstrapDebt12168(t, true); got != 1 {
 		t.Errorf("#7901 debt consumed by the reassert: corrected commit restarts=%d, want 1 (comms stay DOWN)", got)
 	}
 }

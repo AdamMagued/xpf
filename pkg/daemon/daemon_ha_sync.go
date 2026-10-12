@@ -1524,22 +1524,24 @@ func (d *Daemon) fenceAllRedundancyGroups(ctx context.Context) cluster.FenceResu
 	return res
 }
 
-// startHeartbeatWithRetry resolves the control-link local address and VRF device
-// on every attempt, then starts the cluster heartbeat. Both the address and
-// management-VRF membership may become ready during the startup retry window.
-// It runs in its own goroutine, owned by the comms sub-context.
+// startHeartbeatWithRetryForEpoch resolves the control-link local address and
+// VRF device on every attempt, then starts the cluster heartbeat. Both the
+// address and management-VRF membership may become ready during the startup
+// retry window. Production runs it in its own goroutine, owned by the comms
+// sub-context.
 //
 // It exits immediately when ctx is cancelled (#4033): stopClusterComms cancels
 // the comms context before installing new comms, so without this the old retry
-// goroutine would survive the teardown and keep looping — up to 30 * 2s = 60s
-// — and could call StartHeartbeat AFTER stopClusterComms, installing a
-// heartbeat into a torn-down comms lifecycle and racing the replacement
-// goroutine. Every iteration (and every retry sleep) observes ctx so a comms
-// restart leaves exactly one retry goroutine and one heartbeat.
-func (d *Daemon) startHeartbeatWithRetry(ctx context.Context, controlIface, peerAddr string) {
-	d.startHeartbeatWithRetryForEpoch(ctx, controlIface, peerAddr, 0)
-}
-
+// goroutine would survive teardown and keep looping — up to 30 * 2s = 60s —
+// and could call StartHeartbeat AFTER stopClusterComms, installing a heartbeat
+// into a torn-down comms lifecycle and racing the replacement goroutine. Every
+// iteration (and every retry sleep) observes ctx so a comms restart leaves
+// exactly one retry goroutine and one heartbeat.
+//
+// A resolved attempt in a current, nonzero comms generation records an off-key
+// VRF binding as sticky for the epoch; a later on-key retry cannot restore
+// sockets already opened with another device. Superseded epochs cannot update
+// the active transport key.
 func (d *Daemon) startHeartbeatWithRetryForEpoch(ctx context.Context, controlIface, peerAddr string, commsGen uint64) {
 	for i := 0; i < 30; i++ {
 		if ctx.Err() != nil {
