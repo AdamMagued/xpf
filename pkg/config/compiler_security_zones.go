@@ -614,7 +614,7 @@ func compileZones(node *Node, sec *SecurityConfig) error {
 				}
 				parseAddressBookEntries(prop, ab)
 			default:
-				recordUnknownSecurityZoneChild11575(zone, prop.Name())
+				recordUnknownSecurityZoneChild11575(zone, prop.Keys)
 			}
 		}
 	}

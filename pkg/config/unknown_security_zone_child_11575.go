@@ -23,18 +23,30 @@ func IsUnknownSecurityZoneChildSchemaError(err error) bool {
 	return errors.As(err, &target)
 }
 
-func recordUnknownSecurityZoneChild11575(zone *ZoneConfig, keyword string) {
-	if zone == nil || keyword == "" || zoneInterfaceApplyMetaKeyword(keyword) {
+func recordUnknownSecurityZoneChild11575(zone *ZoneConfig, keys []string) {
+	if zone == nil || len(keys) == 0 || keys[0] == "" || zoneInterfaceApplyMetaKeyword(keys[0]) {
 		return
 	}
+	keyword := keys[0]
+	found := false
 	for _, existing := range zone.UnknownZoneChildren {
 		if existing == keyword {
-			return
+			found = true
+			break
 		}
 	}
-	zone.UnknownZoneChildren = append(zone.UnknownZoneChildren, keyword)
+	if !found {
+		zone.UnknownZoneChildren = append(zone.UnknownZoneChildren, keyword)
+	}
 	if enforcementBearingUnknownZoneChild11575(keyword) {
 		zone.DroppedEnforcementChild = true
+		return
+	}
+	for _, key := range keys[1:] {
+		if enforcementBearingUnknownZoneChildKeyword11575(key) {
+			zone.DroppedEnforcementChild = true
+			return
+		}
 	}
 }
 
@@ -47,18 +59,17 @@ func recordUnknownSecurityZoneChild11575(zone *ZoneConfig, keyword string) {
 // zone they are dropped, and policy references to intended zone-local names
 // then fall back to same-named global entries.
 func enforcementBearingUnknownZoneChild11575(keyword string) bool {
-	if len(keyword) <= 2 {
-		// The zone schema is closed-world and has no modeled child this short.
-		// Treat every one- or two-byte unknown as an enforcement truncation.
-		return true
-	}
+	return len(keyword) <= 2 || enforcementBearingUnknownZoneChildKeyword11575(keyword)
+}
+
+func enforcementBearingUnknownZoneChildKeyword11575(keyword string) bool {
 	if containsZoneKeyword11575(keyword, "screen") || containsZoneKeyword11575(keyword, "ids") {
 		return true
 	}
 	if containsZoneKeyword11575(keyword, "addr") && containsZoneKeyword11575(keyword, "book") {
 		return true
 	}
-	for _, supported := range [...]string{"screen", "interfaces", "host-inbound-traffic", "tcp-rst", "address-book", "address-set"} {
+	for _, supported := range [...]string{"screen", "interfaces", "host-inbound-traffic", "tcp-rst", "address-book", "address-set", "address"} {
 		if zoneKeywordDistanceAtMostTwo11575(keyword, supported) ||
 			zoneKeywordPrefixAtLeastTwo11575(keyword, supported) {
 			return true
