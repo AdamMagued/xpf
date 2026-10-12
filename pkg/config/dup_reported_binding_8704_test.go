@@ -94,6 +94,81 @@ func TestEveryNotConservedContainerIsReported8704(t *testing.T) {
 		checked, len(silent), len(deepDupUnreportable))
 }
 
+// #12308: this test pins the measured split: both duplicate block orders
+// compile separately, while flat-set merges their modifiers. The resulting
+// backup joins metric 0's primary ECMP tier, so the unresolved behavior is
+// scope-deferred to #12308 rather than silently described as correct.
+func TestQualifiedNextHopCensusExemptionIsMeasured8704(t *testing.T) {
+	const dupAB = `routing-options { static { route 0.0.0.0/0 {
+		qualified-next-hop 192.168.1.1 { interface ge-0/0/1.0; }
+		qualified-next-hop 192.168.1.1 { metric 100; }
+	} } }`
+	const dupBA = `routing-options { static { route 0.0.0.0/0 {
+		qualified-next-hop 192.168.1.1 { metric 100; }
+		qualified-next-hop 192.168.1.1 { interface ge-0/0/1.0; }
+	} } }`
+	parse := func(text string) *ConfigTree {
+		tree, errs := NewParser(text).Parse()
+		if len(errs) > 0 {
+			t.Fatalf("parse repeated QNH fixture: %v", errs[0])
+		}
+		return tree
+	}
+	assertSplitEntries := func(name, text string) {
+		t.Helper()
+		cfg, err := CompileConfig(parse(text))
+		if err != nil {
+			t.Fatalf("%s strict compile: %v", name, err)
+		}
+		if len(cfg.RoutingOptions.StaticRoutes) != 1 ||
+			len(cfg.RoutingOptions.StaticRoutes[0].NextHops) != 2 {
+			t.Fatalf("%s should retain two next-hop entries: %+v", name, cfg.RoutingOptions.StaticRoutes)
+		}
+		haveInterface, haveMetric := false, false
+		for _, nh := range cfg.RoutingOptions.StaticRoutes[0].NextHops {
+			if nh.Interface != "" {
+				haveInterface = true
+				if nh.HasMetric {
+					t.Fatalf("%s unexpectedly merged modifiers onto one entry: %+v", name, nh)
+				}
+			}
+			if nh.HasMetric {
+				haveMetric = nh.Metric == 100
+				if nh.Interface != "" {
+					t.Fatalf("%s unexpectedly merged modifiers onto one entry: %+v", name, nh)
+				}
+			}
+		}
+		if !haveInterface || !haveMetric {
+			t.Fatalf("%s did not retain interface and metric separately", name)
+		}
+	}
+	assertSplitEntries("interface-then-metric", dupAB)
+	assertSplitEntries("metric-then-interface", dupBA)
+
+	flat, err := CompileConfig(flatTreeFromSets(t,
+		"set routing-options static route 0.0.0.0/0 qualified-next-hop 192.168.1.1 interface ge-0/0/1.0",
+		"set routing-options static route 0.0.0.0/0 qualified-next-hop 192.168.1.1 metric 100"))
+	if err != nil {
+		t.Fatalf("flat-set control compile: %v", err)
+	}
+	if len(flat.RoutingOptions.StaticRoutes) != 1 ||
+		len(flat.RoutingOptions.StaticRoutes[0].NextHops) != 1 {
+		t.Fatalf("flat-set control should merge modifiers onto one next-hop: %+v",
+			flat.RoutingOptions.StaticRoutes)
+	}
+	merged := flat.RoutingOptions.StaticRoutes[0].NextHops[0]
+	if merged.Interface != "ge-0/0/1.0" || !merged.HasMetric || merged.Metric != 100 {
+		t.Fatalf("flat-set control did not preserve both modifiers: %+v", merged)
+	}
+	key := "routing-options static route xpfname qualified-next-hop"
+	if reason := deepDupUnreportable[key]; reason == "" {
+		t.Fatalf("the measured QNH divergence must have a recorded #8704 disposition")
+	} else if !strings.Contains(reason, "#12308") {
+		t.Fatalf("the measured QNH exemption must cite #12308: %q", reason)
+	}
+}
+
 // The finding that made this issue severe, asserted on the compiled config.
 // A traffic selector decides which traffic enters the tunnel; it renders into
 // swanctl.conf, so a dropped local-ip negotiates an SA against a selector the
