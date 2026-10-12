@@ -146,15 +146,17 @@ type AddressBinding struct {
 type SecurityConfig struct {
 	Zones    map[string]*ZoneConfig // keyed by zone name
 	Policies []*ZonePairPolicies    // ordered list of zone-pair policy sets
-	// MalformedZonePairs records diagnostics for zone-pair statements whose
-	// shape shows a bracketed-list collapse (#9246). The strict uniform gate
-	// rejects the commit. On tolerant loads it warns and skips the malformed
-	// context, while the gate adds a synthetic global LenientContentDropped
-	// carrier so the userspace snapshot builder emits its existing
-	// __unsupported__ sentinel and the helper refuses the whole snapshot
-	// (#12039). Keeping the source diagnostic here is necessary because the
-	// malformed residue is no longer distinguishable from an ordinary empty
-	// pair after AST compilation.
+	// MalformedZonePairs records diagnostics for policy contexts that cannot
+	// be compiled into a valid zone pair: unsupported bracketed-list collapse
+	// (#9246), an active from-zone policy without a to-zone destination (#12231),
+	// or the #11346 mixed spelling with a destination in the container keys.
+	// The strict uniform gate rejects these contexts. Tolerant loads warn and
+	// skip the malformed context. The gate adds a synthetic global
+	// LenientContentDropped carrier so the userspace snapshot builder
+	// emits its existing __unsupported__ sentinel and the helper refuses the
+	// whole snapshot (#12039). Keeping the source diagnostic here is necessary
+	// because the malformed residue is no longer distinguishable from an
+	// ordinary empty pair after AST compilation.
 	// json:"-" deliberately: this is a COMPILE-TIME DIAGNOSTIC, not part of the
 	// config's semantic content. Serialising it would perturb every fixture and
 	// fingerprint that compares compiled configs -- the #4406 goldens, and the

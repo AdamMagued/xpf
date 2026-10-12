@@ -106,3 +106,146 @@ func TestMalformedZonePairPermitStillPoisonsSnapshot12039(t *testing.T) {
 		t.Fatalf("malformed then-permit context must remain quarantined; warnings=%s", strings.Join(cfg.Warnings, "\n"))
 	}
 }
+
+func mixedZonePairSnapshot12231(t *testing.T, fromZone string) (*config.Config, *ConfigSnapshot) {
+	t.Helper()
+	text := `security {
+    zones { security-zone A; security-zone B; }
+    policies {
+        ` + fromZone + `
+        global {
+            policy g-permit {
+                match { source-address any; destination-address any; application any; }
+                then { permit; }
+            }
+        }
+        default-policy permit-all;
+    }
+}`
+	tree, errs := config.NewParser(text).Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse mixed zone-pair shape %q: %v", fromZone, errs)
+	}
+	cfg, err := config.CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("CompileConfigLenient: %v", err)
+	}
+	snap, err := buildSnapshot(cfg, config.UserspaceConfig{}, 1, 0)
+	if err != nil {
+		t.Fatalf("buildSnapshot: %v", err)
+	}
+	return cfg, snap
+}
+
+func TestMixedZonePairSnapshotCells12231(t *testing.T) {
+	deny := `policy p1 {
+        match { source-address any; destination-address any; application any; }
+        then { deny; }
+    }`
+	permit := `policy ok {
+        match { source-address any; destination-address any; application any; }
+        then { permit; }
+    }`
+	for _, tc := range []struct {
+		name       string
+		fromZone   string
+		policy     string
+		from       string
+		to         string
+		action     string
+		wantPoison bool
+	}{
+		{
+			name:     "X03-nested-to-zone-deny",
+			fromZone: `from-zone { A to-zone B { to-zone { B { ` + deny + ` } } } }`,
+			policy:   "p1", from: "A", to: "B", action: "deny",
+		},
+		{
+			name:     "M8-policy-less-mixed",
+			fromZone: `from-zone { A to-zone B; }`,
+		},
+		{
+			name:       "S07-mixed-direct-policy",
+			fromZone:   `from-zone { A to-zone B { ` + deny + ` } }`,
+			wantPoison: true,
+		},
+		{
+			name:     "X15-mixed-with-valid-sibling",
+			fromZone: `from-zone { A to-zone B { ` + deny + ` } B { to-zone { A { ` + permit + ` } } } }`,
+			policy:   "ok", from: "B", to: "A", action: "permit",
+			wantPoison: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, snap := mixedZonePairSnapshot12231(t, tc.fromZone)
+			ruleIndex := func(name, from, to string) int {
+				for i, rule := range snap.Policies {
+					if rule.Name == name && rule.FromZone == from && rule.ToZone == to {
+						return i
+					}
+				}
+				return -1
+			}
+			globalIndex := -1
+			for i, rule := range snap.Policies {
+				if rule.Name == "g-permit" && rule.Action == "permit" {
+					globalIndex = i
+					break
+				}
+			}
+			if globalIndex < 0 || snap.Policies[globalIndex].Action != "permit" {
+				t.Fatalf("snapshot does not preserve global g-permit: %+v", snap.Policies)
+			}
+			if tc.policy != "" {
+				i := ruleIndex(tc.policy, tc.from, tc.to)
+				if i < 0 {
+					t.Fatalf("snapshot lacks %s %s->%s: %+v", tc.policy, tc.from, tc.to, snap.Policies)
+				}
+				if snap.Policies[i].Action != tc.action {
+					t.Fatalf("snapshot %s action = %q, want %q", tc.policy, snap.Policies[i].Action, tc.action)
+				}
+				if i >= globalIndex {
+					t.Fatalf("snapshot %s %s->%s is not before g-permit: %+v", tc.policy, tc.from, tc.to, snap.Policies)
+				}
+			}
+
+			sawSentinel := false
+			for _, rule := range snap.Policies {
+				for _, term := range rule.ApplicationTerms {
+					if term.Name == unsupportedApplicationSentinel || term.Protocol == unsupportedApplicationSentinel {
+						sawSentinel = true
+					}
+				}
+			}
+			reasons := PolicyContentRejectionReasons(cfg, nil)
+			if tc.wantPoison {
+				malformed := strings.Join(cfg.Security.MalformedZonePairs, "\n")
+				if !strings.Contains(malformed, "#11346") {
+					t.Fatalf("mixed config diagnostic lost #11346: %q", malformed)
+				}
+				if !strings.Contains(strings.Join(cfg.Warnings, "\n"), "#11346") {
+					t.Fatalf("mixed config warning lost #11346: %q", cfg.Warnings)
+				}
+				if config.LenientDroppedPolicyLocator(cfg) == "" {
+					t.Fatal("mixed policy has no lenient poison locator")
+				}
+				if !sawSentinel || len(snap.Capabilities.PolicyContentRejected) == 0 || len(reasons) == 0 {
+					t.Fatalf("mixed policy did not poison/refuse snapshot: sentinel=%v rejected=%v reasons=%v",
+						sawSentinel, snap.Capabilities.PolicyContentRejected, reasons)
+				}
+			} else {
+				if len(cfg.Security.MalformedZonePairs) != 0 || config.LenientDroppedPolicyLocator(cfg) != "" {
+					t.Fatalf("clean mixed shape was recorded/poisoned: malformed=%q poison=%q",
+						cfg.Security.MalformedZonePairs, config.LenientDroppedPolicyLocator(cfg))
+				}
+				if sawSentinel || len(snap.Capabilities.PolicyContentRejected) != 0 || len(reasons) != 0 {
+					t.Fatalf("policy-less/enforceable mixed shape was poisoned: sentinel=%v rejected=%v reasons=%v",
+						sawSentinel, snap.Capabilities.PolicyContentRejected, reasons)
+				}
+				if tc.name == "M8-policy-less-mixed" && ruleIndex("p1", "A", "B") >= 0 {
+					t.Fatalf("policy-less mixed shape emitted a fabricated A->B p1 rule: %+v", snap.Policies)
+				}
+			}
+		})
+	}
+}
