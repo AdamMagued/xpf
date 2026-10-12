@@ -96,13 +96,13 @@ func TestHelperRefusalIsCountedAsDebtNotAsAnErrorV6_6785(t *testing.T) {
 	}
 }
 
-// TestRefusalDebtIsRenderedOnlyWhenNonZero6785 pins the operator surface. The
-// counter is health debt, so it has to reach `show chassis cluster information`
-// — a counter nothing renders is a variable, not debt. It is rendered only when
-// non-zero: zero is the ordinary state and a permanently-present "0" line is
-// noise an operator learns to skip past.
-func TestRefusalDebtIsRenderedOnlyWhenNonZero6785(t *testing.T) {
-	const line = "Imports refused by helper:"
+// TestImportDebtIsRenderedOnlyWhenNonZero6785 pins the operator surface.
+// Refusal and deterministic-rejection counters represent peer-session debt,
+// so they have to reach `show chassis cluster information` — a counter nothing
+// renders is a variable, not debt. They are rendered only when non-zero.
+func TestImportDebtIsRenderedOnlyWhenNonZero6785(t *testing.T) {
+	const refusalLine = "Imports refused by helper:"
+	const rejectedLine = "Imports rejected by helper:"
 
 	m := NewManager(0, 1)
 	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200, 1: 100}))
@@ -111,13 +111,17 @@ func TestRefusalDebtIsRenderedOnlyWhenNonZero6785(t *testing.T) {
 	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
 	m.SetSyncStats(ss)
 
-	if got := m.FormatInformation(); strings.Contains(got, line) {
-		t.Fatalf("the refusal line is rendered at zero:\n%s", got)
+	if got := m.FormatInformation(); strings.Contains(got, refusalLine) ||
+		strings.Contains(got, rejectedLine) {
+		t.Fatalf("an import-debt line is rendered at zero:\n%s", got)
 	}
 	ss.stats.ImportsRefusedByHelper.Store(3)
+	ss.stats.ImportsRejectedByHelper.Store(2)
 	out := m.FormatInformation()
-	if !strings.Contains(out, line+" 3") {
-		t.Fatalf("a non-zero refusal count is not rendered anywhere an operator "+
-			"can see it (want %q):\n%s", line+" 3", out)
+	for _, line := range []string{refusalLine + " 3", rejectedLine + " 2"} {
+		if !strings.Contains(out, line) {
+			t.Fatalf("a non-zero import-debt count is not rendered anywhere an operator "+
+				"can see it (want %q):\n%s", line, out)
+		}
 	}
 }

@@ -4544,11 +4544,13 @@ it.
     or its matching `BulkAck` arrives. The forced-resync `DUE` predicate uses
     the age bound; the separate cold-prime `AWAITED` predicate suppresses
     duplicate sends while a fresh debt-paying ack is in flight.
-  - Committed worker-repair outcomes and known deterministic helper validation
-    rejections are not retryable: they clear the key marker and retain the
-    intentional ACK path without poisoning mirror-health state. Helper-down,
-    `mirror-write-failed`, unknown, and context-wrapped validation text remain
-    transient and withhold ACK. Cells: `sync_bulk_install_outcome_12166_test.go`,
+  - Committed worker-repair outcomes and typed deterministic helper rejections
+    are not retryable: they clear the key marker and retain the intentional
+    ACK path without poisoning mirror-health state. Deterministic rejections
+    increment `ImportsRejectedByHelper` because the peer still believes the
+    absent session was synced. Helper-down, `mirror-write-failed`, unknown, and
+    untyped context-containing validation text remain transient and withhold ACK.
+    Cells: `sync_bulk_install_outcome_12166_test.go`,
     `sync_bulk_retry_12166_test.go`, and
     `pkg/dataplane/userspace/synced_import_refusal_6785_test.go`.
   - `snapshotZoneOwnership` captures each RG's primary answer, the zone-level

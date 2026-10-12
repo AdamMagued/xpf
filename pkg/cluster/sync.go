@@ -363,6 +363,11 @@ type SyncStats struct {
 	// takeover-readiness gate — refusing to fail over on a node whose peer is
 	// oversubscribing it would turn a capacity problem into an outage.
 	ImportsRefusedByHelper atomic.Uint64
+	// ImportsRejectedByHelper counts typed deterministic synced-import
+	// rejections from the healthy helper. The peer still believes the session
+	// was synced, so this peer-session debt is surfaced separately from
+	// transport Errors and semantic ImportsRefusedByHelper.
+	ImportsRejectedByHelper atomic.Uint64
 	// ConfigsQueueFullDropped counts config payloads that never reached the
 	// #3931 ordered apply queue because it was full at enqueue (#6778). The
 	// non-blocking enqueue discards the INCOMING payload, which is the NEWEST
@@ -607,9 +612,10 @@ type SyncStatsSnapshot struct {
 	// through a new Manager accessor because the Manager holds only the
 	// SyncStatsProvider interface, and this is the same transport every other
 	// field in the status render already uses.
-	PeerBootIncarnation    string
-	ConfigsApplyFailed     uint64
-	ImportsRefusedByHelper uint64
+	PeerBootIncarnation     string
+	ConfigsApplyFailed      uint64
+	ImportsRefusedByHelper  uint64
+	ImportsRejectedByHelper uint64
 	// #6778 receive-edge loss, and #7328's nack counter alongside it: the
 	// queue-full drop is recovered BY a nack, so a drop that is climbing while
 	// nacks are not tells the operator the recovery path itself is broken (a
@@ -1394,9 +1400,11 @@ type SessionSync struct {
 	// flag bounds it to a single in-flight re-drive so a survivor that ALSO
 	// flaps cannot cause a re-drive storm.
 	bulkRedriveInFlight atomic.Bool
-	// bulkAckRetryOwed latches a retry when a completed bulk's source failed
-	// during its retry attempt. The peer ack clears it through
-	// clearPendingBulkAck, while reconnect's cold-prime path replaces it.
+	// bulkAckRetryOwed keeps retry-readiness debt latched across every
+	// unacknowledged-bulk re-drive. Each re-drive sets it at the start and
+	// re-arms it after a failed source/write attempt. A matching BulkAck
+	// (sync_conn_read.go) or storing a replacement pending bulk (sync_bulk.go)
+	// clears it; clearPendingBulkAck deliberately does not.
 	bulkAckRetryOwed atomic.Bool
 	// bulkRequestInFlight coalesces concurrent inbound syncMsgBulkRequest
 	// handlers; ordinary bulks still serialize through bulkSendMu.
@@ -2286,6 +2294,7 @@ func (s *SessionSync) Stats() SyncStatsSnapshot {
 		BulkEndsEpochOnlyMatched:       s.stats.BulkEndsEpochOnlyMatched.Load(),
 		ConfigsApplyFailed:             s.stats.ConfigsApplyFailed.Load(),
 		ImportsRefusedByHelper:         s.stats.ImportsRefusedByHelper.Load(),
+		ImportsRejectedByHelper:        s.stats.ImportsRejectedByHelper.Load(),
 		ConfigsQueueFullDropped:        s.stats.ConfigsQueueFullDropped.Load(),
 		ConfigApplyNacksReceived:       s.stats.ConfigApplyNacksReceived.Load(),
 		IPsecSASent:                    s.stats.IPsecSASent.Load(), IPsecSAReceived: s.stats.IPsecSAReceived.Load(),

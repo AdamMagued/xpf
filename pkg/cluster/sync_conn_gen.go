@@ -3,7 +3,6 @@ package cluster
 import (
 	"errors"
 	"log/slog"
-	"strings"
 	"sync/atomic"
 
 	"github.com/psaab/xpf/pkg/conntrack"
@@ -12,17 +11,16 @@ import (
 
 // definitiveBulkInstallOutcome reports helper results that cannot be repaired
 // by replaying the identical row: the helper committed it with worker repair
-// pending/overflow, or explicitly rejected the row deterministically.
+// pending/overflow, or explicitly rejected the row deterministically. Every
+// production deterministic rejection reaches this classifier wrapped in
+// dataplane.ErrSyncedImportRejected: userspace/process_control.go classifies
+// helper response text, manager_sessions.go prefixes the mirror error, and
+// the session-store adapters pass it through unchanged. No in-tree path hands
+// the cluster an unwrapped deterministic error.
 func definitiveBulkInstallOutcome(err error) bool {
-	if errors.Is(err, dataplane.ErrSyncedImportRepairPending) ||
+	return errors.Is(err, dataplane.ErrSyncedImportRepairPending) ||
 		errors.Is(err, dataplane.ErrSyncedImportRepairOverflow) ||
-		errors.Is(err, dataplane.ErrSyncedImportRejected) {
-		return true
-	}
-	// Older dataplane adapters and test doubles may flatten the typed
-	// deterministic helper rejection into its stable error text.
-	return strings.HasPrefix(err.Error(), "parse ") ||
-		strings.HasPrefix(err.Error(), "refusing synced session with unresolved IPv6 extension-header")
+		errors.Is(err, dataplane.ErrSyncedImportRejected)
 }
 
 // scopedDeleteKeyV4 keys receiver generation guards by scoped policy-delete
@@ -1646,6 +1644,9 @@ func (s *SessionSync) installClusterSyncedV4(key dataplane.SessionKey, val datap
 		// A committed worker-repair result or deterministic helper rejection
 		// cannot be repaired by re-sending the identical row. Keep it out of
 		// transient mirror-health state and clear this key's retry marker.
+		if errors.Is(err, dataplane.ErrSyncedImportRejected) {
+			s.stats.ImportsRejectedByHelper.Add(1)
+		}
 		slog.Debug("cluster sync: helper returned a committed or deterministic synced-session outcome",
 			"af", "v4", "err", err)
 		s.noteBulkInstallOutcomeV4(key, false)
@@ -1728,6 +1729,9 @@ func (s *SessionSync) installClusterSyncedV6(key dataplane.SessionKeyV6, val dat
 		s.noteBulkInstallOutcomeV6(key, false)
 	} else if definitiveBulkInstallOutcome(err) {
 		// IPv6 twin of the v4 committed/deterministic outcome handling.
+		if errors.Is(err, dataplane.ErrSyncedImportRejected) {
+			s.stats.ImportsRejectedByHelper.Add(1)
+		}
 		slog.Debug("cluster sync: helper returned a committed or deterministic synced-session outcome",
 			"af", "v6", "err", err)
 		s.noteBulkInstallOutcomeV6(key, false)
