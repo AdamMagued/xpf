@@ -299,14 +299,18 @@ fn worker_queue_6929_drops_are_not_folded_into_poison_recoveries() {
 // change what they exercise. `worker_queue.rs` is excluded because it contains
 // the one legitimate `push_back`, inside `push_bounded` itself.
 
-/// Blank out `//` line comments, nested `/* */` blocks and string-literal bodies.
+/// Blank out `//` line comments, nested `/* */` blocks, string-literal bodies
+/// and char literals.
 ///
 /// Comments are stripped so this guard cannot be satisfied by prose that
 /// merely quotes the pattern it forbids — the doc comment on `push_bounded`
 /// names `push_back` in exactly that way. String bodies are stripped so a
 /// literal containing `//` (a URL, say) cannot silently blind the line scan
-/// that follows it. Bytes are replaced by spaces rather than removed so line
-/// numbers in a failure message still point at the real source line.
+/// that follows it. Char and byte-char literals are stripped whole, because
+/// the quote in `'"'` or `b'"'` would otherwise open a phantom string that
+/// swaps code and string state until the next quote. Bytes are replaced by
+/// spaces rather than removed so line numbers in a failure message still point
+/// at the real source line.
 pub(crate) fn blank_comments_and_strings(src: &str) -> String {
     let b = src.as_bytes();
     let mut out = vec![b' '; b.len()];
@@ -372,6 +376,29 @@ pub(crate) fn blank_comments_and_strings(src: &str) -> String {
                 i += 1;
             }
             i = (i + 1).min(b.len());
+        } else if b[i] == b'\'' {
+            // rustc's lexer rule: an escape, or exactly one character, then the
+            // closing quote. Anything else (`'a`, `'static`, `'outer:`) is a
+            // lifetime or label and stays code.
+            let end = if b.get(i + 1) == Some(&b'\\') {
+                b.get(i + 3..)
+                    .and_then(|rest| rest.iter().position(|&c| c == b'\'' || c == b'\n'))
+                    .map(|at| i + 3 + at)
+                    .filter(|&at| b[at] == b'\'')
+            } else {
+                src[i + 1..]
+                    .chars()
+                    .next()
+                    .map(|c| i + 1 + c.len_utf8())
+                    .filter(|&at| b.get(at) == Some(&b'\''))
+            };
+            match end {
+                Some(at) => i = at + 1,
+                None => {
+                    out[i] = b[i];
+                    i += 1;
+                }
+            }
         } else {
             out[i] = b[i];
             i += 1;
@@ -587,14 +614,15 @@ pub(crate) fn cfg_test_modules(root: &std::path::Path) -> std::collections::Hash
     }
 
     // Pass 1 collects every module declaration and literal include! in the
-    // tree, remembering each source file's incoming test gate and included
-    // files. Pass 2 takes the transitive closure, because #[cfg(test)] is
-    // INHERITED: a plain mod or include! inside a file that is itself only
+    // tree: test-gated ones as seeds, the rest as edges from the declaring or
+    // including file. Pass 2 takes the transitive closure, because #[cfg(test)]
+    // is INHERITED: a plain mod or include! inside a file that is itself only
     // compiled under test is equally test-only. Without the closure, 36 files
     // under directories like event_stream/tests/ were still classified as
     // production — the third defect this control caught.
-    let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seeds: Vec<String> = Vec::new();
     let mut edges: Vec<(String, String)> = Vec::new();
+    let mut included: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut files = Vec::new();
     afxdp_rs_files(root, &mut files);
     for path in files {
@@ -629,7 +657,8 @@ pub(crate) fn cfg_test_modules(root: &std::path::Path) -> std::collections::Hash
             }
             // include! source belongs to the file containing the macro,
             // unlike a module resolved from the owning module directory.
-            // Record an edge so test-only parents classify included files too.
+            // Record a seed under #[cfg(test)], else an edge, so test-only
+            // parents classify included files too.
             // Match only a complete macro name at the start of a code line.
             // The blanked copy preserves byte offsets, so the path still comes
             // from the original string literal, never comment/string contents.
@@ -641,12 +670,13 @@ pub(crate) fn cfg_test_modules(root: &std::path::Path) -> std::collections::Hash
                 if let Some(rest) = rest.strip_prefix('"') {
                     if let Some(end) = rest.find('"') {
                         if let Some(dir) = path.parent() {
-                            let from = normalise(&path, root);
                             let target = normalise(&dir.join(&rest[..end]), root);
+                            included.insert(target.clone());
                             if cfg_test {
-                                out.insert(target.clone());
+                                seeds.push(target);
+                            } else {
+                                edges.push((normalise(&path, root), target));
                             }
-                            edges.push((from, target));
                         }
                     }
                 }
@@ -687,7 +717,7 @@ pub(crate) fn cfg_test_modules(root: &std::path::Path) -> std::collections::Hash
                         ],
                     };
                     for cand in candidates {
-                        out.insert(normalise(&cand, root));
+                        seeds.push(normalise(&cand, root));
                     }
                 } else {
                     // Not test-gated HERE, but may inherit if this owning file
@@ -719,20 +749,42 @@ pub(crate) fn cfg_test_modules(root: &std::path::Path) -> std::collections::Hash
         }
     }
 
-    // Pass 2: fixpoint. Bounded by the edge count, so it terminates even on a
-    // cyclic declaration graph — which cannot exist in valid Rust, but a
-    // scanner that hangs on malformed input is worse than one that stops early.
-    for _ in 0..edges.len().max(1) {
-        let mut grew = false;
-        for (from, to) in &edges {
-            if out.contains(from) && !out.contains(to) {
-                out.insert(to.clone());
-                grew = true;
-            }
-        }
-        if !grew {
+    // Pass 2: fixpoint from the seeds. Bounded by the seed and edge counts, so
+    // it terminates even on a cyclic declaration graph — which cannot exist in
+    // valid Rust, but a scanner that hangs on malformed input is worse than one
+    // that stops early.
+    //
+    // include! exists to reuse text, so one file can be included by a
+    // test-only file and also declared or included by production. An include
+    // target is admitted only once every ungated edge into it starts from a
+    // test-only file; otherwise a test helper including shared production
+    // source would hide that source from every canary. Admission only becomes
+    // true as the set grows, so the iteration still reaches the least
+    // fixpoint: an includer found test-only on a later pass admits the target
+    // on the pass after.
+    let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for _ in 0..=seeds.len() + edges.len() {
+        let reached: Vec<String> = seeds
+            .iter()
+            .chain(
+                edges
+                    .iter()
+                    .filter(|(from, _)| out.contains(from))
+                    .map(|(_, to)| to),
+            )
+            .filter(|to| !out.contains(*to))
+            .filter(|to| {
+                !included.contains(*to)
+                    || edges
+                        .iter()
+                        .all(|(from, edge_to)| edge_to != *to || out.contains(from))
+            })
+            .cloned()
+            .collect();
+        if reached.is_empty() {
             break;
         }
+        out.extend(reached);
     }
     out
 }
@@ -762,6 +814,26 @@ fn cfg_test_include_edges_ignore_non_code_text_12270() {
         (
             "nested_block_comment",
             "/* outer /* inner */ include!(\"../prod.rs\") */",
+        ),
+        // Line-start include! inside multi-line comments and raw strings: the
+        // line-start rule alone accepts these, so only blanking rejects them.
+        (
+            "line_start_in_block_comment",
+            "/*\ninclude!(\"../prod.rs\");\n*/",
+        ),
+        (
+            "line_start_in_raw_string",
+            "const DOC: &str = r#\"\ninclude!(\"../prod.rs\");\n\"#;",
+        ),
+        // An unblanked quote char opens a phantom string that ends at the raw
+        // string's opening quote, exposing the raw string's body as code.
+        (
+            "char_quote_before_raw_string",
+            "const Q: char = '\"';\nconst DOC: &str = r#\"\ninclude!(\"../prod.rs\");\n\"#;",
+        ),
+        (
+            "byte_char_quote_before_raw_string",
+            "const Q: u8 = b'\"';\nconst DOC: &str = r#\"\ninclude!(\"../prod.rs\");\n\"#;",
         ),
         ("macro_name", r#"my_include!("../prod.rs");"#),
         (
@@ -826,6 +898,26 @@ fn cfg_test_include_edges_ignore_non_code_text_12270() {
         "nested include! edge or its .. path was not followed"
     );
 
+    // A quote char literal must not hide the include! after it, and a lifetime
+    // must not be read as a char literal that swallows it.
+    let root = temp.join("char_literal_before_include");
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    std::fs::write(
+        root.join("test_parent.rs"),
+        "#[cfg(test)]\n#[path = \"tests/fixture.rs\"]\nmod tests;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("tests/fixture.rs"),
+        "const Q: char = '\"';\nfn f<'a>(s: &'a str) -> &'a str { s }\ninclude!(\"../helper.rs\");\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("helper.rs"), "").unwrap();
+    assert!(
+        cfg_test_modules(&root).contains("helper.rs"),
+        "a char literal or lifetime hid the include! that follows it"
+    );
+
     let root = temp.join("cfg_include_resets_before_mod");
     std::fs::create_dir_all(root.join("parent")).unwrap();
     std::fs::write(
@@ -846,6 +938,164 @@ fn cfg_test_include_edges_ignore_non_code_text_12270() {
     assert!(
         cfg_test_modules(&src).contains("afxdp/icmp_ptb_primary_fallback_11437_tests.rs"),
         "the real icmp_ptb_tests.rs:10 include! edge must remain classified"
+    );
+    let _ = std::fs::remove_dir_all(&temp);
+}
+
+/// The shared blanker strips char literals whole and leaves lifetimes and
+/// labels as code. Unblanked, the quote in `'"'` opened a phantom string that
+/// read the following code as string and the next string as code, in every
+/// guard that calls the blanker rather than only in the include! scan.
+#[test]
+fn blank_comments_and_strings_strips_char_literals_not_lifetimes_12270() {
+    let src = concat!(
+        "let q = '\"'; let e = '\\''; let u = '\\u{22}'; let m = 'é';\n",
+        "fn f<'a>(x: &'a str) -> &'static str { 'outer: loop { break 'outer; } x }\n",
+        "let s = \"text\"; let b = b'\"'; code();\n",
+    );
+    let blanked = blank_comments_and_strings(src);
+    assert_eq!(
+        blanked.len(),
+        src.len(),
+        "blanking must preserve byte offsets"
+    );
+    let lines: Vec<&str> = blanked.lines().collect();
+    assert_eq!(lines.len(), 3, "blanking must preserve line breaks");
+    assert!(
+        lines[0].starts_with("let q =")
+            && lines[0].contains("let m =")
+            && !lines[0].contains(['\'', '"']),
+        "char literals were not stripped whole: {:?}",
+        lines[0]
+    );
+    assert_eq!(
+        lines[1],
+        src.lines().nth(1).unwrap(),
+        "lifetimes and labels must stay code"
+    );
+    assert!(
+        lines[2].contains("code();")
+            && !lines[2].contains("text")
+            && !lines[2].contains(['\'', '"']),
+        "a char literal swapped code and string state: {:?}",
+        lines[2]
+    );
+}
+
+/// include! copies text, so a file a test includes can also be compiled into
+/// production. That file must stay production: classifying it as a fixture
+/// drops it, and every module it declares, from the #6929, #7015, #7053 and
+/// #8121 scans while #8325 stays green.
+#[test]
+fn cfg_test_include_targets_shared_with_production_stay_production_12270() {
+    let temp = std::env::temp_dir().join(format!("xpf-include-share-12270-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp);
+    let scan = |name: &str, files: &[(&str, &str)]| {
+        let root = temp.join(name);
+        for (rel, text) in files {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        cfg_test_modules(&root)
+    };
+
+    let fixtures = scan(
+        "declared_by_production",
+        &[
+            (
+                "lib/mod.rs",
+                "mod prod;\n#[cfg(test)]\n#[path = \"t.rs\"]\nmod t;\n",
+            ),
+            ("lib/t.rs", "include!(\"prod.rs\");\n"),
+            ("lib/prod.rs", "mod child;\n"),
+            ("lib/prod/child.rs", ""),
+        ],
+    );
+    assert!(
+        fixtures.contains("lib/t.rs"),
+        "the test-gated includer was not recognized"
+    );
+    assert!(
+        !fixtures.contains("lib/prod.rs") && !fixtures.contains("lib/prod/child.rs"),
+        "a test include! hid a production-declared module and its child"
+    );
+
+    let fixtures = scan(
+        "included_by_production",
+        &[
+            (
+                "test_parent.rs",
+                "#[cfg(test)]\n#[path = \"tests/fixture.rs\"]\nmod tests;\n",
+            ),
+            ("tests/fixture.rs", "include!(\"../shared.rs\");\n"),
+            ("prod_user.rs", "include!(\"shared.rs\");\n"),
+            ("shared.rs", "mod child;\n"),
+            ("shared/child.rs", ""),
+        ],
+    );
+    assert!(
+        fixtures.contains("tests/fixture.rs"),
+        "the test fixture was not recognized"
+    );
+    assert!(
+        !fixtures.contains("shared.rs") && !fixtures.contains("shared/child.rs"),
+        "a file that production also includes was hidden as a fixture"
+    );
+
+    let fixtures = scan(
+        "gated_and_ungated_include",
+        &[
+            ("a.rs", "#[cfg(test)]\ninclude!(\"shared.rs\");\n"),
+            ("b.rs", "include!(\"shared.rs\");\n"),
+            ("shared.rs", ""),
+        ],
+    );
+    assert!(
+        !fixtures.contains("shared.rs"),
+        "a test-gated include! outweighed an ungated include! of the same file"
+    );
+
+    // Control: a helper shared only by test files is still a fixture when its
+    // includers are classified on different passes.
+    let fixtures = scan(
+        "shared_by_test_only_files",
+        &[
+            (
+                "test_parent.rs",
+                "#[cfg(test)]\n#[path = \"tests/a.rs\"]\nmod a;\n",
+            ),
+            (
+                "tests/a.rs",
+                "#[path = \"b.rs\"]\nmod b;\ninclude!(\"common.rs\");\n",
+            ),
+            ("tests/b.rs", "include!(\"common.rs\");\n"),
+            ("tests/common.rs", ""),
+        ],
+    );
+    assert!(
+        fixtures.contains("tests/b.rs") && fixtures.contains("tests/common.rs"),
+        "a helper included only by test-only files was left as production"
+    );
+
+    // Pinned limit, disclosed in docs/log/12270.md: this scanner resolves a
+    // crate root's `mod prod;` to main/prod.rs, so that declaration does not
+    // block the include, and prod.rs is still classified as a fixture.
+    let fixtures = scan(
+        "crate_root_declaration",
+        &[
+            (
+                "main.rs",
+                "mod prod;\n#[cfg(test)]\n#[path = \"t.rs\"]\nmod t;\n",
+            ),
+            ("t.rs", "include!(\"prod.rs\");\n"),
+            ("prod.rs", ""),
+        ],
+    );
+    assert!(
+        fixtures.contains("prod.rs"),
+        "crate-root mod resolution changed: invert this pin and drop the crate-root \
+         limit from the #12270 Risk text"
     );
     let _ = std::fs::remove_dir_all(&temp);
 }
