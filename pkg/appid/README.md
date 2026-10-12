@@ -113,8 +113,9 @@ and resolves session display names from the dataplane's assigned `app_id`.
   (`addAppRef`) inside `CatalogNames`, so the two reference paths cannot
   diverge (#3626 L04). `TestStrictValidationSetMatchesCatalogNames`
   pins the user-app subset of `CatalogNames(cfg, false)` to
-  `config.ApplicationsToValidateStrict` — its fixture now carries a
-  NAT-only reference so the parity covers the NAT walk too.
+  `config.ApplicationsToValidateStrict` — its fixture carries both a NAT-only
+  reference and a predefined `junos-sip` bundle reference, covering the NAT
+  and predefined-bundle walks.
 - `CatalogNames` is nil-tolerant on the policy walk (#3622): a nil
   `*config.ZonePairPolicies` entry or a nil `*config.Policy` entry —
   both admitted by the tolerant-load path (#1960) — is skipped rather
