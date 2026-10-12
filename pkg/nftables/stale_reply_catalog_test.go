@@ -236,6 +236,26 @@ func TestHostInboundStaleReplyGuardsFollowIngressPolicy10752(t *testing.T) {
 	}
 }
 
+func TestHostInboundStaleReplyGuardsCoverLifelineWithheldAddresses12229(t *testing.T) {
+	views := []HostInboundZoneView{{
+		Zone: "deny", SystemServices: []string{"snmp"}, V4Addrs: []string{"198.51.100.2"},
+		IngressDenyV4: []string{"192.0.2.1"}, IngressDenyV6: []string{"2001:db8::1"},
+		IngressNetdevs: []string{"ge-untrust"},
+	}}
+	rules := HostInboundStaleReplyGuardRules(views, nil, nil, nil, false)
+	for _, tc := range []struct {
+		family  string
+		address string
+	}{
+		{"ip", "192.0.2.1"},
+		{"ip6", "2001:db8::1"},
+	} {
+		if !guardRuleHasIngressTuple(rules, []string{"ge-untrust"}, false, tc.address, tc.family, config.HostInboundProtoTCP, 22) {
+			t.Errorf("shared %s destination %s lacks the denying ingress stale-reply guard", tc.family, tc.address)
+		}
+	}
+}
+
 func TestHostInboundStaleReplyNetlinkEmitsIngressScope10752(t *testing.T) {
 	views := []HostInboundZoneView{
 		{Zone: "deny", SystemServices: []string{"snmp"}, V4Addrs: []string{"192.0.2.10"}, IngressNetdevs: []string{"eth-deny"}},

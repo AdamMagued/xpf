@@ -104,9 +104,9 @@ func buildHostInboundNetlink(p *nlPlan, spec HostInboundSpec) {
 	// host-service or any-service rules can reach broad accepts.
 	emitHostInboundWireGuardIngressNetlink(p, spec.Views, famV4, spec.WGListenPorts, spec.WGZonePorts)
 	emitHostInboundWireGuardIngressNetlink(p, spec.Views, famV6, spec.WGListenPorts, spec.WGZonePorts)
-	// #9637: unambiguous ingress scopes take their zone's service rights first.
-	// Unzoned destination addresses are excluded so a zone cannot admit another
-	// interface's address; its catch-all still denies them below.
+	// #9637/#12229: each unambiguous ingress scope judges every zone-owned and
+	// lifeline-withheld destination using that view's service policy. Ambiguous
+	// scopes retain destination-owner service admits and their counted catch-all.
 	zoneIngressV4, zoneIngressV6 := hostInboundZoneIngressDestinations(spec.Views)
 	for _, v := range spec.Views {
 		emitHostInboundZoneIngressNetlink(p, v, famV4, zoneIngressV4)

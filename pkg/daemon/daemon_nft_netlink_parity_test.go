@@ -660,6 +660,7 @@ var iifnameNeSetRe = regexp.MustCompile(`iifname != \{[^{}]*\}`)
 // ruleIifnameScope below. Single-name `meta sdifname "x"` lines byte
 // compare directly (inline Cmp data renders intact).
 var sdifnameSetRe = regexp.MustCompile(`meta sdifname \{[^{}]*\}`)
+
 // sdifnameNeSetRe is the negated counterpart. Preserve `!=` so the per-rule
 // scope assertion and text diff still catch an admission polarity change.
 var sdifnameNeSetRe = regexp.MustCompile(`meta sdifname != \{[^{}]*\}`)
@@ -898,12 +899,11 @@ func bytesTrimRightZero(b []byte) []byte {
 
 func parityHostInboundInputs() (views []dpuserspace.ZoneHostInboundView, unzonedV4, unzonedV6 []string, programs []dpuserspace.JunosHostProgram, wg []uint16, wgZones map[string][]uint16) {
 	views = []dpuserspace.ZoneHostInboundView{
-		// #9637: IngressNetdevs on every rendering branch the ingress-zone rules
-		// take, so T1 pins them rule-for-rule: a multi-netdev set (trust), the
-		// named-service union (mgmt), routing protocols (core), the ident-reset
-		// reject (edge), the empty-admit drop (quarantine), any-service (open),
-		// and the v6-only view.
-		// The shared VRF pair pins member-scoped ingress, destination-owner fallback, and counted v4/v6 drops.
+		// #9637/#12229: IngressNetdevs on every rendering branch the ingress-zone
+		// rules take, including withheld lifeline-shared destinations. T1 pins
+		// a multi-netdev set, named-service union, routing protocols,
+		// ident-reset reject, empty-admit drop, any-service, v6-only, and
+		// direct/VRF-scoped ingress-deny views.
 		{Zone: "trust", SystemServices: []string{"ssh", "https", "ping", "dns"}, V4Addrs: []string{"10.0.1.1", "10.0.1.2"}, V6Addrs: []string{"2001:db8:1::1"}, IngressNetdevs: []string{"ge-0-0-0", "ge-0-0-0.10"}, ICMPFloodThreshold: 30, UDPFloodThreshold: 20, SYNFloodThreshold: 100, SYNFloodSrcThreshold: 5},
 		{Zone: "mgmt", SystemServices: []string{"all"}, V4Addrs: []string{"10.0.9.1"}, IngressNetdevs: []string{"ge-0-0-9"}},
 		{Zone: "core", Protocols: []string{"all"}, V4Addrs: []string{"10.0.5.1"}, V6Addrs: []string{"2001:db8:5::1"}, IngressNetdevs: []string{"ge-0-0-5"}},
@@ -917,6 +917,9 @@ func parityHostInboundInputs() (views []dpuserspace.ZoneHostInboundView, unzoned
 		// addresses and cannot show that (mutation M7 of #9637 escaped without
 		// this row).
 		{Zone: "v6only", SystemServices: []string{"ping"}, V6Addrs: []string{"2001:db8:66::1"}, IngressNetdevs: []string{"ge-0-0-66"}},
+		// This ingress-deny-only view pins converter copies and the VRF-scoped
+		// IPv4/IPv6 catch-all rules in both renderers.
+		{Zone: "lifeline-vrf-deny", IngressNetdevs: []string{"lifeline-vrf"}, IngressVRFScopes: []config.HostInboundVRFIngressScope{{Master: "lifeline-vrf", Slaves: []string{"ge-lifeline-vrf"}}}, IngressDenyV4: []string{"192.0.2.88"}, IngressDenyV6: []string{"2001:db8:88::1"}},
 		{Zone: "shared-trust", SystemServices: []string{"ssh"}, V4Addrs: []string{"10.0.91.1"}, V6Addrs: []string{"fe80::91"}, IngressVRFScopes: []config.HostInboundVRFIngressScope{{Master: "shared-parent", Slaves: []string{"trust-slave"}}}, IngressDenyNetdevs: []string{"shared-parent"}},
 		{Zone: "shared-untrust", SystemServices: []string{"ping"}, V4Addrs: []string{"10.0.92.1"}, V6Addrs: []string{"2001:db8:92::1"}, IngressVRFScopes: []config.HostInboundVRFIngressScope{{Master: "shared-parent", Slaves: []string{"untrust-slave"}}}},
 		{Zone: "shared-trust", SystemServices: []string{"ping"}, V4Addrs: []string{"10.0.91.2"}, V6Addrs: []string{"fe80::92"}, IngressVRFScopes: []config.HostInboundVRFIngressScope{{Master: "shared-parent", Slaves: []string{"trust-slave-2"}}}},

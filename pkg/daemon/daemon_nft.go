@@ -1878,8 +1878,9 @@ func hostInboundHasIngressScope(views []dpuserspace.ZoneHostInboundView, unzoned
 //
 //  4. VRF slave names with no surviving zone are denied by `meta sdifname`
 //     before any zone rule scoped to their shared LOCAL_IN master. Ingress-zone
-//     service rules match only zone-owned local addresses; ambiguous effective
-//     targets retain owner-specific admits plus a counted catch-all drop.
+//     service rules judge each view's policy against every zone-owned and
+//     lifeline-withheld destination; ambiguous effective targets retain owner-
+//     specific admits plus a counted catch-all drop.
 //
 //  5. Other known unzoned physical ingress is denied by iifname before
 //     `ct state established,related accept`, which preserves established traffic
@@ -1969,14 +1970,17 @@ func buildHostInboundFilterPayloadWithUnzonedIngress(views []dpuserspace.ZoneHos
 		}
 	}
 	// Ingress-zone rules reference the per-zone/family counter across every
-	// zone-owned destination, including families with no address in that view.
+	// judged destination, including withheld lifeline values and families with
+	// no address in that view.
 	ingressV4, ingressV6 := hostInboundIngressDestinations(views, unzonedV4, unzonedV6)
 	zoneIngressV4, zoneIngressV6 := hostInboundZoneIngressDestinations(views)
 	for _, v := range views {
-		if hostInboundEmitsDrop(v, v.V4Addrs) || hostInboundEmitsIngressDrop(v, zoneIngressV4) || hostInboundEmitsWireGuardGuard(v.V4Addrs, wgListenPorts) {
+		if hostInboundEmitsDrop(v, v.V4Addrs) || hostInboundEmitsIngressDrop(v, zoneIngressV4) ||
+			hostInboundEmitsWireGuardGuard(v.V4Addrs, wgListenPorts) {
 			addCounter(xnft.HostInboundDenyCounterName(v.Zone, "ip"))
 		}
-		if hostInboundEmitsDrop(v, v.V6Addrs) || hostInboundEmitsIngressDrop(v, zoneIngressV6) || hostInboundEmitsWireGuardGuard(v.V6Addrs, wgListenPorts) {
+		if hostInboundEmitsDrop(v, v.V6Addrs) || hostInboundEmitsIngressDrop(v, zoneIngressV6) ||
+			hostInboundEmitsWireGuardGuard(v.V6Addrs, wgListenPorts) {
 			addCounter(xnft.HostInboundDenyCounterName(v.Zone, "ip6"))
 		}
 	}
@@ -2168,9 +2172,9 @@ func buildHostInboundFilterPayloadWithUnzonedIngress(views []dpuserspace.ZoneHos
 	// reaches these accepts.
 	emitHostInboundWireGuardIngressAccepts(&rules, views, "ip", wgListenPorts, wgZonePorts)
 	emitHostInboundWireGuardIngressAccepts(&rules, views, "ip6", wgListenPorts, wgZonePorts)
-	// #9637: unambiguous ingress scopes take their zone's service rights first,
-	// but only for zone-owned destinations. Ambiguous scopes retain the
-	// destination-owner service admits and their counted catch-all.
+	// #9637/#12229: each unambiguous ingress scope judges every zone-owned and
+	// lifeline-withheld destination using that view's service policy. Ambiguous
+	// scopes retain destination-owner service admits and their counted catch-all.
 	for _, v := range views {
 		emitHostInboundZoneIngress(&rules, v, "ip", zoneIngressV4)
 		emitHostInboundZoneIngress(&rules, v, "ip6", zoneIngressV6)

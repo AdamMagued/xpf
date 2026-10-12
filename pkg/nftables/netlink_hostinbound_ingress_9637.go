@@ -1,10 +1,10 @@
 package nftables
 
 // hostInboundIngressDestinations mirrors the daemon oracle's helper of the same
-// name: every judged firewall-local address per family (each view's, then the
-// unzoned ones), first-seen order, no duplicates (#9637). It feeds the unzoned
-// and ambiguous guards; ordinary zone-ingress rules use only zone-owned
-// destinations.
+// name: every judged firewall-local address per family (each view's, including
+// withheld lifeline-shared ingress-deny values, then the unzoned ones),
+// first-seen order, no duplicates (#9637, #12229). It feeds the unzoned,
+// ambiguous, and per-zone ingress guards.
 func hostInboundIngressDestinations(views []HostInboundZoneView, unzonedV4, unzonedV6 []string) (v4, v6 []string) {
 	seen4, seen6 := map[string]bool{}, map[string]bool{}
 	add := func(out *[]string, seen map[string]bool, addrs []string) {
@@ -18,6 +18,8 @@ func hostInboundIngressDestinations(views []HostInboundZoneView, unzonedV4, unzo
 	for _, v := range views {
 		add(&v4, seen4, v.V4Addrs)
 		add(&v6, seen6, v.V6Addrs)
+		add(&v4, seen4, v.IngressDenyV4)
+		add(&v6, seen6, v.IngressDenyV6)
 	}
 	add(&v4, seen4, unzonedV4)
 	add(&v6, seen6, unzonedV6)
@@ -304,7 +306,7 @@ func hostInboundEmitsUnzonedIngressDrop(netdevs, dests []string) bool {
 }
 
 // emitHostInboundZoneIngressNetlink mirrors the daemon oracle: normal view
-// matches are scoped to ingress netdevs and every zone-owned destination.
+// matches are scoped to ingress netdevs and every judged local destination.
 func emitHostInboundZoneIngressNetlink(p *nlPlan, v HostInboundZoneView, f nlFamily, dests []string) {
 	if len(dests) == 0 {
 		return
