@@ -179,6 +179,8 @@ func TestResolveMACFirstStillRefusesSlotSwap(t *testing.T) {
 }
 
 func TestResolveMovedOriginalCardStillRefusesSlotSwap(t *testing.T) {
+	// #12206: `key mac` reaches only the MAC arm, so precheck (b) is its sole
+	// moved-card refusal oracle. Keep it distinct from the mac-then-pci case.
 	const (
 		pinnedPCI = "0000:09:00.0"
 		movedPCI  = "0000:0a:00.0"
@@ -194,8 +196,11 @@ func TestResolveMovedOriginalCardStillRefusesSlotSwap(t *testing.T) {
 		name     string
 		keyOrder string
 	}{
+		{name: "mac-only", keyOrder: config.DeviceMapKeyMAC},
 		{name: "mac-first", keyOrder: config.DeviceMapKeyMACThenPCI},
 		{name: "pci-first", keyOrder: config.DeviceMapKeyPCIThenMAC},
+		{name: "pci-only", keyOrder: config.DeviceMapKeyPCI},
+		{name: "default", keyOrder: ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			entries := []config.DeviceMapEntry{
