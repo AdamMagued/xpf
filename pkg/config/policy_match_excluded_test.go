@@ -233,8 +233,9 @@ func TestPolicyMatchAddressTypoFailsCommit(t *testing.T) {
 
 // TestPolicyMatchAddressLegitimateFormsCommit asserts the strict
 // validator does NOT reject any legitimate address form (#2008): an
-// address-book name, `any`, `any-ipv4` / `any-ipv6`, a literal CIDR,
-// and a bare IP — including under `*-address-excluded`.
+// address-book name, `any`, `any-ipv4` / `any-ipv6` and their internal
+// short forms `any4` / `any6` (#12242), a literal CIDR, and a bare IP —
+// including under `*-address-excluded`.
 func TestPolicyMatchAddressLegitimateFormsCommit(t *testing.T) {
 	tree := buildTree(t, []string{
 		"set security zones security-zone trust",
@@ -251,6 +252,11 @@ func TestPolicyMatchAddressLegitimateFormsCommit(t *testing.T) {
 		"set security policies from-zone trust to-zone untrust policy fam match destination-address any-ipv6",
 		"set security policies from-zone trust to-zone untrust policy fam match application any",
 		"set security policies from-zone trust to-zone untrust policy fam then permit",
+		// any4 / any6: the internal short forms of the same keywords (#12242)
+		"set security policies from-zone trust to-zone untrust policy short match source-address any4",
+		"set security policies from-zone trust to-zone untrust policy short match destination-address any6",
+		"set security policies from-zone trust to-zone untrust policy short match application any",
+		"set security policies from-zone trust to-zone untrust policy short then permit",
 		// literal CIDR + bare IP (v4 and v6)
 		"set security policies from-zone trust to-zone untrust policy lit match source-address 172.16.0.0/16",
 		"set security policies from-zone trust to-zone untrust policy lit match destination-address 2001:db8::1",

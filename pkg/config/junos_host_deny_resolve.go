@@ -63,15 +63,9 @@ func junosHostResolveAddrSet(cfg *Config, tokens []string, feedBound map[string]
 			ok = false
 			return
 		}
-		if val == "any" || val == "any-ipv4" || val == "any-ipv6" {
-			switch val {
-			case "any":
-				anyV4, anyV6 = true, true
-			case "any-ipv4":
-				anyV4 = true
-			case "any-ipv6":
-				anyV6 = true
-			}
+		if kwV4, kwV6, kw := PolicyAddressWildcardFamilies(val); kw {
+			anyV4 = anyV4 || kwV4
+			anyV6 = anyV6 || kwV6
 			return
 		}
 		// netip.ParsePrefix rejects every padded mask, including forms the
@@ -103,15 +97,17 @@ func junosHostResolveAddrSet(cfg *Config, tokens []string, feedBound map[string]
 		}
 	}
 	for _, tok := range tokens {
-		switch tok {
-		case "", "any":
+		// Keywords before any name lookup (#9523), from the SSOT family table so
+		// the short forms `any4` / `any6` the strict gate accepts project exactly
+		// like `any-ipv4` / `any-ipv6` instead of failing as an unresolvable
+		// literal and withdrawing the whole ingress-zone program (#12242).
+		if tok == "" {
 			anyV4, anyV6 = true, true
 			continue
-		case "any-ipv4":
-			anyV4 = true
-			continue
-		case "any-ipv6":
-			anyV6 = true
+		}
+		if kwV4, kwV6, kw := PolicyAddressWildcardFamilies(tok); kw {
+			anyV4 = anyV4 || kwV4
+			anyV6 = anyV6 || kwV6
 			continue
 		}
 		if junosHostNameUnrepresentable(ab, feedBound, tok, map[string]bool{}) {
@@ -146,11 +142,11 @@ func junosHostResolveAddrSet(cfg *Config, tokens []string, feedBound map[string]
 }
 
 // junosHostAddrScoped reports whether a token list names a concrete (non-any)
-// address scope.
+// address scope. The empty token and every match-all keyword (#12242: the SSOT
+// set, short forms included) are not a scope.
 func junosHostAddrScoped(tokens []string) bool {
 	for _, t := range tokens {
-		switch t {
-		case "", "any", "any-ipv4", "any-ipv6":
+		if t == "" || IsPolicyAddressWildcardKeyword(t) {
 			continue
 		}
 		return true
