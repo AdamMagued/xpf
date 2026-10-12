@@ -79,8 +79,19 @@ func quarantineCollidingZones(snap *ConfigSnapshot) []ZoneIDCollision {
 		return nil
 	}
 	collisions := make([]ZoneIDCollision, 0, len(quarantined))
+	// #12249: the defined-`any` poison follows THIS snapshot's own zones — the
+	// effective cfg.Security.Zones keys buildZoneSnapshots emits, which policy
+	// lowering and PolicyContentRejectionReasons also read — never the runtime
+	// name set. An `any` defined only in a peer node's view installs nothing
+	// here; poisoning this node's legitimate wildcard rules on it would make
+	// the helper refuse the whole snapshot with no rejection reason to explain
+	// it, and partial republishes (effective lowering) would publish them clean.
+	definedAny := false
 	kept := snap.Zones[:0]
 	for _, z := range snap.Zones {
+		if z.Name == config.ReservedWildcardZoneName {
+			definedAny = true
+		}
 		if _, drop := quarantined[z.Name]; drop {
 			collisions = append(collisions, ZoneIDCollision{
 				ID:          z.ID,
@@ -138,7 +149,7 @@ func quarantineCollidingZones(snap *ConfigSnapshot) []ZoneIDCollision {
 	// republish paths (#6480).
 	policyQuarantined := config.QuarantinedZoneNames(names)
 	snap.Policies = scrubPoliciesForQuarantinedZones(snap.Policies, policyQuarantined)
-	poisonDefinedAnyZonePairPolicies(snap.Policies, config.HasDefinedAnyZoneName(names))
+	poisonDefinedAnyZonePairPolicies(snap.Policies, definedAny)
 	sort.Slice(collisions, func(i, j int) bool {
 		if collisions[i].ID != collisions[j].ID {
 			return collisions[i].ID < collisions[j].ID
