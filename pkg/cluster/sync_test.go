@@ -804,6 +804,8 @@ type mockSweepDP struct {
 	deletedDNATV6  []dataplane.DNATKeyV6
 	failSetV4      map[dataplane.SessionKey]error
 	failSetV6      map[dataplane.SessionKeyV6]error
+	failDeleteV4   map[dataplane.SessionKey]error
+	failDeleteV6   map[dataplane.SessionKeyV6]error
 	// onSetV4/onSetV6, when set, run INSIDE the session write. They exist so a
 	// test can land a concurrent event in the exact window between a caller's
 	// pre-write check and the write itself — the #6368 config-apply race. nil
@@ -954,6 +956,9 @@ func (m *mockSweepDP) DeleteSession(key dataplane.SessionKey) error {
 	if m.onDeleteV4 != nil {
 		m.onDeleteV4(key)
 	}
+	if err, ok := m.failDeleteV4[key]; ok {
+		return err
+	}
 	delete(m.v4sessions, key)
 	return nil
 }
@@ -961,6 +966,9 @@ func (m *mockSweepDP) DeleteSession(key dataplane.SessionKey) error {
 func (m *mockSweepDP) DeleteSessionV6(key dataplane.SessionKeyV6) error {
 	if m.onDeleteV6 != nil {
 		m.onDeleteV6(key)
+	}
+	if err, ok := m.failDeleteV6[key]; ok {
+		return err
 	}
 	delete(m.v6sessions, key)
 	return nil

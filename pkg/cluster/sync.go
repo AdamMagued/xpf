@@ -363,6 +363,11 @@ type SyncStats struct {
 	// takeover-readiness gate — refusing to fail over on a node whose peer is
 	// oversubscribing it would turn a capacity problem into an outage.
 	ImportsRefusedByHelper atomic.Uint64
+	// ImportsRejectedByHelper counts typed deterministic synced-import
+	// rejections from the healthy helper. The peer still believes the session
+	// was synced, so this peer-session debt is surfaced separately from
+	// transport Errors and semantic ImportsRefusedByHelper.
+	ImportsRejectedByHelper atomic.Uint64
 	// ConfigsQueueFullDropped counts config payloads that never reached the
 	// #3931 ordered apply queue because it was full at enqueue (#6778). The
 	// non-blocking enqueue discards the INCOMING payload, which is the NEWEST
@@ -607,9 +612,10 @@ type SyncStatsSnapshot struct {
 	// through a new Manager accessor because the Manager holds only the
 	// SyncStatsProvider interface, and this is the same transport every other
 	// field in the status render already uses.
-	PeerBootIncarnation    string
-	ConfigsApplyFailed     uint64
-	ImportsRefusedByHelper uint64
+	PeerBootIncarnation     string
+	ConfigsApplyFailed      uint64
+	ImportsRefusedByHelper  uint64
+	ImportsRejectedByHelper uint64
 	// #6778 receive-edge loss, and #7328's nack counter alongside it: the
 	// queue-full drop is recovered BY a nack, so a drop that is climbing while
 	// nacks are not tells the operator the recovery path itself is broken (a
@@ -669,6 +675,7 @@ type TransferReadinessSnapshot struct {
 	Connected             bool
 	PendingBulkAckEpoch   uint64
 	PendingBulkAckAge     time.Duration
+	BulkAckRetryOwed      bool
 	BulkReceiveInProgress bool
 	BulkReceiveEpoch      uint64
 	BulkReceiveSessions   int
@@ -694,7 +701,8 @@ func (s TransferReadinessSnapshot) ConfigStale() bool {
 // security policy. The unplanned/crash failover path is a separate
 // availability-vs-security tradeoff and is NOT gated here.
 func (s TransferReadinessSnapshot) ReadyForManualFailover() bool {
-	return s.PendingBulkAckEpoch == 0 && !s.BulkReceiveInProgress && !s.ConfigStale()
+	return s.PendingBulkAckEpoch == 0 && !s.BulkAckRetryOwed &&
+		!s.BulkReceiveInProgress && !s.ConfigStale()
 }
 
 // Reason explains the current transfer-readiness blocker, if any.
@@ -706,6 +714,8 @@ func (s TransferReadinessSnapshot) Reason() string {
 			age = 0
 		}
 		return fmt.Sprintf("peer still receiving outbound bulk epoch=%d age=%s", s.PendingBulkAckEpoch, age.Round(100*time.Millisecond))
+	case s.BulkAckRetryOwed:
+		return "outbound authoritative bulk retry is owed"
 	case s.BulkReceiveInProgress:
 		return fmt.Sprintf("local bulk receive still in progress epoch=%d sessions=%d", s.BulkReceiveEpoch, s.BulkReceiveSessions)
 	case s.ConfigStale():
@@ -1390,6 +1400,12 @@ type SessionSync struct {
 	// flag bounds it to a single in-flight re-drive so a survivor that ALSO
 	// flaps cannot cause a re-drive storm.
 	bulkRedriveInFlight atomic.Bool
+	// bulkAckRetryOwed keeps retry-readiness debt latched across every
+	// unacknowledged-bulk re-drive. Each re-drive sets it at the start and
+	// re-arms it after a failed source/write attempt. A matching BulkAck
+	// (sync_conn_read.go) or storing a replacement pending bulk (sync_bulk.go)
+	// clears it; clearPendingBulkAck deliberately does not.
+	bulkAckRetryOwed atomic.Bool
 	// bulkRequestInFlight coalesces concurrent inbound syncMsgBulkRequest
 	// handlers; ordinary bulks still serialize through bulkSendMu.
 	bulkRequestInFlight atomic.Bool
@@ -1442,9 +1458,15 @@ type SessionSync struct {
 	// BulkEnd is accepted only on this connection. Guarded by bulkMu, compared
 	// by identity, and cleared with the epoch and incarnation on a full
 	// disconnect.
-	bulkRecvConn               net.Conn
-	bulkRecvV4                 map[dataplane.SessionKey]struct{}
-	bulkRecvV6                 map[dataplane.SessionKeyV6]struct{}
+	bulkRecvConn net.Conn
+	bulkRecvV4   map[dataplane.SessionKey]struct{}
+	bulkRecvV6   map[dataplane.SessionKeyV6]struct{}
+	// bulkInstallFailedV4/V6 retain only transient helper-install failures for
+	// the active authoritative bulk. They are separate from the received-key
+	// set because a failed transport write must not make that snapshot complete;
+	// semantic helper refusals deliberately do not enter these sets.
+	bulkInstallFailedV4        map[dataplane.SessionKey]struct{}
+	bulkInstallFailedV6        map[dataplane.SessionKeyV6]struct{}
 	bulkZoneSnapshot           *zoneOwnershipSnapshot
 	barrierSeq                 atomic.Uint64
 	barrierAckSeq              atomic.Uint64
@@ -2272,6 +2294,7 @@ func (s *SessionSync) Stats() SyncStatsSnapshot {
 		BulkEndsEpochOnlyMatched:       s.stats.BulkEndsEpochOnlyMatched.Load(),
 		ConfigsApplyFailed:             s.stats.ConfigsApplyFailed.Load(),
 		ImportsRefusedByHelper:         s.stats.ImportsRefusedByHelper.Load(),
+		ImportsRejectedByHelper:        s.stats.ImportsRejectedByHelper.Load(),
 		ConfigsQueueFullDropped:        s.stats.ConfigsQueueFullDropped.Load(),
 		ConfigApplyNacksReceived:       s.stats.ConfigApplyNacksReceived.Load(),
 		IPsecSASent:                    s.stats.IPsecSASent.Load(), IPsecSAReceived: s.stats.IPsecSAReceived.Load(),
@@ -2530,6 +2553,8 @@ func (s *SessionSync) reconcileStaleSessions(bulkSerial uint64) (bool, uint64, b
 	s.inventoryActiveGeneration = 0
 	s.bulkRecvV4 = nil
 	s.bulkRecvV6 = nil
+	s.bulkInstallFailedV4 = nil
+	s.bulkInstallFailedV6 = nil
 	s.bulkZoneSnapshot = nil
 	s.bulkMu.Unlock()
 	start := time.Now()

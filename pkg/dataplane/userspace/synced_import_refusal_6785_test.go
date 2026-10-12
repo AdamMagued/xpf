@@ -377,27 +377,34 @@ func TestLegacyReaderRepairWireFailsClosedWithoutRefusalClassification11360(t *t
 // refusal prefix away from byte zero must not change helper-health classification.
 func TestHelperErrorClassification6785(t *testing.T) {
 	cases := []struct {
-		name         string
-		helperError  string
-		wantRefusal  bool
-		wantGateBusy bool
-		wantPending  bool
-		wantOverflow bool
+		name              string
+		helperError       string
+		wantRefusal       bool
+		wantGateBusy      bool
+		wantPending       bool
+		wantOverflow      bool
+		wantDeterministic bool
 	}{
-		{"refusal-capacity", syncedImportRefusedPrefix + "capacity", true, false, false, false},
-		{"refusal-stale", syncedImportRefusedPrefix + "stale-generation", true, false, false, false},
-		{"refusal-reserve", syncedImportRefusedPrefix + "reserve", true, false, false, false},
-		{"repair-pending", syncedImportRepairPrefix + "worker-repair-pending", false, false, true, false},
-		{"repair-overflow", syncedImportRepairPrefix + "worker-repair-overflow", false, false, false, true},
-		{"retryable-gate-busy", syncedImportRefusedPrefix + "gate-busy", false, true, false, false},
-		{"token-not-at-the-start", "write failed while handling " + syncedImportRefusedPrefix + "capacity", false, false, false, false},
-		{"bare-mirror-write-failed", "mirror-write-failed", false, false, false, false},
-		{"plain-helper-error", "session table write failed", false, false, false, false},
-		{"unknown-operation", "unknown session sync operation frobnicate", false, false, false, false},
+		{"refusal-capacity", syncedImportRefusedPrefix + "capacity", true, false, false, false, false},
+		{"refusal-stale", syncedImportRefusedPrefix + "stale-generation", true, false, false, false, false},
+		{"refusal-reserve", syncedImportRefusedPrefix + "reserve", true, false, false, false, false},
+		{"repair-pending", syncedImportRepairPrefix + "worker-repair-pending", false, false, true, false, false},
+		{"repair-overflow", syncedImportRepairPrefix + "worker-repair-overflow", false, false, false, true, false},
+		{"retryable-gate-busy", syncedImportRefusedPrefix + "gate-busy", false, true, false, false, false},
+		{"token-not-at-the-start", "write failed while handling " + syncedImportRefusedPrefix + "capacity", false, false, false, false, false},
+		{"bare-mirror-write-failed", "mirror-write-failed", false, false, false, false, false},
+		{"plain-helper-error", "session table write failed", false, false, false, false, false},
+		{"unknown-operation", "unknown session sync operation frobnicate", false, false, false, false, false},
+		{"known-parse-error", "parse next_hop invalid IP address", false, false, false, false, true},
+		{"known-unresolved-extension", "refusing synced session with unresolved IPv6 extension-header protocol 0", false, false, false, false, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
+			dir, err := os.MkdirTemp("", "s78-")
+			if err != nil {
+				t.Fatalf("create short session-socket directory: %v", err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(dir) })
 			sock := filepath.Join(dir, "userspace-dp-sessions.sock")
 			ln, err := net.Listen("unix", sock)
 			if err != nil {
@@ -437,6 +444,10 @@ func TestHelperErrorClassification6785(t *testing.T) {
 				t.Fatalf("classified as a terminal semantic refusal = %v, want %v (err %v)",
 					got, tc.wantRefusal, err)
 			}
+			if got := errors.Is(err, dataplane.ErrSyncedImportRejected); got != tc.wantDeterministic {
+				t.Fatalf("classified as a deterministic helper rejection = %v, want %v (err %v)",
+					got, tc.wantDeterministic, err)
+			}
 			if got := errors.Is(err, errSyncedImportGateBusy); got != tc.wantGateBusy {
 				t.Fatalf("classified as retryable gate-busy = %v, want %v (err %v)",
 					got, tc.wantGateBusy, err)
@@ -450,7 +461,7 @@ func TestHelperErrorClassification6785(t *testing.T) {
 					got, tc.wantOverflow, err)
 			}
 			// Every recognized status retains its stable reason token.
-			if tc.wantRefusal || tc.wantGateBusy || tc.wantPending || tc.wantOverflow {
+			if tc.wantRefusal || tc.wantGateBusy || tc.wantPending || tc.wantOverflow || tc.wantDeterministic {
 				prefix := syncedImportRefusedPrefix
 				if tc.wantPending || tc.wantOverflow {
 					prefix = syncedImportRepairPrefix
@@ -875,5 +886,29 @@ func TestMirrorWriteFailedWireAgreement10788(t *testing.T) {
 	)
 	if !bareResponse.MatchString(stripLineComments(string(rustHandler))) {
 		t.Fatal("Rust sync handler no longer sends mirror-write-failed bare while prefixing semantic refusals")
+	}
+}
+
+func TestDeterministicSyncedImportRejectionPreservesMirrorHealth6785(t *testing.T) {
+	for _, previouslyFailed := range []bool{false, true} {
+		m := New()
+		m.sessionMirrorFailed = previouslyFailed
+		if previouslyFailed {
+			m.sessionMirrorErr = "prior transport failure"
+		}
+		m.mu.Lock()
+		m.noteSyncedMirrorFailureLocked(fmt.Errorf("%w: parse next_hop invalid IP address",
+			dataplane.ErrSyncedImportRejected))
+		m.mu.Unlock()
+		if m.sessionMirrorFailed != previouslyFailed {
+			t.Fatalf("deterministic rejection changed prior mirror health from %v to %v",
+				previouslyFailed, m.sessionMirrorFailed)
+		}
+		if previouslyFailed && m.sessionMirrorErr != "prior transport failure" {
+			t.Fatalf("deterministic rejection cleared the prior mirror failure: %q", m.sessionMirrorErr)
+		}
+		if got := m.syncedImportRefusals.Load(); got != 0 {
+			t.Fatalf("deterministic parse rejection counted as semantic refusal: %d", got)
+		}
 	}
 }

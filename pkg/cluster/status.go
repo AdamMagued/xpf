@@ -622,6 +622,9 @@ func (m *Manager) FormatInformation() string {
 		if syncStats.ImportsRefusedByHelper > 0 {
 			fmt.Fprintf(&b, "  Imports refused by helper: %d\n", syncStats.ImportsRefusedByHelper)
 		}
+		if syncStats.ImportsRejectedByHelper > 0 {
+			fmt.Fprintf(&b, "  Imports rejected by helper: %d\n", syncStats.ImportsRejectedByHelper)
+		}
 		// #6778: a config that never reached the ordered apply queue. Rendered
 		// beside apply-failed because the operator consequence is identical —
 		// this node is running a config older than the primary's committed one

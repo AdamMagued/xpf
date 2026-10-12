@@ -58,6 +58,13 @@ var ErrSyncedImportRepairPending = errors.New("synced session worker repair pend
 // that worker-local state converged.
 var ErrSyncedImportRepairOverflow = errors.New("synced session worker repair latch overflow")
 
+// ErrSyncedImportRejected classifies an explicit deterministic rejection
+// returned by the healthy userspace helper outside the semantic refusal
+// taxonomy. Retrying the identical row cannot change that outcome, so bulk
+// replication may acknowledge it rather than retaining an unbounded retry
+// debt. Transport failures remain unclassified here and must withhold ack.
+var ErrSyncedImportRejected = errors.New("synced session import deterministically rejected by helper")
+
 var ErrDPDKBackendRetired = errors.New(
 	"the DPDK dataplane backend has been retired; use " +
 		"'set system dataplane-type userspace' (see #1525)",

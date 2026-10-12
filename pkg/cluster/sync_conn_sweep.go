@@ -224,6 +224,29 @@ func (s *SessionSync) syncSweep() int {
 				slog.Warn("cluster sync: owed cold-prime re-drive failed, will retry", "err", err)
 			}
 		}
+	} else if (s.bulkAckRetryOwed.Load() || s.forcedBulkRetryDue()) &&
+		s.bulkRedriveInFlight.CompareAndSwap(false, true) {
+		// A forced resync or another authoritative bulk may be withheld at
+		// BulkEnd without discharging cold-prime debt. Re-send an aged,
+		// unacknowledged snapshot so that a recovered receiver can complete
+		// reconciliation. The sender-side timeout is bounded by the same retry
+		// interval as cold-prime, and the shared in-flight guard prevents
+		// overlapping survivor/cold-prime retries.
+		slog.Warn("cluster sync: re-driving aged unacknowledged bulk on the live connection")
+		s.bulkAckRetryOwed.Store(true)
+		s.bulkSendMu.Lock()
+		s.clearPendingBulkAck()
+		err := s.doBulkSyncWithBulkSend(true)
+		s.bulkSendMu.Unlock()
+		s.bulkRedriveInFlight.Store(false)
+		if err != nil {
+			s.bulkAckRetryOwed.Store(true)
+			if errors.Is(err, errBulkFencedForPeer) {
+				slog.Debug("cluster sync: unacknowledged bulk retry fenced for peer; waiting for disconnect or capable discovery")
+			} else {
+				slog.Warn("cluster sync: unacknowledged bulk retry failed, will retry", "err", err)
+			}
+		}
 	}
 	if s.lastSweepEmpty && !s.syncBackfillNeeded.Load() {
 		if s.telemetry != nil {

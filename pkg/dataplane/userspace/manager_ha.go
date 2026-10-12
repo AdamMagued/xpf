@@ -610,6 +610,11 @@ func (m *Manager) noteSyncedMirrorFailureLocked(err error) {
 			"rolling back the BPF mirror", "err", err)
 		return
 	}
+	if errors.Is(err, dataplane.ErrSyncedImportRejected) {
+		slog.Debug("userspace: helper deterministically rejected an invalid synced session",
+			"err", err)
+		return
+	}
 	m.recordSessionMirrorFailureLocked(err)
 	slog.Debug("userspace: session mirror failed", "err", err)
 }

@@ -554,6 +554,9 @@ func (s *SessionSync) bulkSyncWindow(walk *bulkWalk) error {
 	s.pendingBulkAckEpoch.Store(epoch)
 	s.fence.pendingBulk.Store(walk.fence) // #9508: AFTER the epoch; see barrierFence.pendingBulk
 	s.pendingBulkAckSince.Store(time.Now().UnixNano())
+	// This new pending bulk now carries the retry obligation. Readiness remains
+	// blocked by its ack epoch rather than the separate retry latch.
+	s.bulkAckRetryOwed.Store(false)
 
 	// Send bulk end marker with matching epoch, plus this node's boot
 	// incarnation (#9174 V013). The payload grows 8 -> 24 bytes as a
@@ -673,6 +676,9 @@ func (s *SessionSync) clearPendingBulkAck() {
 	s.pendingBulkAckEpoch.Store(0)
 	s.pendingBulkAckSince.Store(0)
 	s.pendingBulkOwed.Store(0)
+	// A caller handling a successful matching BulkAck or completing a replacement
+	// bulk clears bulkAckRetryOwed only after it has established equivalent
+	// pending state. Source/write failures must not erase retry readiness debt.
 }
 
 // armColdPrimeLocked records a cold-prime obligation under a NEW generation
@@ -741,6 +747,18 @@ func (s *SessionSync) coldPrimeAckAwaited() bool {
 	return ok && age < BulkAckPendingRetryAfter
 }
 
+// forcedBulkRetryDue reports when a forced-resync bulk (#5450), or another
+// unacknowledged authoritative bulk not carrying cold-prime debt, has passed
+// the ack retry bound. Cold-prime debt uses coldPrimeAckAwaited instead.
+func (s *SessionSync) forcedBulkRetryDue() bool {
+	if s.forceResync.Load() || s.needColdPrime.Load() ||
+		s.pendingBulkOwed.Load() != 0 {
+		return false
+	}
+	_, age, ok := s.PendingBulkAck()
+	return ok && age >= BulkAckPendingRetryAfter
+}
+
 // coldPrimeOwedWithoutPendingBulk reports whether a cold-prime debt is
 // outstanding with no bulk in flight to pay it (#10387): needColdPrime is
 // armed for the current generation but no pending outbound bulk carries that
@@ -796,7 +814,8 @@ func (s *SessionSync) ColdPrimeOwedWithoutPendingBulk() bool {
 // from the peer than it has successfully applied.
 func (s *SessionSync) TransferReadiness() TransferReadinessSnapshot {
 	snap := TransferReadinessSnapshot{
-		Connected: s.stats.Connected.Load(),
+		Connected:        s.stats.Connected.Load(),
+		BulkAckRetryOwed: s.bulkAckRetryOwed.Load(),
 	}
 	if epoch, age, ok := s.PendingBulkAck(); ok {
 		snap.PendingBulkAckEpoch = epoch

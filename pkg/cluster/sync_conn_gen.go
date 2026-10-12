@@ -9,6 +9,20 @@ import (
 	"github.com/psaab/xpf/pkg/dataplane"
 )
 
+// definitiveBulkInstallOutcome reports helper results that cannot be repaired
+// by replaying the identical row: the helper committed it with worker repair
+// pending/overflow, or explicitly rejected the row deterministically. Every
+// production deterministic rejection reaches this classifier wrapped in
+// dataplane.ErrSyncedImportRejected: userspace/process_control.go classifies
+// helper response text, manager_sessions.go prefixes the mirror error, and
+// the session-store adapters pass it through unchanged. No in-tree path hands
+// the cluster an unwrapped deterministic error.
+func definitiveBulkInstallOutcome(err error) bool {
+	return errors.Is(err, dataplane.ErrSyncedImportRepairPending) ||
+		errors.Is(err, dataplane.ErrSyncedImportRepairOverflow) ||
+		errors.Is(err, dataplane.ErrSyncedImportRejected)
+}
+
 // scopedDeleteKeyV4 keys receiver generation guards by scoped policy-delete
 // identity (#10512): colliding tenants sharing a bare tuple order
 // independently. Comparable (all fields comparable) for map + tombstone use.
@@ -48,6 +62,42 @@ func (s *SessionSync) noteHelperMirrorResult(af string, warned *atomic.Bool, err
 		return
 	}
 	slog.Debug("cluster sync: repeated synced-session helper mirror failure", "af", af, "err", err)
+}
+
+// noteBulkInstallOutcomeV4 records whether key needs a transport retry during
+// the active authoritative receive bulk. Definitive outcomes clear old debt.
+// It does not affect incremental sync accounting.
+func (s *SessionSync) noteBulkInstallOutcomeV4(key dataplane.SessionKey, retry bool) {
+	s.bulkMu.Lock()
+	defer s.bulkMu.Unlock()
+	if !s.bulkInProgress {
+		return
+	}
+	if !retry {
+		delete(s.bulkInstallFailedV4, key)
+		return
+	}
+	if s.bulkInstallFailedV4 == nil {
+		s.bulkInstallFailedV4 = make(map[dataplane.SessionKey]struct{})
+	}
+	s.bulkInstallFailedV4[key] = struct{}{}
+}
+
+// noteBulkInstallOutcomeV6 is the IPv6 twin of noteBulkInstallOutcomeV4.
+func (s *SessionSync) noteBulkInstallOutcomeV6(key dataplane.SessionKeyV6, retry bool) {
+	s.bulkMu.Lock()
+	defer s.bulkMu.Unlock()
+	if !s.bulkInProgress {
+		return
+	}
+	if !retry {
+		delete(s.bulkInstallFailedV6, key)
+		return
+	}
+	if s.bulkInstallFailedV6 == nil {
+		s.bulkInstallFailedV6 = make(map[dataplane.SessionKeyV6]struct{})
+	}
+	s.bulkInstallFailedV6[key] = struct{}{}
 }
 
 // genGuardMapCap is the ABSOLUTE CEILING for the per-side EFFECTIVE guard
@@ -1572,6 +1622,7 @@ func (s *SessionSync) installClusterSyncedV4(key dataplane.SessionKey, val datap
 		s.recordInstalledGenV4(key, record)
 		s.recordInstalledGenScopedV4(scopedLogicalDomain(val.RoutingDomain), key, scopedRecord)
 		s.stats.SessionsInstalled.Add(1)
+		s.noteBulkInstallOutcomeV4(key, false)
 		s.noteHelperMirrorResult("v4", &s.sessionMirrorWarnedV4, nil)
 		if val.IsReverse == 0 && s.OnForwardSessionInstalled != nil {
 			s.OnForwardSessionInstalled()
@@ -1588,8 +1639,20 @@ func (s *SessionSync) installClusterSyncedV4(key dataplane.SessionKey, val datap
 		slog.Debug("cluster sync: helper refused a synced-session import; the "+
 			"local mirror was rolled back and the peer holds a session this node does not",
 			"af", "v4", "err", err)
+		s.noteBulkInstallOutcomeV4(key, false)
+	} else if definitiveBulkInstallOutcome(err) {
+		// A committed worker-repair result or deterministic helper rejection
+		// cannot be repaired by re-sending the identical row. Keep it out of
+		// transient mirror-health state and clear this key's retry marker.
+		if errors.Is(err, dataplane.ErrSyncedImportRejected) {
+			s.stats.ImportsRejectedByHelper.Add(1)
+		}
+		slog.Debug("cluster sync: helper returned a committed or deterministic synced-session outcome",
+			"af", "v4", "err", err)
+		s.noteBulkInstallOutcomeV4(key, false)
 	} else {
 		s.noteHelperMirrorResult("v4", &s.sessionMirrorWarnedV4, err)
+		s.noteBulkInstallOutcomeV4(key, true)
 	}
 	return false
 }
@@ -1646,6 +1709,7 @@ func (s *SessionSync) installClusterSyncedV6(key dataplane.SessionKeyV6, val dat
 		s.recordInstalledGenV6(key, record)
 		s.recordInstalledGenScopedV6(scopedLogicalDomain(val.RoutingDomain), key, scopedRecord)
 		s.stats.SessionsInstalled.Add(1)
+		s.noteBulkInstallOutcomeV6(key, false)
 		s.noteHelperMirrorResult("v6", &s.sessionMirrorWarnedV6, nil)
 		if val.IsReverse == 0 && s.OnForwardSessionInstalled != nil {
 			s.OnForwardSessionInstalled()
@@ -1662,8 +1726,18 @@ func (s *SessionSync) installClusterSyncedV6(key dataplane.SessionKeyV6, val dat
 		slog.Debug("cluster sync: helper refused a synced-session import; the "+
 			"local mirror was rolled back and the peer holds a session this node does not",
 			"af", "v6", "err", err)
+		s.noteBulkInstallOutcomeV6(key, false)
+	} else if definitiveBulkInstallOutcome(err) {
+		// IPv6 twin of the v4 committed/deterministic outcome handling.
+		if errors.Is(err, dataplane.ErrSyncedImportRejected) {
+			s.stats.ImportsRejectedByHelper.Add(1)
+		}
+		slog.Debug("cluster sync: helper returned a committed or deterministic synced-session outcome",
+			"af", "v6", "err", err)
+		s.noteBulkInstallOutcomeV6(key, false)
 	} else {
 		s.noteHelperMirrorResult("v6", &s.sessionMirrorWarnedV6, err)
+		s.noteBulkInstallOutcomeV6(key, true)
 	}
 	return false
 }
@@ -1692,6 +1766,8 @@ func (s *SessionSync) deleteClusterSyncedV4(key dataplane.SessionKey, deleteGen 
 	if err := s.sessions.DeleteWithCompanionsV4(key, dataplane.DeleteReasonClusterStale, forwardOnly); err != nil {
 		s.stats.Errors.Add(1)
 		slog.Warn("cluster sync: failed to delete v4 session", "err", err)
+	} else {
+		s.noteBulkInstallOutcomeV4(key, false)
 	}
 }
 
@@ -1716,6 +1792,8 @@ func (s *SessionSync) deleteClusterSyncedV6(key dataplane.SessionKeyV6, deleteGe
 	if err := s.sessions.DeleteWithCompanionsV6(key, dataplane.DeleteReasonClusterStale, forwardOnly); err != nil {
 		s.stats.Errors.Add(1)
 		slog.Warn("cluster sync: failed to delete v6 session", "err", err)
+	} else {
+		s.noteBulkInstallOutcomeV6(key, false)
 	}
 }
 
@@ -1735,6 +1813,8 @@ func (s *SessionSync) deleteClusterSyncedScopedV4(domain uint32, key dataplane.S
 	if err := s.sessions.DeleteClusterScopedV4(key, domain, expectedID); err != nil {
 		s.stats.Errors.Add(1)
 		slog.Warn("cluster sync: failed to delete scoped v4 session", "err", err)
+	} else {
+		s.noteBulkInstallOutcomeV4(key, false)
 	}
 }
 
@@ -1753,5 +1833,7 @@ func (s *SessionSync) deleteClusterSyncedScopedV6(domain uint32, key dataplane.S
 	if err := s.sessions.DeleteClusterScopedV6(key, domain, expectedID); err != nil {
 		s.stats.Errors.Add(1)
 		slog.Warn("cluster sync: failed to delete scoped v6 session", "err", err)
+	} else {
+		s.noteBulkInstallOutcomeV6(key, false)
 	}
 }
