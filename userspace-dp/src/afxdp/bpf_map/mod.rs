@@ -1146,41 +1146,10 @@ fn publish_bpf_conntrack_entry_raw(
     result
 }
 
-/// Publish while the caller owns the tuple admission lease.
-///
+/// Publish with source-NAT provenance while the caller owns the tuple admission lease.
 /// The low-level write intentionally does not acquire a second permit: worker
 /// callers must acquire `try_acquire_install` before mutating their table, and
 /// helper callers hold a `GateLease` across their complete transaction.
-pub(crate) fn publish_bpf_conntrack_entry_under_gate(
-    conntrack_v4_fd: c_int,
-    conntrack_v6_fd: c_int,
-    key: &SessionKey,
-    decision: SessionDecision,
-    metadata: &SessionMetadata,
-    zone_name_to_id: &FastMap<String, u16>,
-    alg_disable_flags: u8,
-    app_id: u16,
-    session_id: u64,
-    timeout_secs: u32,
-    origin: SessionOrigin,
-) -> ConntrackPublishResult {
-    publish_bpf_conntrack_entry_under_gate_with_source_nat(
-        conntrack_v4_fd,
-        conntrack_v6_fd,
-        key,
-        decision,
-        metadata,
-        zone_name_to_id,
-        alg_disable_flags,
-        app_id,
-        session_id,
-        timeout_secs,
-        origin,
-        None,
-    )
-}
-
-/// Publish with source-NAT provenance while the caller owns the tuple admission lease.
 pub(crate) fn publish_bpf_conntrack_entry_under_gate_with_source_nat(
     conntrack_v4_fd: c_int,
     conntrack_v6_fd: c_int,

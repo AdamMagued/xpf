@@ -1329,11 +1329,10 @@ const (
 	SessFlagSNATProvenanceKnown = 1 << 10
 )
 
-// Source-NAT provenance values (#12187), the Go mirror of the Rust
-// `source_nat_provenance` numeric enum carried on the session-delta JSON leg,
-// the binary open/update records, and SessionSyncRequest. 0 is unknown/legacy
-// and is omitted on every wire encoding (legacy-safe); 1 is dynamic SNAT and
-// 2 is static SNAT.
+// Source-NAT provenance values (#12187), the Go mirror of Rust's
+// `source_nat_provenance` enum. Rust delta JSON and binary open/update
+// records encode unknown/legacy 0 explicitly; Go SessionSyncRequest omits
+// zero via `omitempty`. 1 is dynamic SNAT and 2 is static SNAT.
 const (
 	SourceNatProvenanceUnknown uint8 = 0
 	SourceNatProvenanceDynamic uint8 = 1

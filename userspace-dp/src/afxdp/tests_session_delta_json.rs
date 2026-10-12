@@ -144,10 +144,10 @@ fn session_delta_info_rt_flow_session_id_wire_key_6312() {
 
 #[test]
 fn session_delta_info_carries_source_nat_provenance_12187() {
+    let binding = test_binding_identity();
     for (source_nat_static, expected) in [(None, 0), (Some(false), 1), (Some(true), 2)] {
         let mut delta = delta_with_session_id(1);
         delta.source_nat_static = source_nat_static;
-        let binding = test_binding_identity();
         let info = session_delta_info(&binding, &delta, &zone_names());
         assert_eq!(info.source_nat_provenance, expected);
         let value: serde_json::Value =

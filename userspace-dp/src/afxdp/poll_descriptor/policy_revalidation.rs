@@ -434,6 +434,8 @@ fn source_nat_translation_still_valid(
 /// foreign-hit early exit. A reverse hit is judged through its forward
 /// companion; a forward hit with no local entry is checked sessionlessly and
 /// drops this packet without claiming ownership of the peer's session.
+/// A transient translated alias may use the resolver's identity-checked
+/// original tuple; without that proof it remains checked against the wire key.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn source_nat_revocation_on_session_hit(
     forwarding: &ForwardingState,
@@ -444,57 +446,75 @@ pub(super) fn source_nat_revocation_on_session_hit(
     flow: &SessionFlow,
     origin: SessionOrigin,
     source_nat_static: Option<bool>,
+    source_nat_validation_key: Option<&SessionKey>,
 ) -> Option<PolicyRevocation> {
-    let (forward_key, forward_decision, forward_metadata, forward_origin, canonical_key, stored_static) =
-        if metadata.is_reverse {
-            let reverse_key = sessions.revalidation_canonical_key(session_key)?;
-            let (reverse_decision, _, _) = sessions.entry_with_origin(&reverse_key)?;
-            let forward_query =
-                crate::session::reverse_session_key(&reverse_key, reverse_decision.nat);
-            let canonical_key = match sessions.source_nat_revalidation_target(&forward_query) {
-                SourceNatRevalidationTarget::Fresh | SourceNatRevalidationTarget::NoLocalEntry => {
-                    return None;
-                }
-                SourceNatRevalidationTarget::Stale { key, static_nat } => (key, static_nat),
-            };
-            let (forward_decision, forward_metadata, forward_origin) =
-                sessions.entry_with_origin(&canonical_key.0)?;
-            (
-                canonical_key.0.clone(),
-                forward_decision,
-                forward_metadata,
-                forward_origin,
-                Some(canonical_key.0),
-                canonical_key.1,
-            )
-        } else {
-            match sessions.source_nat_revalidation_target(session_key) {
-                SourceNatRevalidationTarget::Fresh => return None,
-                SourceNatRevalidationTarget::Stale {
-                    key: canonical_key,
+    let (
+        forward_key,
+        forward_decision,
+        forward_metadata,
+        forward_origin,
+        canonical_key,
+        stored_static,
+    ) = if metadata.is_reverse {
+        let reverse_key = sessions.revalidation_canonical_key(session_key)?;
+        let (reverse_decision, _, _) = sessions.entry_with_origin(&reverse_key)?;
+        let forward_query = crate::session::reverse_session_key(&reverse_key, reverse_decision.nat);
+        let canonical_key = match sessions.source_nat_revalidation_target(&forward_query) {
+            SourceNatRevalidationTarget::Fresh | SourceNatRevalidationTarget::NoLocalEntry => {
+                return None;
+            }
+            SourceNatRevalidationTarget::Stale { key, static_nat } => (key, static_nat),
+        };
+        let (forward_decision, forward_metadata, forward_origin) =
+            sessions.entry_with_origin(&canonical_key.0)?;
+        (
+            canonical_key.0.clone(),
+            forward_decision,
+            forward_metadata,
+            forward_origin,
+            Some(canonical_key.0),
+            canonical_key.1,
+        )
+    } else {
+        match sessions.source_nat_revalidation_target(session_key) {
+            SourceNatRevalidationTarget::Fresh => return None,
+            SourceNatRevalidationTarget::Stale {
+                key: canonical_key,
+                static_nat,
+            } => {
+                let (forward_decision, forward_metadata, forward_origin) =
+                    sessions.entry_with_origin(&canonical_key)?;
+                (
+                    canonical_key.clone(),
+                    forward_decision,
+                    forward_metadata,
+                    forward_origin,
+                    Some(canonical_key),
                     static_nat,
-                } => {
-                    let (forward_decision, forward_metadata, forward_origin) =
-                        sessions.entry_with_origin(&canonical_key)?;
-                    (
-                        canonical_key.clone(),
-                        forward_decision,
-                        forward_metadata,
-                        forward_origin,
-                        Some(canonical_key),
-                        static_nat,
-                    )
-                }
-                SourceNatRevalidationTarget::NoLocalEntry => (
-                    flow.forward_key.clone(),
+                )
+            }
+            SourceNatRevalidationTarget::NoLocalEntry => {
+                let original_key = source_nat_validation_key
+                    .filter(|key| {
+                        origin.is_peer_synced()
+                            && decision.nat.rewrite_src == Some(flow.forward_key.src_ip)
+                            && crate::session::forward_wire_key(key, decision.nat)
+                                == flow.forward_key
+                            && (session_key == &flow.forward_key || session_key == *key)
+                    })
+                    .cloned()
+                    .unwrap_or_else(|| flow.forward_key.clone());
+                (
+                    original_key,
                     decision,
                     metadata.clone(),
                     origin,
                     None,
                     source_nat_static,
-                ),
+                )
             }
-        };
+        }
+    };
 
     let (valid, static_nat) = source_nat_translation_still_valid(
         forwarding,

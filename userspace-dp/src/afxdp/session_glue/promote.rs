@@ -230,9 +230,9 @@ pub(in crate::afxdp) fn maybe_promote_synced_session(
 /// a non-pool / non-reserved session) frees nothing and a double-free is
 /// impossible — `release_flow` is a no-op when the flow was never tracked.
 ///
-/// Behavior otherwise unchanged from the pre-#1346 free function; the
-/// signature carries `forwarding` + `now_ns` for the reservation release
-/// (was 7 params, now 9 after the #5295 additions).
+/// `key` identifies the stored session and is the tuple tested by the
+/// translated-forward guard. `forwarding`, `now_ns`, and `worker_id` scope
+/// the local NAT reservation release.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::afxdp::session_glue) fn purge_translated_synced_hit(
     sessions: &mut SessionTable,
