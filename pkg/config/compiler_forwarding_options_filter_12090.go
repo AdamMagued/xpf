@@ -1,0 +1,67 @@
+package config
+
+import "fmt"
+
+// validateUnsupportedForwardingOptionsFiltersAST rejects unsupported
+// `filter`/`simple-filter` keyword heads under forwarding-options. DHCP relay
+// server-group names are instances, not filter keywords. No forwarding-options
+// filter hook has a compiler or dataplane consumer, and open-world schema
+// walking otherwise accepts and drops these nodes (#12090).
+func validateUnsupportedForwardingOptionsFiltersAST(nodes []*Node, lenient bool) ([]string, error) {
+	var warnings []string
+	emit := func(label string) error {
+		msg := fmt.Sprintf(
+			"forwarding-options: `%s` is not supported (xpf has no consumer for this forwarding-options binding; remove it) (#12090)",
+			label)
+		if !lenient {
+			return fmt.Errorf("%s", msg)
+		}
+		warnings = append(warnings, msg)
+		return nil
+	}
+
+	var walk func(*Node, *schemaNode, []*Node, bool) error
+	walk = func(n *Node, parentSchema *schemaNode, ancestors []*Node, isIdentity bool) error {
+		if n == nil {
+			return nil
+		}
+		// Apply statements and their tails are values, not filter heads.
+		if isApplyStatementKeyword(n.Name()) {
+			return nil
+		}
+		if !isIdentity && (n.Name() == "filter" || n.Name() == "simple-filter") {
+			if err := emit(filterKeywordLabel12090(n)); err != nil {
+				return err
+			}
+		}
+		nodeSchema, identity := schemaNodeAndIdentity12090(parentSchema, n)
+		if inspectPackedHead12090(n, nodeSchema, ancestors) && identity < len(n.Keys) {
+			tail := n.Keys[identity:]
+			for _, p := range filterKeywordPositions12090(nodeSchema, tail) {
+				if err := emit(packedFilterKeywordLabel12090(tail[p], tail[p+1:])); err != nil {
+					return err
+				}
+			}
+		}
+		// A bare args-bearing keyword (`instance { s { ... } }`) has braced
+		// identity children: their names are instance values, not keywords.
+		childIdentity := !isIdentity && len(n.Keys) == 1 && nodeSchema != nil &&
+			nodeSchema.args > 0 && schemaChildFor(parentSchema, n.Name()) == nodeSchema
+		next := append(ancestors, n)
+		for _, child := range n.Children {
+			if err := walk(child, nodeSchema, next, childIdentity); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, node := range nodes {
+		if node == nil || node.Name() != "forwarding-options" {
+			continue
+		}
+		if err := walk(node, setSchema, nil, false); err != nil {
+			return nil, err
+		}
+	}
+	return warnings, nil
+}
