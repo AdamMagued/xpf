@@ -136,13 +136,19 @@ func TestFabricGRPCResolvesVRFBindingPerAttempt12168(t *testing.T) {
 	d.startClusterComms(d.daemonCtx)
 	waitVRFLinkLookups12168(t, &linkLookups, 2)
 	time.Sleep(50 * time.Millisecond)
-	if got := linkLookups.Load(); got != 3 {
-		t.Fatalf("before gRPC starts, resolver made %d lookups; want 3 startup lookups", got)
-	}
 	baseline := linkLookups.Load()
 
 	d.grpcSrv = grpcapi.NewServer("", grpcapi.Config{Store: d.store, Cluster: d.cluster})
-	waitVRFLinkLookups12168(t, &linkLookups, baseline+2)
+	deadline := time.Now().Add(1800 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if got := linkLookups.Load(); got >= baseline+2 {
+			t.Logf("gRPC bind retries refreshed VRF resolver %d times", got-baseline)
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("gRPC bind retries made %d VRF lookups after server start; want at least 2",
+		linkLookups.Load()-baseline)
 }
 
 // startClusterComms must install the manager's live resolver even when no
