@@ -1041,10 +1041,6 @@ func (d *Daemon) executeConfirmedRollback(gen uint64) {
 	// #4234 deletion-clear: a rollback that removes a policy the abandoned commit
 	// added must drop that policy's sessions, same as any commit.
 	oldActive := d.store.ActiveConfig()
-	// #12169: capture the store's recorded origin before PromoteRollback
-	// consumes it; nil compiled targets also arise from recovered non-first
-	// windows whose rollback config no longer compiles (#6538).
-	_, firstCommitRollback, _ := d.store.PendingRollbackTarget(gen)
 
 	// #9615: a window recovered across a restart, possibly by a newer build,
 	// was never pre-flighted here, and a feed-bound target may simply not be
@@ -1052,6 +1048,10 @@ func (d *Daemon) executeConfirmedRollback(gen uint64) {
 	if d.confirmRollbackTargetHandledAtFire(gen) {
 		return
 	}
+	// #12169: capture the rollback origin and pending-window flag before
+	// PromoteRollback consumes them; nil compiled targets also arise from
+	// recovered non-first windows whose rollback config no longer compiles
+	// (#6538).
 	_, firstCommitRollback, firstCommitPending := d.store.PendingRollbackTarget(gen)
 
 	closeoutIntentDurable := false
