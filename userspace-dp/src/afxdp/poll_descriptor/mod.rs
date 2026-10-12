@@ -3654,13 +3654,16 @@ pub(super) fn poll_binding_process_descriptor_with_injection(
                                 })
                         })
                         // #2134: per-IP session-limit enforcement at the
-                        // new-flow decision. This dominates BOTH counted
-                        // install sites below (LocalMiss host-inbound and
-                        // ForwardFlow transit), fires exactly once per new
-                        // flow before its session exists, and reads the
-                        // SessionTable count read-only (so an over-limit /
-                        // rejected IP never gets a phantom map entry —
-                        // #2128). Keys on the pre-NAT original src/dst
+                        // new-flow decision. This check dominates all FOUR
+                        // counted install sites below in this session-miss
+                        // arm: LocalMiss host-inbound, ForwardFlow transit,
+                        // FabricPuntSeed, and MissingNeighborSeed. In
+                        // particular, it must stay before both transient-seed
+                        // arms or those newly counted installs could bypass
+                        // the quota. It fires exactly once per new flow before
+                        // its session exists and reads the SessionTable count
+                        // read-only (so an over-limit or rejected IP never gets
+                        // a phantom map entry — #2128). Keys on the pre-NAT
                         // (`flow.src_ip`/`flow.dst_ip`), matching Junos
                         // per-source-IP semantics and the screen stage's
                         // own tuple. Evaluated only if miss-time flood or

@@ -608,8 +608,12 @@ impl SessionOrigin {
     }
 
     /// Transient LOCAL seeds: installed by this node's own cold path, never
-    /// exported to the peer and never Open-delta'd (`install.rs`'s `counted`
-    /// gate, `forward_export_candidates_for_owner_rgs`). #7770 adds
+    /// exported to the peer and never Open-delta'd (the explicit
+    /// `!origin.is_transient_local_seed()` conjunct on the `install.rs`
+    /// Open-delta gate, plus `forward_export_candidates_for_owner_rgs`;
+    /// NOT the `counted` gate — seeds ARE quota-counted since #12179, so
+    /// deleting that conjunct as redundant would HA-export seeds in
+    /// violation of #7770/#10402). #7770 adds
     /// `FabricPuntSeed` for the same reason `MissingNeighborSeed` is here: the
     /// entry is a local artefact of a decision this node made, not a claim of
     /// authority over the flow, and syncing it would put a NAT-free duplicate
