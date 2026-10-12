@@ -123,3 +123,134 @@ func TestBuildSNATSnapshotExpandsEveryApplication(t *testing.T) {
 			protos, tcp, udp, terms)
 	}
 }
+
+func TestDNATSecondProtocollessApplicationDoesNotEmitProtoAny12224(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Applications.Applications = map[string]*config.Application{
+		"web":      {Name: "web", Protocol: "tcp", DestinationPort: "80"},
+		"no-proto": {Name: "no-proto"},
+	}
+	cfg.Security.NAT.Destination = &config.DestinationNATConfig{
+		Pools: map[string]*config.NATPool{
+			"p1": {Name: "p1", Address: "192.168.1.10"},
+		},
+		RuleSets: []*config.NATRuleSet{{
+			Name:     "rs",
+			FromZone: "untrust",
+			Rules: []*config.NATRule{{
+				Name: "r1",
+				Match: config.NATMatch{
+					DestinationAddress: "203.0.113.10",
+					Application:        "web",
+					Applications:       []string{"web", "no-proto"},
+				},
+				Then: config.NATThen{Type: config.NATDestination, PoolName: "p1"},
+			}},
+		}},
+	}
+
+	snaps := buildDestinationNATSnapshots(cfg, nil)
+	if len(snaps) != 1 || snaps[0].Protocol != "tcp" || snaps[0].DestinationPort != 80 {
+		t.Fatalf("DNAT snapshots = %+v, want only web's tcp/80 term (no PROTO_ANY)", snaps)
+	}
+
+	rule := cfg.Security.NAT.Destination.RuleSets[0].Rules[0]
+	rule.Match.Application = "no-proto"
+	rule.Match.Applications = []string{"no-proto"}
+	snaps = buildDestinationNATSnapshots(cfg, nil)
+	if len(snaps) != 1 || len(snaps[0].MatchSourcePorts) != 1 ||
+		snaps[0].MatchSourcePorts[0] != natNeverMatchPortRange {
+		t.Fatalf("protocol-less-only DNAT snapshots = %+v, want one #3434 never-match row", snaps)
+	}
+}
+
+func TestDNATOffKeepsPortedProtocollessExemption12224(t *testing.T) {
+	cfg := compileSetLenient5717(t, []string{
+		"set applications application NOPROTO destination-port 8080",
+		"set security nat destination pool dp1 address 10.0.0.9/32",
+		"set security nat destination rule-set drs from zone untrust",
+		"set security nat destination rule-set drs rule d0 match destination-address 203.0.113.9/32",
+		"set security nat destination rule-set drs rule d0 match application [ junos-ssh NOPROTO ]",
+		"set security nat destination rule-set drs rule d0 then destination-nat off",
+		"set security nat destination rule-set drs rule d1 match destination-address 203.0.113.9/32",
+		"set security nat destination rule-set drs rule d1 then destination-nat pool dp1",
+	})
+
+	offPorts := map[string]map[uint16]bool{}
+	for _, snap := range buildDestinationNATSnapshots(cfg, nil) {
+		if snap.Name != "d0" || !snap.Off {
+			continue
+		}
+		if offPorts[snap.Protocol] == nil {
+			offPorts[snap.Protocol] = map[uint16]bool{}
+		}
+		offPorts[snap.Protocol][snap.DestinationPort] = true
+	}
+	if !offPorts["tcp"][8080] || !offPorts["udp"][8080] {
+		t.Fatalf("DNAT off exemption rows = %v, want tcp/8080 and udp/8080", offPorts)
+	}
+}
+
+func TestDNATProtocollessApplicationSetMemberFailsClosed12224(t *testing.T) {
+	base := []string{
+		"set applications application NOPROTO destination-port 8080",
+		"set applications application-set S application NOPROTO",
+		"set security nat destination pool dp1 address 10.0.0.9/32",
+		"set security nat destination rule-set drs from zone untrust",
+		"set security nat destination rule-set drs rule d1 match destination-address 203.0.113.9/32",
+		"set security nat destination rule-set drs rule d1 then destination-nat pool dp1",
+	}
+
+	mixed := compileSetLenient5717(t, append(append([]string(nil), base...),
+		"set security nat destination rule-set drs rule d1 match application [ junos-http S ]"))
+	mixedSnaps := buildDestinationNATSnapshots(mixed, nil)
+	if len(mixedSnaps) != 1 || mixedSnaps[0].Name != "d1" ||
+		mixedSnaps[0].Protocol != "tcp" || mixedSnaps[0].DestinationPort != 80 {
+		t.Fatalf("mixed [junos-http S] DNAT snapshots = %+v, want only junos-http tcp/80", mixedSnaps)
+	}
+
+	alone := compileSetLenient5717(t, append(append([]string(nil), base...),
+		"set security nat destination rule-set drs rule d1 match application S"))
+	aloneSnaps := buildDestinationNATSnapshots(alone, nil)
+	if len(aloneSnaps) != 1 || aloneSnaps[0].Name != "d1" ||
+		len(aloneSnaps[0].MatchSourcePorts) != 1 ||
+		aloneSnaps[0].MatchSourcePorts[0] != natNeverMatchPortRange {
+		t.Fatalf("alone [S] DNAT snapshots = %+v, want one #3434 never-match row", aloneSnaps)
+	}
+}
+
+func TestSNATSecondProtocollessApplicationUsesNeverMatch12224(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Applications.Applications = map[string]*config.Application{
+		"web":      {Name: "web", Protocol: "tcp", DestinationPort: "80"},
+		"no-proto": {Name: "no-proto"},
+	}
+	cfg.Security.NAT.Source = []*config.NATRuleSet{{
+		Name:     "rs",
+		FromZone: "trust",
+		ToZone:   "untrust",
+		Rules: []*config.NATRule{{
+			Name: "r1",
+			Match: config.NATMatch{
+				Application:  "web",
+				Applications: []string{"web", "no-proto"},
+			},
+			Then: config.NATThen{Type: config.NATSource, Interface: true},
+		}},
+	}}
+
+	snaps := buildSourceNATSnapshots(cfg, nil)
+	if len(snaps) != 1 {
+		t.Fatalf("len(source NAT snapshots) = %d, want 1", len(snaps))
+	}
+	protocols := make(map[uint16]bool, len(snaps[0].MatchApplications))
+	for _, term := range snaps[0].MatchApplications {
+		protocols[term.Protocol] = true
+	}
+	if !protocols[natAppProtoNumber("tcp")] || !protocols[natProtoNever] {
+		t.Fatalf("SNAT application protocols = %v, want tcp plus never-match (%d)", protocols, natProtoNever)
+	}
+	if protocols[natProtoAny] {
+		t.Fatalf("SNAT protocol-less application emitted PROTO_ANY: %+v", snaps[0].MatchApplications)
+	}
+}
