@@ -84,16 +84,15 @@ type userspaceXSKBindingController interface {
 // Quarantined zones (#12237) are skipped outright: the dataplane installs only
 // the surviving zone, and the zone-approximation fallback sync-owns on ANY RG
 // in the set — so a collision loser's RGs would wrong-owner-sync the
-// survivor's unattributable sessions. ZoneQuarantineExclusions is a pure
-// function of the zone-name set, so both HA nodes compute the identical
-// survivor-only map from the identical config.
+// survivor's unattributable sessions. The exclusions are
+// config.ZoneQuarantineExclusionsForConfig, the same runtime zone-name set the
+// dataplane quarantine decides over (#12247), so both HA nodes agree on the
+// survivor even when the colliders are node-scoped: a node whose only claimant
+// of a shared ID is the loser maps that ID to no RG, matching a dataplane that
+// installs no zone for it.
 func buildZoneRGMap(cfg *config.Config, zoneIDs map[string]uint16) cluster.ZoneRGMap {
 	result := make(cluster.ZoneRGMap)
-	names := make([]string, 0, len(cfg.Security.Zones))
-	for zoneName := range cfg.Security.Zones {
-		names = append(names, zoneName)
-	}
-	excluded := config.ZoneQuarantineExclusions(names)
+	excluded := config.ZoneQuarantineExclusionsForConfig(cfg)
 	for zoneName, zone := range cfg.Security.Zones {
 		// Quarantined/reserved zones are absent from dataplane enforcement.
 		// Do not let their RGs leak into the survivor's same-ID ownership set.
