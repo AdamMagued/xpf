@@ -102,3 +102,59 @@ func TestCommitCheckQualifiedNextHopMetric12184(t *testing.T) {
 		}
 	}
 }
+
+// #12184: flat-run expansion also activates the typed QNH preference leaf
+// (1..254), so CommitCheck must reject values that previously compiled.
+func TestCommitCheckQualifiedNextHopPreferenceChains12184(t *testing.T) {
+	spellings := []struct {
+		name  string
+		input func(string) string
+	}{
+		{
+			name: "interface chain",
+			input: func(value string) string {
+				return "set routing-options static route 0.0.0.0/0 qualified-next-hop 192.168.1.1 interface ge-0/0/1.0 preference " + value
+			},
+		},
+		{
+			name: "metric chain",
+			input: func(value string) string {
+				return "set routing-options static route 0.0.0.0/0 qualified-next-hop 192.168.1.1 metric 100 preference " + value
+			},
+		},
+	}
+	for _, value := range []string{"0", "255", "abc"} {
+		for _, spelling := range spellings {
+			t.Run("reject/"+spelling.name+"/"+value, func(t *testing.T) {
+				s := newTestStore(t)
+				if err := s.EnterConfigure(); err != nil {
+					t.Fatalf("EnterConfigure: %v", err)
+				}
+				if err := s.LoadOverride(spelling.input(value)); err != nil {
+					t.Fatalf("LoadOverride rejected candidate before CommitCheck: %v", err)
+				}
+				_, err := s.CommitCheck()
+				if err == nil {
+					t.Fatalf("CommitCheck accepted preference %q in %s spelling", value, spelling.name)
+				}
+				if !strings.Contains(err.Error(), "preference") || !strings.Contains(err.Error(), value) {
+					t.Fatalf("CommitCheck error %q must name preference and offending value %q", err, value)
+				}
+			})
+		}
+	}
+	for _, spelling := range spellings {
+		t.Run("accept/"+spelling.name+"/5", func(t *testing.T) {
+			s := newTestStore(t)
+			if err := s.EnterConfigure(); err != nil {
+				t.Fatalf("EnterConfigure: %v", err)
+			}
+			if err := s.LoadOverride(spelling.input("5")); err != nil {
+				t.Fatalf("LoadOverride rejected candidate before CommitCheck: %v", err)
+			}
+			if _, err := s.CommitCheck(); err != nil {
+				t.Fatalf("CommitCheck rejected valid preference 5 in %s spelling: %v", spelling.name, err)
+			}
+		})
+	}
+}

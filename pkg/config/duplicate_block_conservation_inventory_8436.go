@@ -66,10 +66,9 @@ var dupConservationInventory8436 = []string{
 	// #12184 made the qualified-next-hop metric synthesizable in this census.
 	// Measured: flat-set sibling commands merge interface+metric onto one
 	// next-hop, while repeated hierarchical blocks compile as two entries with
-	// the modifiers split between them. Strict commit accepts the duplicate
-	// and tolerant ingress had no warning; #12308 tracks that divergence.
-	// The whole blocks are not dropped, but their settings are not merged onto
-	// the same next-hop as the flat-set form.
+	// the modifiers split between them. The interface-only entry therefore
+	// lands in metric 0, the primary ECMP tier, instead of failing over.
+	// This unresolved consequence is scope-deferred to #12308.
 	"routing-options static route xpfname qualified-next-hop",
 	// ---- Already REJECTED at strict commit (conservation by refusal) (8). ----
 	//
@@ -332,7 +331,6 @@ var dupConservationSkipped8436 = []string{
 	"protocols rip group",
 	"routing-options rib xpfname static route",
 	"routing-options rib xpfname static route xpfname qualified-next-hop",
-
 	"security ipsec proposal",
 	"security log stream",
 	"system services dhcp-local-server group xpfname interface",

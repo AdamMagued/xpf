@@ -188,8 +188,8 @@ func TestStaticRouteQualifiedNextHopMetric_ValidCommits12184(t *testing.T) {
 		t.Fatalf("expected compiled static route with metric 20, got %v", cfg.RoutingOptions.StaticRoutes)
 	}
 
-	// staticRouteNode() is also used under routing-options rib and
-	// routing-instances; confirm the typed leaf is active at both parents.
+	// These valid-value controls pin that the shared staticRouteNode schema
+	// accepts a metric under both parents; they do not exercise rejection.
 	for _, set := range []string{
 		"set routing-options rib v4-static static route 10.1.0.0/24 qualified-next-hop 192.168.2.1 metric 0",
 		"set routing-instances VRF-A routing-options static route 10.2.0.0/24 qualified-next-hop 192.168.3.1 metric 4294967295",
@@ -197,5 +197,47 @@ func TestStaticRouteQualifiedNextHopMetric_ValidCommits12184(t *testing.T) {
 		if err := SchemaValidate(flatTreeFromSets(t, set), nil); err != nil {
 			t.Errorf("valid metric at shared staticRouteNode parent for %q: %v", set, err)
 		}
+	}
+}
+
+// #12184: expanding flat QNH runs also exposes the existing typed preference
+// leaf (1..254). These flat chains used to bypass that gate.
+func TestStaticRouteQualifiedNextHopPreferenceFlatChains12184(t *testing.T) {
+	spellings := []struct {
+		name string
+		tree func(string) *ConfigTree
+	}{
+		{
+			name: "interface-chain",
+			tree: func(value string) *ConfigTree {
+				return flatTreeFromSets(t,
+					"set routing-options static route 0.0.0.0/0 qualified-next-hop 192.168.1.1 interface ge-0/0/1.0 preference "+value)
+			},
+		},
+		{
+			name: "metric-chain",
+			tree: func(value string) *ConfigTree {
+				return flatTreeFromSets(t,
+					"set routing-options static route 0.0.0.0/0 qualified-next-hop 192.168.1.1 metric 100 preference "+value)
+			},
+		},
+	}
+	for _, value := range []string{"0", "255", "abc"} {
+		for _, spelling := range spellings {
+			t.Run("reject/"+spelling.name+"/"+value, func(t *testing.T) {
+				err := SchemaValidate(spelling.tree(value), nil)
+				if err == nil {
+					t.Fatalf("expected invalid preference %q in %s to be rejected", value, spelling.name)
+				}
+				if !strings.Contains(err.Error(), "preference") || !strings.Contains(err.Error(), value) {
+					t.Fatalf("error %q must name preference and offending value %q", err, value)
+				}
+			})
+		}
+	}
+	for _, spelling := range spellings {
+		t.Run("accept/"+spelling.name+"/5", func(t *testing.T) {
+			assertCommitAccepts(t, spelling.tree("5"))
+		})
 	}
 }

@@ -94,9 +94,10 @@ func TestEveryNotConservedContainerIsReported8704(t *testing.T) {
 		checked, len(silent), len(deepDupUnreportable))
 }
 
-// #12308: measure why this census divergence is not generically reported.
-// Both modifiers survive on separate entries; a generic dropped-block report
-// would overstate what this measurement establishes.
+// #12308: this test pins the measured split: both duplicate block orders
+// compile separately, while flat-set merges their modifiers. The resulting
+// backup joins metric 0's primary ECMP tier, so the unresolved behavior is
+// scope-deferred to #12308 rather than silently described as correct.
 func TestQualifiedNextHopCensusExemptionIsMeasured8704(t *testing.T) {
 	const dupAB = `routing-options { static { route 0.0.0.0/0 {
 		qualified-next-hop 192.168.1.1 { interface ge-0/0/1.0; }
