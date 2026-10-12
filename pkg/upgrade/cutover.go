@@ -3,6 +3,7 @@ package upgrade
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -531,6 +532,17 @@ func (r *Runner) Run(opts Options) (err error) {
 					"realign the generation", r.versionDir(stagedVer), existingGen, srcGen)
 			}
 		}
+		// REFUSE-AT-INIT: prove the staged binary can read the live config DB
+		// before persisting STAGED. Otherwise a clean envelope refusal would
+		// leave an in-flight journal that blocks operator rollback.
+		if err := r.validateForwardEnvelopeCompatibility(stagedVer, stagedXpfd); err != nil {
+			refusal := &forwardEnvelopeGateRefusal{phase: "PREFLIGHT", err: err}
+			if cerr := r.clearJournal(); cerr != nil {
+				r.logf("upgrade: WARN clear stale journal on envelope refuse: %v", cerr)
+				return fmt.Errorf("%w; failed to clear stale journal: %v", refusal, cerr)
+			}
+			return refusal
+		}
 		j.TargetVersion = stagedVer
 		// Record the RESTORABLE current, not the raw basename: a dangling /
 		// pathful / incomplete `current` must be recorded as "" (no rollback
@@ -584,6 +596,12 @@ func (r *Runner) Run(opts Options) (err error) {
 	// ---- PREFLIGHT (pure) ----
 	if !j.State.atLeast(StatePreflight) {
 		if err := r.preflight(j); err != nil {
+			if isForwardEnvelopeGateRefusal(err) {
+				if cerr := r.clearJournal(); cerr != nil {
+					r.logf("upgrade: WARN clear journal on resumed envelope refuse: %v", cerr)
+					return fmt.Errorf("preflight: %w; failed to clear refusal journal: %v", err, cerr)
+				}
+			}
 			return fmt.Errorf("preflight: %w", err)
 		}
 		if err := r.transition(j, StatePreflight); err != nil {
@@ -742,7 +760,20 @@ func (r *Runner) Run(opts Options) (err error) {
 	if !j.State.atLeast(StateStopped) {
 		if err := r.validateForwardEnvelopeCompatibility(j.TargetVersion,
 			filepath.Join(r.versionDir(j.TargetVersion), "xpfd")); err != nil {
-			return fmt.Errorf("refuse-before-STOP: %w", err)
+			refusal := &forwardEnvelopeGateRefusal{phase: "STOP", err: err}
+			if cerr := r.clearJournal(); cerr != nil {
+				r.logf("upgrade: WARN clear journal on pre-STOP envelope refuse: %v", cerr)
+				return fmt.Errorf("%w; failed to clear refusal journal: %v", refusal, cerr)
+			}
+			return refusal
+		}
+		// A committed predecessor reused as the staged target remains a
+		// rollback candidate until the final live-DB gate passes.
+		if r.committedPredecessorStamp(j, j.TargetVersion) != nil {
+			if err := r.stampInFlightVersion(j.TargetVersion); err != nil {
+				return fmt.Errorf("mark version %s non-committed after pre-STOP check: %w",
+					j.TargetVersion, err)
+			}
 		}
 	}
 	// ---- STOP + CUT-BOUNDARY DB SNAPSHOT (live mutation #1) ----
@@ -945,13 +976,31 @@ func firstNonNil(errs ...error) error {
 // uses this seam; the flip.go rollback-restore stats are unaffected.
 var statConfigDBDir = os.Stat
 
+type forwardEnvelopeGateRefusal struct {
+	phase string
+	err   error
+}
+
+func (e *forwardEnvelopeGateRefusal) Error() string {
+	return fmt.Sprintf("refuse-before-%s: %v; the unit was not stopped; re-stage an "+
+		"envelope-compatible target or run `xpfd upgrade --rollback "+
+		"[--target <compatible-version>]` after this refusal journal is cleared", e.phase, e.err)
+}
+
+func (e *forwardEnvelopeGateRefusal) Unwrap() error { return e.err }
+
+func isForwardEnvelopeGateRefusal(err error) bool {
+	var refusal *forwardEnvelopeGateRefusal
+	return errors.As(err, &refusal)
+}
+
 // preflight checks disk space (incl. the rollback DB snapshot), GCs
 // eligible versions if short, and takes the pre-upgrade DB snapshot. Pure:
 // no live mutation.
 func (r *Runner) preflight(j *Journal) error {
 	if err := r.validateForwardEnvelopeCompatibility(j.TargetVersion,
 		filepath.Join(r.sourceDir(j), "xpfd")); err != nil {
-		return fmt.Errorf("refuse-before-PREFLIGHT: %w", err)
+		return &forwardEnvelopeGateRefusal{phase: "PREFLIGHT", err: err}
 	}
 	if err := fsatomic.MkdirAllDurable(r.cfg.VersionsDir, 0755); err != nil {
 		return fmt.Errorf("create versions dir: %w", err)
@@ -1140,12 +1189,13 @@ func (r *Runner) copyStaged(j *Journal) error {
 				j.SourceGeneration, srcDir)
 		}
 	}
+	preservedPredecessorStamp := r.committedPredecessorStamp(j, ver)
 
-	// An existing non-live target is no longer a committed rollback candidate
-	// once a new cut starts using its version tag. Persist this before either
-	// accepting an identical-source resume or replacing the tree, so a failed
-	// cut cannot inherit the old commit stamp.
-	if _, err := os.Stat(dst); err == nil && ver != j.PreviousVersion {
+	// Other existing non-live targets are no longer committed candidates once
+	// a cut uses their version tag. A committed predecessor of the live version
+	// is the exception: retain its stamp until the pre-STOP envelope recheck.
+	if _, err := os.Stat(dst); err == nil && ver != j.PreviousVersion &&
+		preservedPredecessorStamp == nil {
 		if err := r.stampInFlightVersion(ver); err != nil {
 			return fmt.Errorf("mark version %s non-committed before copy: %w", ver, err)
 		}
@@ -1199,6 +1249,26 @@ func (r *Runner) copyStaged(j *Journal) error {
 		// Stale non-live: reuse the proven guarded delete, then recopy.
 		r.logf("upgrade: replacing stale version dir %s (source generation %q -> %q)",
 			dst, existingGen, j.SourceGeneration)
+		if preservedPredecessorStamp != nil {
+			mismatch, merr := r.mismatchedManagedBinary(ver, srcDir)
+			if merr != nil {
+				// An unreadable predecessor (e.g. a binary unlinked by a
+				// crashed removeStaleVersionDir while .committed survived)
+				// cannot be proven byte-identical: demote it as changed
+				// bytes instead of refusing, so a crash-resumed replace
+				// cannot wedge the PREFLIGHT journal (#12177 F1).
+				r.logf("upgrade: cannot hash committed predecessor %s before replace (%v); demoting as changed bytes",
+					ver, merr)
+				mismatch = "unverifiable"
+			}
+			if mismatch != "" {
+				if err := r.stampInFlightVersion(ver); err != nil {
+					return fmt.Errorf("mark changed predecessor %s non-committed before replace: %w",
+						ver, err)
+				}
+				preservedPredecessorStamp = nil
+			}
+		}
 		if rerr := r.removeStaleVersionDir(ver); rerr != nil {
 			return rerr
 		}
@@ -1220,13 +1290,18 @@ func (r *Runner) copyStaged(j *Journal) error {
 		_ = os.RemoveAll(partial)
 		return fmt.Errorf("partial checksum mismatch (copy corrupted)")
 	}
-	// Include a non-committed marker in the atomic directory rename. A crash
-	// after COPY but before COMMIT must never make this target eligible for a
-	// later default rollback.
+	// Include an in-flight marker in the atomic directory rename so a crash
+	// after COPY but before COMMIT cannot make an attempted target eligible
+	// for default rollback. Preserve a committed predecessor's stamp until the
+	// pre-STOP envelope recheck has passed.
 	if ver != j.PreviousVersion {
-		if werr := r.writeCommitStampTo(partial, committedStamp{Version: ver}); werr != nil {
+		stamp := committedStamp{Version: ver}
+		if preservedPredecessorStamp != nil {
+			stamp = *preservedPredecessorStamp
+		}
+		if werr := r.writeCommitStampTo(partial, stamp); werr != nil {
 			_ = os.RemoveAll(partial)
-			return fmt.Errorf("mark copied version %s non-committed: %w", ver, werr)
+			return fmt.Errorf("stamp copied version %s before commit: %w", ver, werr)
 		}
 	}
 	// Stamp the source generation INSIDE the partial (B-P3b OPT1) so it lands
@@ -1260,26 +1335,36 @@ func (r *Runner) copyStaged(j *Journal) error {
 // its bytes survived; every managed binary (including the non-lockstep
 // cli/day0-config the flip repoints) is hash-compared staged-vs-versioned.
 func (r *Runner) verifyVersionDirMatchesStaged(ver, srcDir string) error {
+	mismatch, err := r.mismatchedManagedBinary(ver, srcDir)
+	if err != nil {
+		return err
+	}
+	if mismatch != "" {
+		return fmt.Errorf("REFUSE: version dir %s binary %s differs from pinned staged source %s "+
+			"(bitrot, tamper, or same-stamp restage); re-stage under a DISTINCT version tag",
+			r.versionDir(ver), mismatch, srcDir)
+	}
+	return nil
+}
+
+// mismatchedManagedBinary compares each managed binary across a version dir
+// and its pinned source, returning the first name with different bytes.
+func (r *Runner) mismatchedManagedBinary(ver, srcDir string) (string, error) {
 	dst := r.versionDir(ver)
-	// Both trees carry the binaries FLAT by Name (the staged dir is what the
-	// deb installed; manifest StagedSrc is the repo-relative build path, not
-	// the staged layout).
 	for _, name := range manifest.Names() {
 		want, err := fileSHA256Hex(filepath.Join(srcDir, name))
 		if err != nil {
-			return fmt.Errorf("hash staged %s: %w", name, err)
+			return "", fmt.Errorf("hash staged %s: %w", name, err)
 		}
 		got, err := fileSHA256Hex(filepath.Join(dst, name))
 		if err != nil {
-			return fmt.Errorf("hash version-dir %s: %w", name, err)
+			return "", fmt.Errorf("hash version-dir %s: %w", name, err)
 		}
 		if want != got {
-			return fmt.Errorf("REFUSE: version dir %s binary %s differs from pinned staged source %s "+
-				"(bitrot, tamper, or same-stamp restage); re-stage under a DISTINCT version tag",
-				dst, name, srcDir)
+			return name, nil
 		}
 	}
-	return nil
+	return "", nil
 }
 
 func fileSHA256Hex(path string) (string, error) {
