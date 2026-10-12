@@ -1126,8 +1126,12 @@ reconcile above (extend it only for maps whose loss is truly safe).
 
 APT package selection is not a monotonic floor on the running xpf binaries
 or kernel. A bounded Debian APT 3.3.3 amd64 probe of a private signed
-lower-only `xpf*` package repository, using the managed 990/-1 preferences
-(`install.sh:407–416`), found:
+lower-only `xpf*` package repository used installed version
+`0.0.200+gaaaaaaaaaaaa` and repository version
+`0.0.100+gbbbbbbbbbbbb`. The fixture's Release was freshly signed during
+the probe, not a captured production signature or a replay after previously
+observing newer repository metadata. Under the managed 990/-1 preferences
+(`install.sh:406–416`), it found:
 
 - **P2:** ordinary unversioned `apt-get upgrade` did not downgrade the
   newer installed package (rc 0, no change).
@@ -1135,7 +1139,8 @@ lower-only `xpf*` package repository, using the managed 990/-1 preferences
   wildcard denies left the installed-but-unindexed version with no
   candidate. That is an availability failure, not a downgrade.
 - **P5:** an explicit older-version install with `--allow-downgrades`
-  did install the older package in the private root.
+  did install the older package in the private root. No unflagged control
+  was run, so necessity of the flag is not established even for this case.
 - **P7:** an expired signed Release was rejected by `apt-get update` with
   an empty, fresh lists cache (rc 100).
 

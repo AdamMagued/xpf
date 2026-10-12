@@ -14,8 +14,8 @@ write_source (:379-397), and write_channel_pin (:402-447).
 
 RED/GREEN: default run is GREEN (the extracted real EXIT trap cleans the
 written source and pin). With T1_PROVE_RED=1, the harness omits the trap
-registration, simulating a trap-absent/broken pre-fix equivalent; trap
-registration and cleanup assertions then fail (RED).
+registration; only the cleanup-firing assertion fails. The registration test
+checks only the harness-generated trap line, not install.sh's registration.
 
 Bounds: shell-trap behavior only. No anti-rollback floor, no Q1-Q4
 enforcement, no APT resolver claims (those live in docs only).
@@ -74,12 +74,18 @@ def _render_harness(tmpdir, action, trap_enabled):
         "    done",
         "}",
         # These command stubs log all mutations and guard their operands.
+        # The guard's refusal must short-circuit the real command: cleanup_on_fail
+        # calls rm as `rm ... || _rc=1` and mv as an `if` condition, and POSIX
+        # suppresses `set -e` inside AND-OR lists and `if` conditions (the
+        # suppression extends into called function bodies), so a bare
+        # `t1_path_guard "$@"; command ...` sequencing would run the real
+        # command anyway after a refusal. `|| return 97` refuses for real.
         # The test root exists before the harness starts; install -d is a no-op.
-        'install() { t1_log "install $*"; t1_path_guard "$@"; }',
-        'mktemp() { t1_log "mktemp $*"; t1_path_guard "$@"; command mktemp "$@"; }',
-        'chmod() { t1_log "chmod $*"; t1_path_guard "$@"; command chmod "$@"; }',
-        'mv() { t1_log "mv $*"; t1_path_guard "$@"; command mv "$@"; }',
-        'rm() { t1_log "rm $*"; t1_path_guard "$@"; command rm "$@"; }',
+        'install() { t1_log "install $*"; t1_path_guard "$@" || return 97; }',
+        'mktemp() { t1_log "mktemp $*"; t1_path_guard "$@" || return 97; command mktemp "$@"; }',
+        'chmod() { t1_log "chmod $*"; t1_path_guard "$@" || return 97; command chmod "$@"; }',
+        'mv() { t1_log "mv $*"; t1_path_guard "$@" || return 97; command mv "$@"; }',
+        'rm() { t1_log "rm $*"; t1_path_guard "$@" || return 97; command rm "$@"; }',
         'info() { printf "xpf-install: %s\\n" "$*"; }',
         'SRC="$T1_TMP/xpf.sources"',
         'PIN="$T1_TMP/xpf-channel.pref"',
@@ -124,10 +130,22 @@ class TrapTextTests(unittest.TestCase):
         self.assertIn("SRC_WRITTEN=1", source)
         self.assertIn("PIN_WRITTEN=1", source)
 
+    def test_exit_trap_registered_before_main_guard(self):
+        source = _install_source()
+        trap_lines = re.findall(
+            r"(?m)^[ \t]*trap\b[^\n]*\b(?:EXIT|0)\b", source)
+        self.assertEqual(trap_lines, [_TRAP_LINE])
+        guard = 'if [ "${XPF_INSTALL_SOURCE_ONLY:-}" != "1" ]; then'
+        self.assertIn(guard, source)
+        self.assertLess(
+            source.index(_TRAP_LINE), source.index(guard),
+            "EXIT cleanup trap must be registered before the main guard")
+
     def test_trap_registered_in_harness(self):
         with tempfile.TemporaryDirectory(prefix="t1-10848-trap-") as tmp:
             rc, out = _run_harness(
                 Path(tmp), "trap", trap_enabled=not _PROVE_RED)
+        self.assertNotIn("stub refused", out)
         self.assertEqual(rc, 0, out[-2000:])
         if _PROVE_RED:
             self.assertNotIn("cleanup_on_fail", out)
@@ -146,6 +164,7 @@ class TrapFiresTests(unittest.TestCase):
                 trap_enabled=not _PROVE_RED)
             calls = (tmpdir / "calls.log").read_text()
             self.assertNotEqual(rc, 0, out[-2000:])
+            self.assertNotIn("stub refused", out)
             self.assertIn("writing apt source", out)
             self.assertIn("wrote managed apt channel pin", out)
             # These assertions fail in RED mode if the EXIT trap is absent.
@@ -167,6 +186,7 @@ class TrapFiresTests(unittest.TestCase):
                 trap_enabled=False)
             calls = (tmpdir / "calls.log").read_text()
             self.assertNotEqual(rc, 0, out[-2000:])
+            self.assertNotIn("stub refused", out)
             self.assertIn("writing apt source", out)
             self.assertTrue(src.exists(), "control source missing")
             self.assertTrue(pin.exists(), "control pin missing")
@@ -184,6 +204,7 @@ class TrapFiresTests(unittest.TestCase):
                 trap_enabled=not _PROVE_RED)
             calls = (tmpdir / "calls.log").read_text()
             self.assertEqual(rc, 0, out[-2000:])
+            self.assertNotIn("stub refused", out)
             self.assertTrue(src.exists(), "success run removed source")
             self.assertTrue(pin.exists(), "success run removed pin")
             self.assertNotIn("rm -f", calls)

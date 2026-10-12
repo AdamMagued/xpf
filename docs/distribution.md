@@ -220,14 +220,21 @@ and pin.
 
 The #10848 resolver probe used Debian APT 3.3.3 amd64, a private package
 root, and a signed local `file:` repository containing only an older,
-inert data-only `xpf*` package. The installed version was 0.0.200 and the
-repository version was 0.0.100. Under the managed preference in
-`install.sh` (selected-channel priority 990 plus the two wildcard -1
-denies at lines 407–416), it observed:
+inert data-only `xpf*` package. The installed version was
+`0.0.200+gaaaaaaaaaaaa`; the repository version was
+`0.0.100+gbbbbbbbbbbbb`. The fixture's Release was freshly signed during
+the probe: it was not a captured production signature or a replay after
+previously observing newer repository metadata. Under the managed preference
+in `install.sh` (selected-channel priority 990 plus the two wildcard -1
+denies at lines 406–416), it observed:
+
+Evidence IDs below refer to the #10848 research report
+`result-openai-codex-gpt-6-astra-research-10848-apt-selection-001.md`
+(SHA-256 `ef8d32fee6c8b22874e4ce617daa97e015d75434c50f5c5cd59e91acf17127ad`).
 
 - **P2 — ordinary automatic downgrade REFUTED:** an unversioned
-  `apt-get upgrade` left the installed package at 0.0.200 (rc 0; no
-  change; evidence 015–016).
+  `apt-get upgrade` left the installed package at
+  `0.0.200+gaaaaaaaaaaaa` (rc 0; no change; evidence 015–016).
 - **P3 — candidate-none is REAL:** the same preferences assigned the
   installed-but-unindexed version effective priority -1, leaving no
   candidate. An unversioned `apt-get install` exited 100 with “no
@@ -235,9 +242,9 @@ denies at lines 407–416), it observed:
   availability failure, not an automatic downgrade or a successful
   install.
 - **P5 — explicit authorized downgrade works:** an explicit request for
-  0.0.100 with `--allow-downgrades` installed that version in the private
-  root (evidence 031–032). This does not establish that the flag is
-  necessary for every explicit downgrade.
+  `0.0.100+gbbbbbbbbbbbb` with `--allow-downgrades` installed that version
+  in the private root (evidence 031–032). No unflagged control was run;
+  necessity of `--allow-downgrades` is not established even for this case.
 - **P7 — expired metadata is rejected on fresh acquisition:** with an
   expired signed Release and an empty, distinct lists cache,
   `apt-get update` exited 100 with an expiry error (evidence 029). Its
