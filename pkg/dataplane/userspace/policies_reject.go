@@ -85,6 +85,14 @@ func collectPolicyContentRejections(policies []PolicyRuleSnapshot) []string {
 				rejectionCause("malformed zone-pair context", rule.malformedZonePairShapes), policyRejectionScope(rule)))
 			continue
 		}
+		if appBad && len(rule.unknownSecurityPoliciesChildren) > 0 &&
+			len(rule.rejectedApplications) == 1 &&
+			rule.rejectedApplications[0] == lenientDroppedConstraintToken &&
+			!srcBad && !dstBad {
+			reasons = append(reasons, fmt.Sprintf("%s was skipped; the userspace helper rejects the whole policy snapshot (synthetic carrier %s)",
+				rejectionCause("unknown security policies child", rule.unknownSecurityPoliciesChildren), policyRejectionScope(rule)))
+			continue
+		}
 		if !appBad && !srcBad && !dstBad {
 			continue
 		}

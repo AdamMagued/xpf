@@ -236,7 +236,7 @@ func shapeDigest8892(t *testing.T) (string, int) {
 // refuse every snapshot in exchange for nothing. The golden below moved to the
 // #9984-merge digest; ProtocolVersion was 24 until #10018's lease-wire bump.
 const (
-	snapshotShapeGolden8892 = "af02ee891588bb85e7b173c4579e37c52769e0bbf65d6507c021708a05c54ae1"
+	snapshotShapeGolden8892 = "059a0f796cc1d27f3506e079150a3f07ed725cdc54ad15dce027dbb530996035"
 	// v13 BUMPED (issue 9412) against the SAME digest. The TCP close class
 	// crosses the HA session-sync path, and the old behaviour is the defect it
 	// fixes, so the v9 rule requires the bump. The session-sync messages are not
@@ -459,6 +459,18 @@ const (
 	// for this field (grep userspace-dp/src returns no CrossFamilyInet use).
 	// No helper-visible behavior or wire shape changes; ProtocolVersion stays
 	// at 45. This is the same v45 STANDS arm used for #12288.
+	// v45 STANDS (#12217): SecurityConfig.UnknownPoliciesChildren is a
+	// compile-time diagnostic (`json:"-"`, the #9246 MalformedZonePairs
+	// precedent) naming unknown direct children of `security policies`,
+	// and Policy.UnknownSecurityPoliciesChildren (`json:"-"`, the F1
+	// carrier cause) carries those names on the synthetic poison carrier.
+	// ConfigSnapshot embeds Config, so this reflection walk sees the
+	// SecurityConfig field plus the Policy field under both global and
+	// hierarchical policy collections although all are absent from
+	// snapshot JSON; Rust keeps `config` opaque and has no consumer.
+	// Measured delta vs the af02ee89 base is exactly these three
+	// `json:"-"` lines. No helper-visible wire change; ProtocolVersion
+	// stays at 45.
 	// v44 -> v45 BUMPED (#11812): single-rate PolicerSnapshot adds optional
 	// marking-action and logical-interface-policer JSON fields. The keys are
 	// omitted by default and the current Rust runtime ignores them; warnings

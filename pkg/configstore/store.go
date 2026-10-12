@@ -883,6 +883,9 @@ func (s *Store) compileTreeLenient(tree *config.ConfigTree) (*config.Config, err
 		case config.IsUnknownSecurityZoneChildSchemaError(schemaErr):
 			slog.Warn("unknown security-zone child in tolerated config; continuing (a strict commit would reject this)",
 				"err", schemaErr, "issue", "#11575")
+		case config.IsUnknownSecurityPoliciesChildSchemaError12217(schemaErr):
+			slog.Warn("unknown security-policies child in tolerated config; continuing (a strict commit would reject this)",
+				"err", schemaErr, "issue", "#12217")
 		case config.IsUnknownTopLevelStanzaSchemaError(schemaErr):
 			slog.Warn("unknown top-level stanza in tolerated config; continuing (a strict commit would reject this)",
 				"err", schemaErr, "issue", "#11576")

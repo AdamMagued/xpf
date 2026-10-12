@@ -287,6 +287,9 @@ func buildOneRuleSnapshot(
 		rejectedApplications:    rejectedApps,
 		// #12288: the malformed shape exists only in compile-time metadata.
 		malformedZonePairShapes: pol.MalformedZonePairShapes,
+		// #12217: carry the skipped policy-container children as
+		// build-time-only rejection metadata.
+		unknownSecurityPoliciesChildren: pol.UnknownSecurityPoliciesChildren,
 	}
 }
 
