@@ -301,14 +301,8 @@ mod new_flow_session_limit_tests {
                     100,
                     u8::try_from(attempt + 1).expect("test destination octet"),
                 ));
-                let verdict = new_flow_session_limit_drop(
-                    &fw,
-                    &table,
-                    "untrust",
-                    TEST_LAN_ZONE_ID,
-                    src,
-                    dst,
-                );
+                let verdict =
+                    new_flow_session_limit_drop(&fw, &table, "untrust", TEST_LAN_ZONE_ID, src, dst);
                 if attempt == 10 {
                     assert_eq!(
                         verdict,
@@ -339,7 +333,6 @@ mod new_flow_session_limit_tests {
             assert_eq!(table.len(), 10);
         }
     }
-
 }
 
 /// #4400/#10270/#10703: TCP SYN-selector behavior on the session-MISS install
