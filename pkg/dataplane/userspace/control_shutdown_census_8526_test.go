@@ -34,7 +34,7 @@ type controlCallFacts struct {
 	name          string
 	file          string
 	acquiresMu    bool // takes m.mu with no preceding release
-	callsReq      bool // calls requestLocked / requestDetailedLocked / requestApplySnapshotLocked
+	callsReq      bool // calls a control request (either apply sender or direct request)
 	setsDeadline  bool
 	deadlineCalls int
 }
@@ -91,9 +91,9 @@ func analyzeControlCalls8526(t *testing.T, dir string) []controlCallFacts {
 					return true
 				}
 				switch sel.Sel.Name {
-				// #9520: requestApplySnapshotLocked is the one apply_snapshot send site, so
-				// its callers issue a round trip exactly as direct requestLocked callers do.
-				case "requestLocked", "requestDetailedLocked", "requestApplySnapshotLocked":
+				// #9520: requestApplySnapshotPreparedLocked is the shared apply_snapshot send site.
+				// requestApplySnapshotLocked prepares and delegates; callers issue a round trip.
+				case "requestLocked", "requestDetailedLocked", "requestApplySnapshotLocked", "requestApplySnapshotPreparedLocked":
 					cf.callsReq = true
 				case "SetDeadline":
 					cf.setsDeadline = true

@@ -208,10 +208,11 @@ func TestCompileDifferStillAdoptsMcfg10066(t *testing.T) {
 
 	h.m.mu.Lock()
 	var status ProcessStatus
-	err := h.m.publishSnapshotFailClosedLocked(attempted, &status, false /*mapsMutatedInPlace*/)
+	prepareSnapshotForApply(attempted)
+	err := h.m.publishPreparedSnapshotFailClosedLocked(attempted, &status, false /*mapsMutatedInPlace*/)
 	h.m.mu.Unlock()
 	if err == nil {
-		t.Fatal("publishSnapshotFailClosedLocked returned nil on a transport failure")
+		t.Fatal("prepared fail-closed publish returned nil on a transport failure")
 	}
 	h.m.mu.Lock()
 	defer h.m.mu.Unlock()

@@ -133,7 +133,7 @@ func TestNeighborReplaceEnvelopeCarriesGenerationAndRetainsRetryDebt(t *testing.
 // TestNeighborReplaceGenerationSeedsFromStartupResponseBeforeFirstPush guards
 // the pre-status-tick startup window from #6034. Compile's successful initial
 // apply_snapshot response already carries the surviving helper's replace fence;
-// publishSnapshotFailClosedLocked must consume it before Compile exposes
+// publishPreparedSnapshotFailClosedLocked must consume it before Compile exposes
 // m.lastSnapshot and a neighbor event can trigger the first replace.
 //
 // No status loop is started here. Reverting the startup-response seed makes the
@@ -191,7 +191,8 @@ func TestNeighborReplaceGenerationSeedsFromStartupResponseBeforeFirstPush(t *tes
 	// deliberately no statusLoop tick between exposure and regeneration.
 	m.mu.Lock()
 	var startupStatus ProcessStatus
-	if err := m.publishSnapshotFailClosedLocked(startupSnapshot, &startupStatus, false); err != nil {
+	prepareSnapshotForApply(startupSnapshot)
+	if err := m.publishPreparedSnapshotFailClosedLocked(startupSnapshot, &startupStatus, false); err != nil {
 		m.mu.Unlock()
 		t.Fatalf("startup apply_snapshot: %v", err)
 	}

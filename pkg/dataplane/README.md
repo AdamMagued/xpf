@@ -1088,7 +1088,7 @@ failure in between left the kernel on the new interface set while the
 control plane still reported the old one. That divergence is a policy
 BYPASS, not merely an outage. Both pre-publish failure modes drive the
 shim to `ctrl.Enabled=0` — `programBootstrapMapsLocked` programs it
-disabled, and `publishSnapshotFailClosedLocked` disables it on the
+disabled, and `publishPreparedSnapshotFailClosedLocked` disables it on the
 same-plan path (#4959), EXCEPT where #7468's atomic retain applies (an
 in-band helper refusal with a retained snapshot: the classifier maps are
 rolled back to it and ctrl stays enabled, because the maps then match
@@ -1446,7 +1446,7 @@ snap`, and there are two of them — one per acceptance path).
   - **The pre-pass is only as good as the phases' own strictness** (#6894 r9,
     #4960). A row that ACCEPTS what the Rust helper later REJECTS puts the
     half-applied state back: the helper's rejection lands at
-    `publishSnapshotFailClosedLocked`, after the zones phase has already
+    `publishPreparedSnapshotFailClosedLocked`, after the zones phase has already
     created VLANs and reconciled addresses. NPTv6 was such a row —
     `compileNPTv6` warned and skipped an unparseable / length-mismatched /
     host-bits-set prefix while `Nptv6State::try_from_snapshots` rejects the

@@ -36,7 +36,7 @@ import (
 //
 //   - Helper REJECTS it (`"not-a-prefix"`, host bits set, mismatched lengths,
 //     a /56, an IPv4 CIDR): today's apply ALREADY fails, at
-//     `publishSnapshotFailClosedLocked`, AFTER `compileZones` created VLANs and
+//     `publishPreparedSnapshotFailClosedLocked`, AFTER `compileZones` created VLANs and
 //     reconciled addresses. Hard-erroring here moves an already-certain failure
 //     ahead of the mutation point. This is the #4960 fix and it stays.
 //   - Helper ACCEPTS it (`"fd00:9::/+48"` -- Rust's `u8::from_str` takes a

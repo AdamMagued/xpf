@@ -409,7 +409,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 // That divergence is a policy BYPASS, not just an outage — bounded, not
 // open-ended, under the armed forward fence (#10302). Both pre-publish
 // failure modes drive the shim to ctrl.Enabled=0 (programBootstrapMapsLocked
-// programs it disabled; publishSnapshotFailClosedLocked disables it on the
+// programs it disabled; publishPreparedSnapshotFailClosedLocked disables it on the
 // same-plan path), and a disabled ctrl makes the shim DROP transit —
 // degraded_ctrl_disabled_action runs before the ingress-map test in
 // userspace-xdp/src/lib.rs, so an interface that still carries the shim is
@@ -536,6 +536,9 @@ func (m *Manager) applyCompiledSnapshot(
 	m.recordZoneIDCollisionsLocked(snap.zoneIDCollisions)
 	m.clusterHA = cfg != nil && cfg.Chassis.Cluster != nil
 	m.seedHAGroupInventoryLocked(cfg)
+	// Plan classification and the eventual digest/send must observe one interface
+	// sample. Revalidation detaches snap.Interfaces before it compacts in place.
+	prepareSnapshotForApply(snap)
 	prevPlanKey := snapshotBindingPlanKey(m.lastSnapshot)
 	newPlanKey := snapshotBindingPlanKey(snap)
 	pendingXSKStartup := m.proc != nil &&
@@ -691,11 +694,11 @@ func (m *Manager) applyCompiledSnapshot(
 	publishSnap.Neighbors = filterPublishableNeighbors(snap.Neighbors)
 	// #4959: on the samePlanRefresh path the classifier BPF maps were already
 	// mutated IN PLACE above (syncUserspaceClassifierMapsFailClosedLocked) with
-	// ctrl still enabled; publishSnapshotFailClosedLocked disables ctrl if this
+	// ctrl still enabled; publishPreparedSnapshotFailClosedLocked disables ctrl if this
 	// publish is rejected so the maps can never run a generation ahead of the
 	// applied Rust snapshot (fail-open). The bootstrap path already set
 	// ctrl.Enabled=0, so it needs no extra fail-closed.
-	if err := m.publishSnapshotFailClosedLocked(&publishSnap, &status, samePlanRefresh); err != nil {
+	if err := m.publishPreparedSnapshotFailClosedLocked(&publishSnap, &status, samePlanRefresh); err != nil {
 		return result, err
 	}
 	// apply_snapshot succeeded, so the scheduler state carried by this full
@@ -722,11 +725,11 @@ func (m *Manager) applyCompiledSnapshot(
 	m.rebuildMonitoredIfindexes()
 	m.pendingFullSnapshotMetadata = false
 	m.publishedSnapshot = snap.Generation
-	m.publishedPlanKey = newPlanKey
+	m.publishedPlanKey = snapshotBindingPlanKey(&publishSnap)
 	// #2079: this full apply_snapshot succeeded — record the applied
 	// (config, generation) for the NAT pool-utilization-alarm monitor.
 	m.markAppliedSnapshotLocked()
-	if h, ok := snapshotContentHash(snap); ok {
+	if h, ok := snapshotContentHash(&publishSnap); ok {
 		m.lastSnapshotHash = h
 	}
 	// #9684: the helper now holds exactly the sections re-sampled above.
@@ -795,7 +798,7 @@ func (m *Manager) applyCompiledSnapshot(
 	return result, nil
 }
 
-// publishSnapshotFailClosedLocked sends apply_snapshot to the running helper and
+// publishPreparedSnapshotFailClosedLocked sends apply_snapshot to the running helper and
 // makes an in-place classifier-map refresh + helper publish one fail-closed
 // transaction (#4959).
 //
@@ -840,9 +843,14 @@ func (m *Manager) applyCompiledSnapshot(
 // When mapsMutatedInPlace is false the caller took the full bootstrap path,
 // which already programmed ctrl.Enabled=0 before this publish, so a publish
 // error is already fail-closed and the error is returned unchanged.
-func (m *Manager) publishSnapshotFailClosedLocked(publishSnap *ConfigSnapshot, status *ProcessStatus, mapsMutatedInPlace bool) error {
+func (m *Manager) publishPreparedSnapshotFailClosedLocked(
+	publishSnap *ConfigSnapshot,
+	status *ProcessStatus,
+	mapsMutatedInPlace bool,
+) error {
 	wasDebt := m.snapshotRetryDebtLocked()
-	if err := m.requestApplySnapshotLocked(publishSnap, status); err != nil {
+	err := m.requestApplySnapshotPreparedLocked(publishSnap, status)
+	if err != nil {
 		publishErr := fmt.Errorf("publish userspace snapshot: %w", err)
 		// #7468: a rejected publish must never return with the manager lacking
 		// a reconcile worker. On the samePlanRefresh path the loop is already
@@ -1236,6 +1244,7 @@ func (m *Manager) UpdatePolicyScheduleStateWithLatch(cfg *config.Config, activeS
 		// retries autonomously on the next scheduler tick.
 		return fmt.Errorf("userspace: publish policy scheduler snapshot: %w", err)
 	}
+	next.Interfaces = publishSnap.Interfaces
 	// The helper accepted the snapshot, so its scheduler bits now match the
 	// desired state carried by this snapshot. Commit the applied/show cache only
 	// at this success boundary; every return above leaves it unchanged.
@@ -1249,10 +1258,10 @@ func (m *Manager) UpdatePolicyScheduleStateWithLatch(cfg *config.Config, activeS
 	m.rebuildMonitoredIfindexes()
 	m.publishedSnapshot = next.Generation
 	m.pendingFullSnapshotMetadata = false
-	m.publishedPlanKey = snapshotBindingPlanKey(&next)
+	m.publishedPlanKey = snapshotBindingPlanKey(&publishSnap)
 	// #2079: full apply_snapshot succeeded — record the applied snapshot.
 	m.markAppliedSnapshotLocked()
-	if h, ok := snapshotContentHash(&next); ok {
+	if h, ok := snapshotContentHash(&publishSnap); ok {
 		m.lastSnapshotHash = h
 	}
 	m.resolvePartialOutcomesLocked(resampled)
@@ -1815,12 +1824,12 @@ func (m *Manager) ensureEgressZoneProtocolLocked() error {
 // returning would leave the XDP shim redirecting transit to XSK against maps a
 // generation AHEAD of the snapshot the helper is enforcing. That is precisely
 // the "fail-OPEN security/availability mismatch" failClosedUserspaceCtrlMapLocked
-// exists to prevent (#4959), and the reason publishSnapshotFailClosedLocked
+// exists to prevent (#4959), and the reason publishPreparedSnapshotFailClosedLocked
 // takes the same mapsMutatedInPlace flag. Driving ctrl to 0 drops transit to the
 // kernel-only fail-closed posture until a later good commit re-publishes.
 //
 // mapsMutatedInPlace MUST mirror the flag the caller passes to
-// publishSnapshotFailClosedLocked, which is the codebase's oracle for "the
+// publishPreparedSnapshotFailClosedLocked, which is the codebase's oracle for "the
 // classifier maps are ahead of the applied snapshot": samePlanRefresh in Compile,
 // unconditionally true in syncSnapshotLocked (its only producer of an
 // unpublished lastSnapshot is Compile's pendingXSKStartup branch, which always

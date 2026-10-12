@@ -222,7 +222,7 @@ func TestSnapshotProtocolDisarmFailureFailsClosed5488(t *testing.T) {
 // so a revert cannot re-inline the bare disarm at either publish site and slip
 // past the behavioral test above (which drives the extracted helper directly).
 //
-// The two sites are exactly the two callers of publishSnapshotFailClosedLocked —
+// The two sites are exactly the two callers of publishPreparedSnapshotFailClosedLocked —
 // the codebase's oracle for "the classifier maps are ahead of the applied
 // snapshot" — and each must pass the SAME mapsMutatedInPlace value to both
 // calls, or the fail-closed action and the publish would disagree about whether
@@ -238,19 +238,19 @@ func TestProtocolGateSitesRouteThroughFailClosedHelper5488(t *testing.T) {
 	}{
 		{
 			// #5485 split Compile at the m.mu boundary; the publish site is now
-			// applyCompiledSnapshot. Retargeted, not relaxed — both asserted
-			// substrings are unchanged.
+			// applyCompiledSnapshot. The prepared wrapper preserves the required
+			// fail-closed handling after interface revalidation.
 			file:      "manager_compile.go",
 			fn:        "applyCompiledSnapshot",
 			wantGate:  "m.disarmSnapshotProtocolFailClosedLocked(snap, err, samePlanRefresh)",
-			wantPub:   "publishSnapshotFailClosedLocked(&publishSnap, &status, samePlanRefresh)",
+			wantPub:   "publishPreparedSnapshotFailClosedLocked(&publishSnap, &status, samePlanRefresh)",
 			whyInPlce: "samePlanRefresh mutates the classifier maps in place before the publish",
 		},
 		{
 			file:      "process_status.go",
 			fn:        "syncSnapshotLocked",
 			wantGate:  "m.disarmSnapshotProtocolFailClosedLocked(&publishSnap, err, true)",
-			wantPub:   "publishSnapshotFailClosedLocked(&publishSnap, &status, true)",
+			wantPub:   "publishPreparedSnapshotFailClosedLocked(&publishSnap, &status, true)",
 			whyInPlce: "its only producer of an unpublished lastSnapshot is Compile's pendingXSKStartup branch, which always mutates the maps in place",
 		},
 	} {

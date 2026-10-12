@@ -66,7 +66,6 @@ func (m *Manager) syncSnapshotLocked() error {
 	// ordering and consumers.
 	retryDebtConvergence := m.snapshotRetryDebtLocked()
 
-	planKey := snapshotBindingPlanKey(m.lastSnapshot)
 	if m.publishedSnapshot >= m.lastSnapshot.Generation {
 		if m.publishedSnapshot != 0 && m.publishedSnapshot == m.lastSnapshot.Generation &&
 			!m.applySnapshotOutcomeUnknown && m.partialOutcomeUnknown == 0 {
@@ -104,7 +103,7 @@ func (m *Manager) syncSnapshotLocked() error {
 		hash, hashOK := snapshotContentHash(m.lastSnapshot)
 		m.publishedSnapshot = m.lastSnapshot.Generation
 		m.pendingFullSnapshotMetadata = false
-		m.publishedPlanKey = planKey
+		m.publishedPlanKey = snapshotBindingPlanKey(m.lastSnapshot)
 		// #2079: the helper already reports this generation as applied
 		// (status.LastSnapshotGeneration >= m.lastSnapshot.Generation
 		// gated this branch), so it IS the applied snapshot.
@@ -116,6 +115,11 @@ func (m *Manager) syncSnapshotLocked() error {
 		m.rebuildNeighborIndex()
 		m.rebuildMonitoredIfindexes()
 		return nil
+	}
+	// Keep the retained authority detached until the publish is acknowledged.
+	retained := *m.lastSnapshot
+	if !m.pendingFullSnapshotMetadata {
+		stripSingleUseCommitMetadata(&retained)
 	}
 	// Publish the initial snapshot immediately so the helper can plan its
 	// bindings. After that, defer newer snapshots until the first XSK
@@ -135,24 +139,23 @@ func (m *Manager) syncSnapshotLocked() error {
 	// liveness needs — so deferring a changed-plan debt waits for liveness the
 	// debt itself prevents. Non-debt publishes are unaffected (predicate false
 	// ⇒ condition bit-identical).
-	if xskStartup && !m.snapshotRetryDebtLocked() && (m.publishedPlanKey == "" || m.publishedPlanKey != planKey) {
+	deferPlan := func(key string) bool {
+		return xskStartup && !m.snapshotRetryDebtLocked() && (m.publishedPlanKey == "" || m.publishedPlanKey != key)
+	}
+	// #9684: deferred ticks gate on the retained rows first, which Compile
+	// already revalidated. An admitted publish then samples once and re-gates
+	// so its plan decision and send use the same interface rows.
+	if deferPlan(snapshotBindingPlanKey(&retained)) {
 		return nil
 	}
-	// #9684: re-sample any section a lost partial update left unknown, only once
-	// the gate above lets this publish proceed. A deferred tick then costs no
-	// kernel sample, which matters because the probe extends while a link is idle
-	// and that window has no bound. A re-sample never moves the binding plan
-	// (resampleUnresolvedSectionsLocked keeps the fabric rows' plan half), so the
-	// gate's decision holds for the copy that will be sent.
-	retained := *m.lastSnapshot
-	// A FIB bump can advance lastSnapshot.Generation without publishing a
-	// full snapshot. If a later status retry is the first accepted publication
-	// of a deferred or unknown-outcome full snapshot, preserve its one-shot
-	// rename metadata; otherwise strip metadata consumed by the prior full
-	// publication just like every other partial republish path.
-	if !m.pendingFullSnapshotMetadata {
-		stripSingleUseCommitMetadata(&retained)
+	prepareSnapshotForApply(&retained)
+	planKey := snapshotBindingPlanKey(&retained)
+	if deferPlan(planKey) {
+		return nil
 	}
+	// #9684: re-sample unresolved sections only after the plan gate admits this
+	// publish. Fabric resampling keeps its plan half, and interface rows were
+	// already detached and revalidated for the same-plan decision.
 	resampled := m.resampleUnresolvedSectionsLocked(&retained)
 	m.refreshCaptureAuthorityLocked(&retained)
 	if xskStartup {
@@ -215,7 +218,7 @@ func (m *Manager) syncSnapshotLocked() error {
 	publishSnap := retained
 	publishSnap.Neighbors = filterPublishableNeighbors(retained.Neighbors)
 	// #5488 (F7): mapsMutatedInPlace is unconditionally true here for the same
-	// reason the publishSnapshotFailClosedLocked call below passes true — the
+	// reason the publishPreparedSnapshotFailClosedLocked call below passes true — the
 	// only producer of an unpublished lastSnapshot is Compile's pendingXSKStartup
 	// branch, which ALWAYS mutated the classifier maps in place first. So a
 	// failed disarm here must also drive ctrl to 0 rather than leave the shim
@@ -238,7 +241,7 @@ func (m *Manager) syncSnapshotLocked() error {
 	// interface-NAT classifier BPF maps IN PLACE first
 	// (syncUserspaceClassifierMapsFailClosedLocked(snap)) with ctrl still
 	// enabled. Besides the deferral above, the retry-debt adopt arm in
-	// publishSnapshotFailClosedLocked (#9642) is the only other producer of an
+	// publishPreparedSnapshotFailClosedLocked (#9642) is the only other producer of an
 	// unpublished lastSnapshot — and on both arms the maps are likewise already
 	// at the attempted plan (mutated in place on the same-plan arm, freshly
 	// programmed on the bootstrap arm), so the conclusion below stands for
@@ -251,11 +254,12 @@ func (m *Manager) syncSnapshotLocked() error {
 	// is unconditionally true here: if the helper REJECTS this publish it keeps
 	// enforcing the previous-good snapshot, so leaving ctrl enabled would run
 	// the shim against classifier maps a generation ahead of the applied Rust
-	// snapshot (fail OPEN). publishSnapshotFailClosedLocked disables ctrl on a
+	// snapshot (fail OPEN). publishPreparedSnapshotFailClosedLocked disables ctrl on a
 	// rejection so transit drops to the kernel-only fail-closed posture.
-	if err := m.publishSnapshotFailClosedLocked(&publishSnap, &status, true); err != nil {
+	if err := m.publishPreparedSnapshotFailClosedLocked(&publishSnap, &status, true); err != nil {
 		return err
 	}
+	m.lastSnapshot.Interfaces = publishSnap.Interfaces
 	// The deferred snapshot has now landed in the helper. Commit its scheduler
 	// state only after the successful request; all failure returns above retain
 	// the prior applied/show cache.
@@ -278,7 +282,7 @@ func (m *Manager) syncSnapshotLocked() error {
 	m.pendingFullSnapshotMetadata = false
 	m.rebuildMonitoredIfindexes()
 	m.publishedSnapshot = m.lastSnapshot.Generation
-	m.publishedPlanKey = planKey
+	m.publishedPlanKey = snapshotBindingPlanKey(&publishSnap)
 	// #2079: deferred full apply_snapshot succeeded — record applied.
 	m.markAppliedSnapshotLocked()
 	if hashOK {

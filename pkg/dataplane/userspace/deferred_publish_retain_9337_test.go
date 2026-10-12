@@ -254,12 +254,13 @@ func TestOrdinaryRefusalStillRetainsThePreviousPlan9337(t *testing.T) {
 	}
 
 	var status ProcessStatus
-	err := m.publishSnapshotFailClosedLocked(refused, &status, true)
+	prepareSnapshotForApply(refused)
+	err := m.publishPreparedSnapshotFailClosedLocked(refused, &status, true)
 	if m.syncCancel != nil {
 		m.syncCancel()
 	}
 	if err == nil {
-		t.Fatal("publishSnapshotFailClosedLocked returned nil on a refused publish")
+		t.Fatal("prepared fail-closed publish returned nil on a refused publish")
 	}
 	if len(syncedTo) != 1 || syncedTo[0] != retained {
 		t.Fatalf("classifier maps synced %d time(s) on the ordinary Compile path, want exactly "+

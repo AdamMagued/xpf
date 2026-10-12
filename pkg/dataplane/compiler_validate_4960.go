@@ -68,7 +68,7 @@ package dataplane
 // not run" but "a phase we DO run that was not strict enough" (#6894 r9 F1).
 // A covered row that ACCEPTS what the Rust helper later REJECTS reproduces the
 // exact #4960 shape from inside the guard: the helper's rejection lands in
-// publishSnapshotFailClosedLocked, after compileZones has mutated the host.
+// publishPreparedSnapshotFailClosedLocked, after compileZones has mutated the host.
 // NPTv6 was such a row. `Match = "2001:db8:9::/48"` with `Then =
 // "not-a-prefix"` is retained by lenient validation with a warning, warned-and-
 // skipped by compileNPTv6, copied verbatim into the snapshot, and then rejected

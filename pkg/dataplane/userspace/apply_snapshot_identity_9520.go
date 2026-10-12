@@ -28,7 +28,7 @@ import (
 //     generation whose digest differs from the installed snapshot's, before any
 //     mutation (userspace-dp/src/server/handlers/snapshot.rs);
 //   - that refusal, and only that refusal, proves the helper HOLDS the
-//     generation, so requestApplySnapshotLocked consumes it and republishes once
+//     generation, so requestApplySnapshotPreparedLocked consumes it and republishes once
 //     on the next one. Without this half the refusal is a non-converging loop:
 //     every retry re-sends the same generation and is refused again.
 
@@ -66,12 +66,32 @@ func stampSnapshotContentDigest(snap *ConfigSnapshot) error {
 	return nil
 }
 
-// requestApplySnapshotLocked is the ONLY site that sends apply_snapshot
-// (TestApplySnapshotHasOneSendSite9520). It stamps the content digest over the
-// exact struct being sent. On a content-conflict refusal it consumes the refused
-// generation and republishes ONCE on the next one, updating snap.Generation in
-// place. A caller commits its bookkeeping from snap.Generation after a nil
-// return (adoptPublishedGenerationLocked). Every outcome is recorded by
+// prepareSnapshotForApply detaches and revalidates interface rows before classification and send.
+func prepareSnapshotForApply(snap *ConfigSnapshot) {
+	// #11086: re-resolve interface rows against the live kernel before
+	// classification, digest, and send. revalidateSnapshotIfindexes detaches
+	// the interface backing array and LinkUp pointers before mutating them.
+	if refreshed, dropped := revalidateSnapshotIfindexes(snap); refreshed+dropped > 0 {
+		slog.Info("userspace: snapshot interface rows revalidated at apply",
+			"refreshed", refreshed, "dropped", dropped)
+	}
+}
+
+// requestApplySnapshotLocked prepares interface rows before sending the snapshot.
+func (m *Manager) requestApplySnapshotLocked(snap *ConfigSnapshot, status *ProcessStatus) error {
+	prepareSnapshotForApply(snap)
+	return m.requestApplySnapshotPreparedLocked(snap, status)
+}
+
+// requestApplySnapshotPreparedLocked is the ONLY site that sends apply_snapshot
+// (TestApplySnapshotHasOneSendSite9520). Its caller has already detached and
+// revalidated Interfaces when plan-key classification needs that sample;
+// requestApplySnapshotLocked performs that preparation for other publishers.
+// This function stamps the content digest over the exact struct being sent. On
+// a content-conflict refusal it consumes the refused generation and republishes
+// ONCE on the next one, updating snap.Generation in place. A caller commits its
+// bookkeeping from snap.Generation after a nil return
+// (adoptPublishedGenerationLocked). Every outcome is recorded by
 // recordApplySnapshotOutcomeLocked.
 //
 // Any other error is returned unchanged and m.generation is left alone. #5134's
@@ -81,15 +101,7 @@ func stampSnapshotContentDigest(snap *ConfigSnapshot) error {
 // still bounded by requestDetailedLocked's #8526 deadline. Outside shutdown the
 // worst-case m.mu hold on this refusal is therefore two round trips; once
 // BeginControlShutdown has latched, the retry is skipped.
-func (m *Manager) requestApplySnapshotLocked(snap *ConfigSnapshot, status *ProcessStatus) (err error) {
-	// #11086: re-resolve interface rows against the live kernel BEFORE the
-	// digest stamp, so a row built before link churn ships refreshed (or
-	// dropped when its netdev is gone) instead of stamping the wrong
-	// netdev's zone. The digest then covers the refreshed content.
-	if refreshed, dropped := revalidateSnapshotIfindexes(snap); refreshed+dropped > 0 {
-		slog.Info("userspace: snapshot interface rows revalidated at apply",
-			"refreshed", refreshed, "dropped", dropped)
-	}
+func (m *Manager) requestApplySnapshotPreparedLocked(snap *ConfigSnapshot, status *ProcessStatus) (err error) {
 	if stampErr := stampSnapshotContentDigest(snap); stampErr != nil {
 		// Nothing was sent, so the helper's state is known to be unchanged.
 		return stampErr

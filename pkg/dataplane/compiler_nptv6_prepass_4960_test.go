@@ -17,7 +17,7 @@ package dataplane
 //	pkg/dataplane compileNPTv6      -> warned, `continue`d, returned nil
 //	userspace buildNptv6Snapshots   -> copied both strings through verbatim
 //	Rust Nptv6State::try_from_snapshots -> rejects the WHOLE snapshot
-//	publishSnapshotFailClosedLocked -> error, AFTER compileZones mutated the
+//	publishPreparedSnapshotFailClosedLocked -> error, AFTER compileZones mutated the
 //	                                   host, with no rollback
 //
 // The exact strings above are the ones userspace-dp/src/nptv6_tests.rs already

@@ -70,7 +70,7 @@ type helperModel9824 struct {
 	// included — branch witnesses read the offers, not just the admissions.
 	requests []ControlRequest
 	// violations records fixture-implementation faults (an unstamped offer
-	// would mean a new send site bypassing requestApplySnapshotLocked).
+	// would mean a new send site bypassing requestApplySnapshotPreparedLocked).
 	violations []string
 }
 
