@@ -27,7 +27,11 @@ security {
 }
 
 func TestUnknownEnforcementZoneChildUnbindsOnTolerantCompile11575(t *testing.T) {
-	for _, keyword := range []string{"screeen", "ids-profile"} {
+	for _, keyword := range []string{
+		"screeen", "ids-profile", "adress-book", "SCREEN", "scr", "host-inbound",
+		"address-set", "addr-book", "s", "sc", "in", "ho", "tc",
+		"zz", "IDS-PROFILE", "SCRN", "Scr", "adress", "addresss", "addresses",
+	} {
 		t.Run(keyword, func(t *testing.T) {
 			tree := unknownZoneChildConfig11575(t, keyword)
 			cfg, err := CompileConfigLenient(tree)
@@ -87,5 +91,68 @@ func TestUnknownNonEnforcementZoneChildWarnsWithoutUnbinding11575(t *testing.T) 
 	}
 	if !foundWarning {
 		t.Fatalf("compiled warning does not name the zone and unknown keyword: %v", cfg.Warnings)
+	}
+}
+
+func TestUnknownPackedEnforcementZoneChildUnbinds11575(t *testing.T) {
+	for _, statement := range []string{
+		"replace: screen safe",
+		"protect: screen safe",
+		"set screen safe",
+		"foo screen safe",
+		"foo SCREEN safe",
+		"foo IDS-PROFILE safe",
+		"foo SCRN safe",
+		"foo Scr safe",
+	} {
+		t.Run(statement, func(t *testing.T) {
+			tree := unknownZoneChildConfig11575(t, statement)
+			cfg, err := CompileConfigLenient(tree)
+			if err != nil {
+				t.Fatalf("lenient compile rejected packed unknown zone child: %v", err)
+			}
+			zone := cfg.Security.Zones["trust"]
+			if zone == nil || !zone.DroppedEnforcementChild {
+				t.Fatalf("packed enforcement tail did not poison zone: %+v", zone)
+			}
+			if len(zone.Interfaces) != 0 || zone.ScreenProfile != "" || zone.ScreenProfileConfigured {
+				t.Fatalf("packed enforcement tail left zone bound: %+v", zone)
+			}
+			head := strings.Fields(statement)[0]
+			foundWarning := false
+			for _, warning := range cfg.Warnings {
+				if strings.Contains(warning, `"`+head+`"`) && strings.Contains(warning, "unbound") {
+					foundWarning = true
+					break
+				}
+			}
+			if !foundWarning {
+				t.Fatalf("compiled warnings do not name the packed head and unbound disposition: %v", cfg.Warnings)
+			}
+			if _, err := CompileConfig(tree); err == nil || !strings.Contains(err.Error(), head) {
+				t.Fatalf("strict compile err = %v, want rejection naming %q", err, head)
+			}
+		})
+	}
+}
+
+func TestUnknownPackedShortNonEnforcementTailDoesNotUnbind11575(t *testing.T) {
+	tree := unknownZoneChildConfig11575(t, "foo xy safe")
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("lenient compile rejected packed unknown zone child: %v", err)
+	}
+	zone := cfg.Security.Zones["trust"]
+	if zone == nil || zone.DroppedEnforcementChild {
+		t.Fatalf("unrelated two-byte packed tail poisoned the zone: %+v", zone)
+	}
+	if len(zone.Interfaces) != 1 || zone.Interfaces[0] != "ge-0/0/0.0" {
+		t.Fatalf("unrelated two-byte packed tail changed zone membership: %v", zone.Interfaces)
+	}
+	if zone.ScreenProfile != "safe" || !zone.ScreenProfileConfigured {
+		t.Fatalf("unrelated two-byte packed tail changed screen binding: %+v", zone)
+	}
+	if _, err := CompileConfig(tree); err == nil || !strings.Contains(err.Error(), "foo") {
+		t.Fatalf("strict compile err = %v, want rejection naming foo", err)
 	}
 }
