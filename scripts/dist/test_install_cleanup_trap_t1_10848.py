@@ -5,6 +5,9 @@ Extracts only `cleanup_on_fail`, `write_source`, and `write_channel_pin`
 from install.sh, then runs them in a shell harness with command stubs. The
 stubs log calls and reject mutating paths outside a per-test temporary dir;
 install.sh itself is never sourced or executed.
+The source-only hook is intentionally avoided: sourcing the full script
+loads unrelated installer code and registers its production EXIT trap.
+Function extraction keeps this regression scoped to the T1 contract.
 
 Source refs at 4a17e0d29: cleanup_on_fail + EXIT trap (install.sh:85-147),
 write_source (:379-397), and write_channel_pin (:402-447).
