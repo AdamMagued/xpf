@@ -622,10 +622,14 @@ sources” means across the HTTP and HTTPS legs sharing that `Server`; separate
 server instances, process restarts, and HA peers have fresh independent
 budgets, so this is not a cluster-wide or restart-persistent attempt quota.
 
-The shared tracker is bounded to 4096 buckets per middleware/Server; under
-high-cardinality pressure, completed buckets may be evicted after an expiry
-sweep, forgiving failures early rather than allowing attacker-chosen identities
-to grow memory without bound.
+The shared tracker is bounded to 4096 buckets per middleware/Server. Expired
+or unlocked buckets may be evicted, but live lockouts are never evicted. If no
+safe room can be made, new identities are refused with HTTP 429 and
+`Retry-After: 1`, preserving active lockouts rather than forgiving them early.
+A remote client controlling roughly 455 IPv4 addresses or IPv6 /64s can keep
+the table full (about 9k failed attempts per lockout period); while it does,
+every identity without existing buckets, including operators, receives 429
+until the lockouts expire. The no-auth loopback path is unaffected.
 Credentials are not accepted over clear HTTP: strict compile rejects explicit
 HTTP plus api-auth, and runtime disables the HTTP leg whenever an api-auth
 identity is active; use HTTPS for credentialed REST access.
