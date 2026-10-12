@@ -262,6 +262,63 @@ func TestEnvelopeRefusal_ReplacePathPreservesIdenticalBytes12177(t *testing.T) {
 	}
 }
 
+// TestEnvelopeRefusal_UnverifiablePredecessorDoesNotWedge12177 covers a
+// crash-resumed same-tag replace whose prior RemoveAll unlinked one managed
+// binary but left the committed stamp behind. The predecessor cannot be
+// proven identical, so the replacement must be demoted rather than stranding
+// the PREFLIGHT journal on a hash error.
+func TestEnvelopeRefusal_UnverifiablePredecessorDoesNotWedge12177(t *testing.T) {
+	r, cfg, fs := stagedDowngradeFixture12177(t)
+	active := filepath.Join(cfg.ConfigDBDir, "active.json")
+	mkfile(t, active,
+		"#xpf-config-envelope v=1 writer=3.0.0 ast=1 min-reader=1 rollback-fmt=1 committed=1\n{}")
+	genid := stageFreshDowngradeGeneration12177(t, r, cfg, fs, 2, true)
+
+	// Model a crash partway through removeStaleVersionDir: the old committed
+	// stamp and source-generation marker survive, but one managed binary does
+	// not. Resume at PREFLIGHT against the freshly published generation.
+	if err := os.Remove(filepath.Join(r.versionDir("2.0.0"), "cli")); err != nil {
+		t.Fatalf("unlink predecessor cli: %v", err)
+	}
+	j := &Journal{
+		State: StatePreflight, TargetVersion: "2.0.0", PreviousVersion: "3.0.0",
+		SourceGeneration: genid,
+	}
+	if err := r.saveJournal(j); err != nil {
+		t.Fatalf("seed resumed PREFLIGHT journal: %v", err)
+	}
+	const risen = "#xpf-config-envelope v=3 writer=3.0.0 ast=1 min-reader=3 rollback-fmt=1 committed=1\n{}"
+	fs.verifyHook = func() { mkfile(t, active, risen) }
+	fs.calls = nil
+
+	err := r.Run(Options{})
+	if err == nil || !strings.Contains(err.Error(), "refuse-before-STOP") {
+		t.Fatalf("resumed Run error = %v, want pre-STOP refusal after replacement", err)
+	}
+	assertForwardEnvelopeRefusedBeforeStop(t, fs)
+	if _, serr := os.Stat(cfg.JournalPath); !os.IsNotExist(serr) {
+		journal, _ := r.loadJournal()
+		t.Fatalf("unverifiable predecessor left journal behind (state=%s): %v", journal.State, serr)
+	}
+	stamp, present := r.readCommittedStamp("2.0.0")
+	if !present || stamp == nil || stamp.Committed {
+		t.Fatalf("unverifiable predecessor stamp = (%+v,present=%v), want non-committed", stamp, present)
+	}
+	if got, err := r.readSrcGen("2.0.0"); err != nil || got != genid {
+		t.Fatalf("replacement generation = %q, err=%v; want %q", got, err, genid)
+	}
+
+	// With the refusal journal cleared, a rerun reports the current envelope
+	// incompatibility at INIT rather than refusing behind a stuck PREFLIGHT.
+	rerunErr := r.Run(Options{})
+	if rerunErr == nil || !strings.HasPrefix(rerunErr.Error(), "refuse-before-PREFLIGHT:") {
+		t.Fatalf("rerun error = %v, want a clean INIT envelope refusal", rerunErr)
+	}
+	if strings.Contains(rerunErr.Error(), "in-flight") {
+		t.Fatalf("rerun was blocked by an in-flight journal: %v", rerunErr)
+	}
+}
+
 func TestEnvelopeRefusal_PreStopDemotesFailedReplacement12177(t *testing.T) {
 	r, cfg, fs := stagedDowngradeFixture12177(t)
 	mkfile(t, filepath.Join(cfg.ConfigDBDir, "active.json"),

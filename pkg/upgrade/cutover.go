@@ -1217,7 +1217,14 @@ func (r *Runner) copyStaged(j *Journal) error {
 		if preservedPredecessorStamp != nil {
 			mismatch, merr := r.mismatchedManagedBinary(ver, srcDir)
 			if merr != nil {
-				return fmt.Errorf("verify committed predecessor %s before replace: %w", ver, merr)
+				// An unreadable predecessor (e.g. a binary unlinked by a
+				// crashed removeStaleVersionDir while .committed survived)
+				// cannot be proven byte-identical: demote it as changed
+				// bytes instead of refusing, so a crash-resumed replace
+				// cannot wedge the PREFLIGHT journal (#12177 F1).
+				r.logf("upgrade: cannot hash committed predecessor %s before replace (%v); demoting as changed bytes",
+					ver, merr)
+				mismatch = "unverifiable"
 			}
 			if mismatch != "" {
 				if err := r.stampInFlightVersion(ver); err != nil {
