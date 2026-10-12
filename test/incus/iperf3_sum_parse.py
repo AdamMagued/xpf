@@ -227,14 +227,27 @@ def failover_stream_verdict(
         if row[0] is not None and 0.5 <= row[2] - row[1] <= 1.5
     ]
 
-    if intervals:
-        last_end = max(row[2] for row in intervals)
-        if last_end < event_seconds + 1:
-            return (
-                None if event_label == "failback" else False,
-                f"client telemetry ends at {last_end:.2f}s, before the {event_label} "
-                f"event at {event_seconds:g}s: no {event_label} stream evidence",
+    last_end = max((row[2] for row in intervals), default=None)
+    if event_label == "failback":
+        has_post_event_interval = any(
+            start >= event_seconds + 1 for _, start, _, _ in intervals
+        )
+        if not has_post_event_interval:
+            if last_end is not None and last_end < event_seconds + 1:
+                return None, (
+                    f"client telemetry ends at {last_end:.2f}s, before the "
+                    f"failback event at {event_seconds:g}s: no failback stream evidence"
+                )
+            return None, (
+                f"client telemetry has no per-stream interval starting at or after "
+                f"{event_seconds + 1:g}s: failback recovery window is uncovered"
             )
+    elif last_end is not None and last_end < event_seconds + 1:
+        return (
+            False,
+            f"client telemetry ends at {last_end:.2f}s, before the {event_label} "
+            f"event at {event_seconds:g}s: no {event_label} stream evidence",
+        )
 
     before = {
         stream for stream, start, _, bps in intervals

@@ -1685,7 +1685,7 @@ info "Recorded per-stream failback event at ${failback_at_seconds}s after iperf 
 if main_iperf_running; then
 	pass "iperf3 survived manual failover"
 elif failover_main_iperf_result_complete /tmp/iperf3-failover.log; then
-	pass "iperf3 completed successfully (finished before manual failover check)"
+	void "iperf3 completed before manual failback; no client remained to witness the failback event"
 else
 	fail "iperf3 DIED during manual failover"
 fi

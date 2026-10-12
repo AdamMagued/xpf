@@ -78,6 +78,7 @@ class FailoverTelemetryTests(unittest.TestCase):
         outage=(),
         duration=32,
         failback_at=20,
+        failback_dip=True,
     ):
         lines = []
         streams = tuple(streams)
@@ -96,7 +97,9 @@ class FailoverTelemetryTests(unittest.TestCase):
                 )
                 and not (stream in delayed_streams and 12 <= second < 15)
             ]
-            interval_dipped = second in outage or second in (10, 11, 20, 21)
+            interval_dipped = second in outage or second in (10, 11) or (
+                failback_dip and second in (20, 21)
+            )
             sum_gbps = (
                 0.0 if interval_dipped
                 else 23.4 * len(live_streams) / 8
@@ -303,6 +306,25 @@ class FailoverTelemetryTests(unittest.TestCase):
         self.assertEqual(lines[2].split(" ", 1)[0], "VOID")
         self.assertIn("before the failback event", lines[2])
 
+
+    def test_failback_boundary_requires_a_post_event_interval(self):
+        for duration, expected in ((21, None), (22, True)):
+            text = self.log(duration=duration, failback_dip=False)
+            for payload, json_stream in (
+                (text, False),
+                (self.json_stream(text), True),
+            ):
+                with self.subTest(duration=duration, json_stream=json_stream):
+                    ok, reason = failover_stream_verdict(
+                        payload,
+                        20,
+                        8,
+                        json_stream=json_stream,
+                        event_label="failback",
+                    )
+                    self.assertIs(ok, expected)
+                    if expected is None:
+                        self.assertIn("no per-stream interval", reason)
 
     def test_failover_cli_emits_interval_and_stream_verdicts(self):
         parser = os.path.join(os.path.dirname(__file__), "iperf3_sum_parse.py")
