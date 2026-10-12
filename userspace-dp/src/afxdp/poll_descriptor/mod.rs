@@ -1966,7 +1966,7 @@ pub(super) fn poll_binding_process_descriptor_with_injection(
                             // #8125: resolved from the same entry, so the row's
                             // `Timeout:` column reports the window in force.
                             let timeout_secs = sessions.timeout_secs_for(&flow.forward_key);
-                            publish_bpf_conntrack_entry(
+                            publish_bpf_conntrack_entry_with_source_nat(
                                 conntrack_v4_fd,
                                 conntrack_v6_fd,
                                 &flow.forward_key,
@@ -1978,6 +1978,7 @@ pub(super) fn poll_binding_process_descriptor_with_injection(
                                 session_id,
                                 timeout_secs,
                                 resolved.origin,
+                                resolved.source_nat_static,
                             );
                         }
                         // Log first N session hits from WAN (return path)
@@ -2313,6 +2314,8 @@ pub(super) fn poll_binding_process_descriptor_with_injection(
                             resolved.decision,
                             flow,
                             resolved.origin,
+                            resolved.source_nat_static,
+                            resolved.source_nat_validation_key.as_ref(),
                         );
                         let owner_icmp_verdict = if session_hit_revocation.is_none()
                             && foreign_arrival_zone.is_none()
@@ -5079,15 +5082,17 @@ pub(super) fn poll_binding_process_descriptor_with_injection(
                                         );
                                     }
                                     let forward_installed = track_in_userspace
-                                        && sessions.install_with_protocol_with_origin(
-                                            flow.forward_key.clone(),
-                                            decision,
-                                            forward_metadata.clone(),
-                                            SessionOrigin::ForwardFlow,
-                                            now_ns,
-                                            meta.protocol,
-                                            meta.tcp_flags,
-                                        );
+                                        && sessions
+                                            .install_with_protocol_with_origin_and_source_nat(
+                                                flow.forward_key.clone(),
+                                                decision,
+                                                forward_metadata.clone(),
+                                                SessionOrigin::ForwardFlow,
+                                                now_ns,
+                                                meta.protocol,
+                                                meta.tcp_flags,
+                                                source_nat_static,
+                                            );
                                     if forward_installed {
                                         sessions.mark_source_nat_revalidated(
                                             &flow.forward_key,
@@ -5224,6 +5229,7 @@ pub(super) fn poll_binding_process_descriptor_with_injection(
                                             key: flow.forward_key.clone(),
                                             decision,
                                             metadata: forward_metadata,
+                                            source_nat_static,
                                             leak_incarnation: leak_incarnation.unwrap_or(0),
                                             origin: SessionOrigin::ForwardFlow,
                                             protocol: meta.protocol,
@@ -5321,7 +5327,7 @@ pub(super) fn poll_binding_process_descriptor_with_injection(
                                         // #8125: see the sibling site.
                                         let ct_timeout_secs =
                                             sessions.timeout_secs_for(&flow.forward_key);
-                                        publish_bpf_conntrack_entry_under_gate(
+                                        publish_bpf_conntrack_entry_under_gate_with_source_nat(
                                             conntrack_v4_fd,
                                             conntrack_v6_fd,
                                             &flow.forward_key,
@@ -5333,6 +5339,7 @@ pub(super) fn poll_binding_process_descriptor_with_injection(
                                             ct_session_id,
                                             ct_timeout_secs,
                                             SessionOrigin::ForwardFlow,
+                                            forward_entry.source_nat_static,
                                         );
                                         publish_shared_session(
                                             worker_ctx.shared_sessions,
@@ -5621,6 +5628,7 @@ pub(super) fn poll_binding_process_descriptor_with_injection(
                                             session_id: 0,
                                             tcp_close_class: 0,
                                             tcp_handshake_state: sessions.handshake_state_wire_for(&flow.forward_key),
+                                            source_nat_static: None,
                                         };
                                         publish_shared_session(
                                             worker_ctx.shared_sessions,
@@ -9252,15 +9260,17 @@ pub(super) fn poll_binding_process_descriptor_with_injection(
                                         sessions.note_admission_refused();
                                     }
                                     let pending_installed = pending_capacity_available
-                                        && sessions.install_with_protocol_with_origin(
-                                            flow.forward_key.clone(),
-                                            pending_decision,
-                                            sess_meta.clone(),
-                                            SessionOrigin::MissingNeighborSeed,
-                                            now_ns,
-                                            meta.protocol,
-                                            meta.tcp_flags,
-                                        );
+                                        && sessions
+                                            .install_with_protocol_with_origin_and_source_nat(
+                                                flow.forward_key.clone(),
+                                                pending_decision,
+                                                sess_meta.clone(),
+                                                SessionOrigin::MissingNeighborSeed,
+                                                now_ns,
+                                                meta.protocol,
+                                                meta.tcp_flags,
+                                                source_nat_static,
+                                            );
                                     if pending_installed {
                                         sessions.mark_source_nat_revalidated(
                                             &flow.forward_key,
@@ -9292,6 +9302,7 @@ pub(super) fn poll_binding_process_descriptor_with_injection(
                                             key: flow.forward_key.clone(),
                                             decision: pending_decision,
                                             metadata: sess_meta,
+                                            source_nat_static,
                                             leak_incarnation: pending_leak_incarnation.unwrap_or(0),
                                             origin: SessionOrigin::MissingNeighborSeed,
                                             protocol: meta.protocol,
@@ -9351,7 +9362,7 @@ pub(super) fn poll_binding_process_descriptor_with_injection(
                                         // #8125: see the sibling site.
                                         let timeout_secs =
                                             sessions.timeout_secs_for(&flow.forward_key);
-                                        publish_bpf_conntrack_entry(
+                                        publish_bpf_conntrack_entry_with_source_nat(
                                             conntrack_v4_fd,
                                             conntrack_v6_fd,
                                             &flow.forward_key,
@@ -9363,6 +9374,7 @@ pub(super) fn poll_binding_process_descriptor_with_injection(
                                             session_id,
                                             timeout_secs,
                                             SessionOrigin::MissingNeighborSeed,
+                                            entry.source_nat_static,
                                         );
                                         // #2244: count failed reverse-NAT publishes so
                                         // map-pressure loss is operator-visible.

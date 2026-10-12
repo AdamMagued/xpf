@@ -2963,6 +2963,7 @@ fn materialize_shared_session_hit(
                 // worker that happens to see its next packet.
                 tcp_close_class: replica.tcp_close_class,
                 tcp_handshake_state: replica.tcp_handshake_state,
+                source_nat_static: replica.source_nat_static,
             },
             false,
         );
@@ -3114,9 +3115,34 @@ pub(super) fn resolve_flow_session_decision_with_conntrack(
         // Preserve the shared session incarnation before materialization takes
         // its entry out of `hit`; local-only hits read it from the table below.
         let shared_session_id = hit.shared_entry.as_ref().map(|entry| entry.session_id);
+        let source_nat_static = match hit.shared_entry.as_ref() {
+            Some(entry) => entry.source_nat_static,
+            None => sessions.source_nat_static_for(hit.key.as_ref(&flow.forward_key)),
+        };
         let keep_transient = poison_key.is_some_and(|(key, decision, metadata, origin)| {
             should_keep_synced_hit_transient(ha_state, now_secs, key, decision, metadata, origin)
         });
+        let session_id_before_purge = shared_session_id
+            .filter(|session_id| *session_id != 0)
+            .or_else(|| {
+                (!shared_was_present)
+                    .then(|| sessions.session_id_for(hit.key.as_ref(&flow.forward_key)))
+            })
+            .unwrap_or(0);
+        let source_nat_validation_key = if keep_transient {
+            shared_source_nat_original_key(
+                shared.forward_wire_sessions,
+                &flow.forward_key,
+                hit.key.as_ref(&flow.forward_key),
+                hit.lookup.decision,
+                &hit.lookup.metadata,
+                hit_origin,
+                source_nat_static,
+                session_id_before_purge,
+            )
+        } else {
+            None
+        };
         if keep_transient && let Some((key, decision, metadata, origin)) = poison_key {
             purge_translated_synced_hit(
                 sessions,
@@ -3141,7 +3167,13 @@ pub(super) fn resolve_flow_session_decision_with_conntrack(
             sessions.forwarding_resolution_is_stale(resolved.forwarding_generation);
         let session_id = shared_session_id
             .filter(|session_id| *session_id != 0)
-            .unwrap_or_else(|| sessions.session_id_for(resolved_key));
+            .unwrap_or_else(|| {
+                if keep_transient {
+                    session_id_before_purge
+                } else {
+                    sessions.session_id_for(resolved_key)
+                }
+            });
         let previous_policy_to_zone_id = forwarding_stale.then(|| {
             if resolved.decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
                 resolved.metadata.egress_zone
@@ -3273,8 +3305,10 @@ pub(super) fn resolve_flow_session_decision_with_conntrack(
             key: resolved_key.clone(),
             session_id,
             decision,
+            source_nat_static,
             metadata,
             origin: hit_origin,
+            source_nat_validation_key,
             created: false,
             install_failed: shared_was_present && materialize_install_failed,
             close_deferred: hit.close_deferred,
@@ -3420,8 +3454,10 @@ pub(super) fn resolve_flow_session_decision_with_conntrack(
         key: flow.forward_key.clone(),
         session_id: sessions.session_id_for(&flow.forward_key),
         decision,
+        source_nat_static: None,
         metadata,
         origin: SessionOrigin::ReverseFlow,
+        source_nat_validation_key: None,
         // #1861 §5.4 + AGY r1 F1: `created` reports the ACTUAL install
         // outcome (was unconditionally true — session_creates over-counted
         // at cap and publish_bpf_conntrack_entry fired for a session that

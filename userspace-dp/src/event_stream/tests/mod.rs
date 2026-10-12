@@ -149,6 +149,7 @@ fn test_close_delta(kind: crate::session::SessionDeltaKind) -> crate::session::S
         tcp_close_class: 0,
         tcp_handshake_state: 0,
         purge_retirement: false,
+        source_nat_static: None,
     }
 }
 

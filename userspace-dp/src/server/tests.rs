@@ -1421,6 +1421,37 @@ fn sync_session_upsert_with_valid_entry_succeeds() {
 }
 
 #[test]
+fn sync_session_upsert_accepts_unknown_provenance_12187() {
+    let sync = SessionSyncRequest {
+        operation: "upsert".to_string(),
+        addr_family: libc::AF_INET as u8,
+        protocol: crate::ip_proto::PROTO_TCP,
+        src_ip: "10.0.0.1".to_string(),
+        dst_ip: "10.0.0.2".to_string(),
+        src_port: 1234,
+        dst_port: 80,
+        egress_ifindex: 7,
+        neighbor_mac: "02:bf:72:01:02:03".to_string(),
+        src_mac: "02:bf:72:0a:0b:0c".to_string(),
+        source_nat_provenance: 3,
+        ..SessionSyncRequest::default()
+    };
+    let imported = build_synced_session_entry(&sync, &rustc_hash::FxHashMap::default(), 0)
+        .expect("out-of-range provenance is unknown, not a rejected sync");
+    assert_eq!(imported.source_nat_static, None);
+
+    let state = new_state(ProcessStatus::default());
+    let mut request = req("sync_session");
+    request.session_sync = Some(sync);
+    let response = run_request(state.clone(), request);
+    assert!(
+        response.ok,
+        "sync with unknown provenance should be accepted: {}",
+        response.error
+    );
+}
+
+#[test]
 fn delivered_session_close_deletes_synced_opening_10888() {
     let state = new_state(ProcessStatus::default());
     let mut upsert = req("sync_session");

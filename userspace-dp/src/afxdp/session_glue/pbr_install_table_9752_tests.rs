@@ -1506,6 +1506,7 @@ fn synced_entry_for(
         session_id: 0,
         tcp_close_class: 0,
         tcp_handshake_state: 0,
+        source_nat_static: None,
     }
 }
 
@@ -2443,7 +2444,7 @@ fn cancel_keys_test_delta(purge_retirement: bool) -> SessionDelta {
     bulk_resync: false,
     tcp_close_class: 0,
     tcp_handshake_state: 0,
-    purge_retirement, }
+    purge_retirement, source_nat_static: None }
 }
 
 /// Round 3 item 3, flow-cancel gating: cancelled flows are DROPPED, so the

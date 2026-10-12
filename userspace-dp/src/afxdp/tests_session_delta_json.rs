@@ -76,7 +76,7 @@ fn delta_with_session_id(session_id: u64) -> SessionDelta {
     bulk_resync: false,
     tcp_close_class: 0,
     tcp_handshake_state: 0,
-    purge_retirement: false, }
+    purge_retirement: false, source_nat_static: None }
 }
 
 fn test_binding_identity() -> BindingIdentity {
@@ -140,6 +140,26 @@ fn session_delta_info_rt_flow_session_id_wire_key_6312() {
         Some(want),
         "`rt_flow_session_id` must carry the id verbatim: {v}"
     );
+}
+
+#[test]
+fn session_delta_info_carries_source_nat_provenance_12187() {
+    let binding = test_binding_identity();
+    for (source_nat_static, expected) in [(None, 0), (Some(false), 1), (Some(true), 2)] {
+        let mut delta = delta_with_session_id(1);
+        delta.source_nat_static = source_nat_static;
+        let info = session_delta_info(&binding, &delta, &zone_names());
+        assert_eq!(info.source_nat_provenance, expected);
+        let value: serde_json::Value =
+            serde_json::to_value(&info).expect("serialize session delta");
+        assert_eq!(
+            value
+                .get("source_nat_provenance")
+                .and_then(serde_json::Value::as_u64),
+            Some(u64::from(expected)),
+            "JSON delta must carry source-NAT provenance {expected}: {value}"
+        );
+    }
 }
 
 /// A delta with no backing entry (`session_id == 0`) must still emit the key
@@ -253,14 +273,14 @@ fn binary_attribution(delta: &SessionDelta) -> BinaryAttribution {
     );
     let payload = &frame.as_bytes()[FRAME_HEADER_SIZE..];
     // The fixed close/install/ICMP/ingress tail precedes the length-prefixed
-    // rule ID. #10888 appends the handshake-state byte after the rule ID, so
-    // locate the prefix from the rule bytes immediately before that final byte.
+    // rule ID. #10888 appends handshake state and #12187 appends provenance
+    // after the ID, so locate its prefix immediately before both trailer bytes.
     let expected_rule_id = delta
         .metadata
         .policy_counter
         .as_ref()
         .map_or("", |counter| counter.rule_id());
-    let rule_id_end = payload.len() - 1; // trailing #10888 handshake-state byte
+    let rule_id_end = payload.len() - 2; // handshake state and provenance trail the policy rule ID
     let id_start = rule_id_end - expected_rule_id.len();
     let rule_id_prefix = id_start - 2;
     let encoded_len = u16::from_le_bytes(
@@ -838,9 +858,9 @@ fn session_delta_json_carries_the_purge_retirement_marker_9752() {
 
 /// Round 4 item 4, chain root (R0): the producer's session-delta JSON for the
 /// PBR flow, as `session_delta_info` emits it — tuple, blue stamp, stable id
-/// 77, zones, owner RG 1. Written to the shared golden
-/// `pbr_delta_9752.json`, which the Go chain test consumes; no hand-shaped
-/// delta exists anywhere downstream. Regen with
+/// 77, zones, owner RG 1, and unknown/legacy source-NAT provenance. Written to
+/// the shared `pbr_delta_9752.json` golden, which the Go chain test consumes;
+/// no hand-shaped delta exists downstream. Regen with
 /// `XPF_WRITE_PBR_DELTA_9752=1` (deliberate shape change only).
 #[test]
 fn producer_delta_json_matches_the_shared_golden_9752() {
@@ -870,6 +890,11 @@ fn producer_delta_json_matches_the_shared_golden_9752() {
     delta.metadata.owner_rg_id = 1;
     let info = session_delta_info(&test_binding_identity(), &delta, &zone_names());
     let json = serde_json::to_value(info).expect("delta serializes");
+    assert_eq!(
+        json.get("source_nat_provenance").and_then(|v| v.as_u64()),
+        Some(0),
+        "the shared delta golden must pin unknown source-NAT provenance"
+    );
     // Pin the load-bearing keys the chain downstream consumes.
     assert_eq!(json.get("event").and_then(|v| v.as_str()), Some("open"));
     assert_eq!(json.get("src_ip").and_then(|v| v.as_str()), Some("10.0.61.102"));

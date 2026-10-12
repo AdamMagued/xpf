@@ -299,6 +299,33 @@ fn session_lookup_hits_after_install() {
 }
 
 #[test]
+fn local_snat_origin_is_on_initial_open_delta_12187() {
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let mut decision = decision();
+    let translated_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10));
+    decision.nat.rewrite_src = Some(translated_ip);
+    decision.nat.rewrite_src_port = Some(45_000);
+
+    assert!(table.install_with_protocol_with_origin_and_source_nat(
+        key.clone(),
+        decision,
+        metadata(),
+        SessionOrigin::ForwardFlow,
+        1_000_000,
+        PROTO_TCP,
+        0x10,
+        Some(false),
+    ));
+    let deltas = table.drain_deltas(8);
+    assert_eq!(deltas.len(), 1);
+    assert_eq!(deltas[0].kind, SessionDeltaKind::Open);
+    assert_eq!(deltas[0].key, key);
+    assert_eq!(deltas[0].decision.nat.rewrite_src, Some(translated_ip));
+    assert_eq!(deltas[0].source_nat_static, Some(false));
+}
+
+#[test]
 fn transient_seed_installs_stay_out_of_delta_stream() {
     let mut table = SessionTable::new();
     let now = 1_000_000_000u64;
@@ -530,6 +557,7 @@ fn adopted_peer_id_cannot_collide_with_a_local_id_6311() {
             session_id: peer_id,
             tcp_close_class: 0,
             tcp_handshake_state: 0,
+            source_nat_static: None,
         },
         false,
     ));
@@ -650,6 +678,7 @@ fn synced_import_adopts_peer_session_id_5212() {
             session_id: peer_id,
             tcp_close_class: 0,
             tcp_handshake_state: 0,
+            source_nat_static: None,
         },
         false,
     ));
@@ -675,6 +704,7 @@ fn synced_import_adopts_peer_session_id_5212() {
             session_id: 0,
             tcp_close_class: 0,
             tcp_handshake_state: 0,
+            source_nat_static: None,
         },
         false,
     ));
@@ -2874,6 +2904,7 @@ fn demote_flips_worker_replica_to_sync_import_10366() {
                 session_id: 0,
                 tcp_close_class: 0,
                 tcp_handshake_state: 0,
+                source_nat_static: None,
             },
             false,
         ));
@@ -2918,6 +2949,7 @@ fn demote_then_refresh_preserves_replica_origin_10366() {
             session_id: 0,
             tcp_close_class: 0,
             tcp_handshake_state: 0,
+            source_nat_static: None,
         },
         false,
     ));
@@ -4695,7 +4727,7 @@ fn reference_update_session(
         bulk_resync: false,
         tcp_close_class,
         tcp_handshake_state,
-        purge_retirement: false, });
+        purge_retirement: false, source_nat_static: None });
     }
     true
 }
@@ -7175,6 +7207,7 @@ fn session_limit_ha_import_promote_demote_count() {
             session_id: 0,
             tcp_close_class: 0,
             tcp_handshake_state: 0,
+            source_nat_static: None,
         },
         false,
     ));
@@ -7253,6 +7286,7 @@ fn session_limit_worker_replica_excluded_then_promote_backcounts_10310() {
             session_id: 0,
             tcp_close_class: 0,
             tcp_handshake_state: 0,
+            source_nat_static: None,
         },
         false,
     ));
@@ -7325,6 +7359,7 @@ fn session_limit_synced_sessions_enforced_after_failover() {
                 session_id: 0,
                 tcp_close_class: 0,
                 tcp_handshake_state: 0,
+                source_nat_static: None,
             },
             false,
         ));
@@ -7375,6 +7410,7 @@ fn session_limit_synced_reimport_nets_to_one() {
                 session_id: 0,
                 tcp_close_class: 0,
                 tcp_handshake_state: 0,
+                source_nat_static: None,
             },
             true,
         ));
@@ -7414,6 +7450,7 @@ fn session_limit_synced_reverse_import_excluded() {
             session_id: 0,
             tcp_close_class: 0,
             tcp_handshake_state: 0,
+            source_nat_static: None,
         },
         false,
     ));
@@ -7610,6 +7647,7 @@ fn session_limit_counts_match_live_counted_entries_invariant() {
             session_id: 0,
             tcp_close_class: 0,
             tcp_handshake_state: 0,
+            source_nat_static: None,
         },
         false,
     );
@@ -7808,6 +7846,7 @@ fn session_limit_destination_backcount_on_enable_covers_preexisting_sessions() {
             session_id: 0,
             tcp_close_class: 0,
             tcp_handshake_state: 0,
+            source_nat_static: None,
         },
         false,
     );
@@ -8188,7 +8227,7 @@ fn open_delta(key: SessionKey) -> SessionDelta {
     bulk_resync: false,
     tcp_close_class: 0,
     tcp_handshake_state: 0,
-    purge_retirement: false, }
+    purge_retirement: false, source_nat_static: None }
 }
 
 /// (a) Overflowing the ring sets the loss latch and counts the drop.
@@ -10479,6 +10518,7 @@ fn import_ipsec_alias_test_session(
             session_id: 1,
             tcp_close_class: 0,
             tcp_handshake_state: 0,
+            source_nat_static: None,
         },
         false,
     )
