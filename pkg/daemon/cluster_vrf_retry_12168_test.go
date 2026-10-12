@@ -142,10 +142,9 @@ func TestClusterTransportKeyTracksVRFConvergence12168(t *testing.T) {
 			controlUnbound, got)
 	}
 	control.Attrs().MasterIndex = vrf.Attrs().Index
-	d.publishMgmtVRFIfaces(nil)
 	controlBound := d.clusterTransportForConfig(controlCfg)
 	if controlBound == controlUnbound || controlBound.VRFDevice != config.ManagementVRFDeviceName {
-		t.Fatalf("kernel control membership produced key %+v, want VRF %q",
+		t.Fatalf("published kernel control membership produced key %+v, want VRF %q",
 			controlBound, config.ManagementVRFDeviceName)
 	}
 
@@ -156,9 +155,10 @@ func TestClusterTransportKeyTracksVRFConvergence12168(t *testing.T) {
 		Fabric1Interface:   "fab1",
 		Fabric1PeerAddress: "192.0.2.4",
 	}
+	d.publishMgmtVRFIfaces(map[string]bool{"fab0": true, "fab1": true})
 	fabricUnbound := d.clusterTransportForConfig(fabricCfg)
 	if fabricUnbound.VRFDevice != "" {
-		t.Fatalf("unbound fabric interfaces resolved VRF %q", fabricUnbound.VRFDevice)
+		t.Fatalf("published but kernel-unbound fabric interfaces resolved VRF %q", fabricUnbound.VRFDevice)
 	}
 	fab0.Attrs().MasterIndex = vrf.Attrs().Index
 	primaryOnly := d.clusterTransportForConfig(fabricCfg)
@@ -169,7 +169,49 @@ func TestClusterTransportKeyTracksVRFConvergence12168(t *testing.T) {
 	fab1.Attrs().MasterIndex = vrf.Attrs().Index
 	fabricBound := d.clusterTransportForConfig(fabricCfg)
 	if fabricBound == fabricUnbound || fabricBound.VRFDevice != config.ManagementVRFDeviceName {
-		t.Fatalf("dual-fabric kernel membership produced key %+v, want VRF %q",
+		t.Fatalf("published kernel dual-fabric membership produced key %+v, want VRF %q",
 			fabricBound, config.ManagementVRFDeviceName)
+	}
+}
+
+func TestDaemonPeerDialResolverTracksCurrentTransportBinding12168(t *testing.T) {
+	store := testStoreWithSetConfig(t, []string{
+		"set chassis cluster cluster-id 1",
+		"set chassis cluster node 0",
+		"set chassis cluster authentication-key xpf-peer-resolver-key-12168",
+		"set chassis cluster control-interface em0",
+		"set chassis cluster peer-address 192.0.2.2",
+		"set interfaces em0 unit 0 family inet address 192.0.2.1/24",
+	})
+	control := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "em0", Index: 10}}
+	vrf := &netlink.Vrf{LinkAttrs: netlink.LinkAttrs{Name: config.ManagementVRFDeviceName, Index: 77}}
+	d := &Daemon{
+		store: store,
+		linkByNameFn: func(name string) (netlink.Link, error) {
+			switch name {
+			case "em0":
+				return control, nil
+			case config.ManagementVRFDeviceName:
+				return vrf, nil
+			default:
+				return nil, errors.New("unknown fixture link")
+			}
+		},
+	}
+	d.publishMgmtVRFIfaces(nil)
+	if got := d.clusterPeerVRFDevice(); got != "" {
+		t.Fatalf("unpublished kernel VRF binding resolved %q", got)
+	}
+	d.publishMgmtVRFIfaces(map[string]bool{"em0": true})
+	if got := d.clusterPeerVRFDevice(); got != "" {
+		t.Fatalf("published but unbound transport resolved %q", got)
+	}
+	control.Attrs().MasterIndex = vrf.Attrs().Index
+	if got := d.clusterPeerVRFDevice(); got != config.ManagementVRFDeviceName {
+		t.Fatalf("converged active transport resolved %q, want vrf-mgmt", got)
+	}
+	d.publishMgmtVRFIfaces(nil)
+	if got := d.clusterPeerVRFDevice(); got != "" {
+		t.Fatalf("withdrawn membership retained peer dial binding %q", got)
 	}
 }

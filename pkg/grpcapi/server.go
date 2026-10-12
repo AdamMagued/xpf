@@ -945,6 +945,8 @@ type fabricSupervisorConfig struct {
 	backoffBase  time.Duration
 	backoffMax   time.Duration
 	healthyServe time.Duration
+	vrfDeviceFn  func() string
+	listenForVRF func(ctx context.Context, vrfDevice string) (net.Listener, error)
 	// listen creates a fresh listener bound to the fabric address.
 	listen func(ctx context.Context) (net.Listener, error)
 	// serve serves the fabric gRPC service on lis until it faults or ctx is
@@ -972,24 +974,39 @@ type fabricSupervisorConfig struct {
 //     SystemAction{zeroize,reboot,halt,power-off}) are rejected with
 //     PermissionDenied and never reach a handler.
 func (s *Server) RunFabricListener(ctx context.Context, addr, vrfDevice string) {
-	lc := net.ListenConfig{
-		Control: func(network, address string, c syscall.RawConn) error {
-			var err error
-			c.Control(func(fd uintptr) {
-				_ = unix.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_REUSEADDR, 1)
-				_ = unix.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_REUSEPORT, 1)
-				if vrfDevice != "" {
-					err = unix.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, vrfDevice)
-				}
-			})
-			return err
-		},
+	s.runFabricListener(ctx, addr, func() string { return vrfDevice })
+}
+
+// RunFabricListenerWithVRFDeviceFunc refreshes its binding on every listener
+// attempt. The management VRF can become the correct binding while a comms
+// epoch is retrying after startup.
+func (s *Server) RunFabricListenerWithVRFDeviceFunc(ctx context.Context, addr string, vrfDeviceFn func() string) {
+	if vrfDeviceFn == nil {
+		vrfDeviceFn = func() string { return "" }
 	}
-	s.superviseFabricListener(ctx, addr, vrfDevice, fabricSupervisorConfig{
+	s.runFabricListener(ctx, addr, vrfDeviceFn)
+}
+
+func (s *Server) runFabricListener(ctx context.Context, addr string, vrfDeviceFn func() string) {
+	s.superviseFabricListener(ctx, addr, "", fabricSupervisorConfig{
 		backoffBase:  fabricListenerBackoffBase,
 		backoffMax:   fabricListenerBackoffMax,
 		healthyServe: fabricListenerHealthyServe,
-		listen: func(ctx context.Context) (net.Listener, error) {
+		vrfDeviceFn:  vrfDeviceFn,
+		listenForVRF: func(ctx context.Context, vrfDevice string) (net.Listener, error) {
+			lc := net.ListenConfig{
+				Control: func(network, address string, c syscall.RawConn) error {
+					var err error
+					c.Control(func(fd uintptr) {
+						_ = unix.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+						_ = unix.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+						if vrfDevice != "" {
+							err = unix.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, vrfDevice)
+						}
+					})
+					return err
+				},
+			}
 			return lc.Listen(ctx, "tcp", addr)
 		},
 		serve: func(ctx context.Context, lis net.Listener) error {
@@ -1037,13 +1054,23 @@ func (s *Server) superviseFabricListener(ctx context.Context, addr, vrfDevice st
 		if ctx.Err() != nil {
 			return
 		}
-		lis, err := cfg.listen(ctx)
+		currentVRF := vrfDevice
+		if cfg.vrfDeviceFn != nil {
+			currentVRF = cfg.vrfDeviceFn()
+		}
+		var lis net.Listener
+		var err error
+		if cfg.listenForVRF != nil {
+			lis, err = cfg.listenForVRF(ctx, currentVRF)
+		} else {
+			lis, err = cfg.listen(ctx)
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
 			slog.Warn("gRPC fabric listener bind failed; will retry",
-				"addr", addr, "vrf", vrfDevice, "backoff", backoff, "err", err)
+				"addr", addr, "vrf", currentVRF, "backoff", backoff, "err", err)
 			if !sleepFabricBackoff(ctx, &backoff, cfg.backoffMax) {
 				return
 			}
@@ -1051,7 +1078,7 @@ func (s *Server) superviseFabricListener(ctx context.Context, addr, vrfDevice st
 		}
 
 		if s.setFabricListenerUp(addr, true) {
-			slog.Info("gRPC fabric listener up", "addr", addr, "vrf", vrfDevice)
+			slog.Info("gRPC fabric listener up", "addr", addr, "vrf", currentVRF)
 		}
 		start := time.Now()
 		serveErr := cfg.serve(ctx, lis)
@@ -1060,7 +1087,7 @@ func (s *Server) superviseFabricListener(ctx context.Context, addr, vrfDevice st
 		// Expected graceful shutdown: ctx cancelled (serveUntilDone returns nil)
 		// or the server was intentionally stopped. Exit cleanly, no retry.
 		if ctx.Err() != nil || serveErr == nil || errors.Is(serveErr, grpc.ErrServerStopped) {
-			slog.Info("gRPC fabric listener stopped", "addr", addr, "vrf", vrfDevice)
+			slog.Info("gRPC fabric listener stopped", "addr", addr, "vrf", currentVRF)
 			return
 		}
 
@@ -1071,7 +1098,7 @@ func (s *Server) superviseFabricListener(ctx context.Context, addr, vrfDevice st
 			backoff = cfg.backoffBase
 		}
 		slog.Warn("gRPC fabric listener serve fault; will retry",
-			"addr", addr, "vrf", vrfDevice, "backoff", backoff, "err", serveErr)
+			"addr", addr, "vrf", currentVRF, "backoff", backoff, "err", serveErr)
 		if !sleepFabricBackoff(ctx, &backoff, cfg.backoffMax) {
 			return
 		}

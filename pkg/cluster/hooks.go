@@ -104,6 +104,15 @@ func (m *Manager) SetHeartbeatRestartNotifyFunc(fn func()) {
 	m.hbRestartNotifyFn = fn
 }
 
+// SetHeartbeatVRFDeviceFunc registers the live binding resolver used by
+// RestartHeartbeat before every bind attempt. The callback runs without m.mu
+// held so daemon link/member lookups cannot block Manager state access.
+func (m *Manager) SetHeartbeatVRFDeviceFunc(fn func(controlIface string) string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.hbVRFDeviceFn = fn
+}
+
 // SetRGForwardingFunc registers the callback that reports a redundancy group's
 // DATAPLANE-side state (applied rg_active and VRRP mastership) for
 // `show chassis cluster status`.

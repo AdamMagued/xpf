@@ -3,12 +3,14 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/vishvananda/netlink"
 )
 
 func TestClusterVRFDeviceFollowsTransportMembership11384(t *testing.T) {
@@ -50,13 +52,12 @@ func TestClusterVRFDeviceFollowsTransportMembership11384(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			d := &Daemon{}
-			d.publishMgmtVRFIfaces(tc.members)
-			got := d.resolveClusterVRFDevice(tc.iface)
+			d := vrfBindingTestDaemon11384(tc.members, tc.iface)
 			want := ""
 			if tc.wantVRF {
 				want = config.ManagementVRFDeviceName
 			}
+			got := d.resolveClusterVRFDevice(tc.iface)
 			if got != want {
 				t.Errorf("resolveClusterVRFDevice(%q) = %q, want %q", tc.iface, got, want)
 			}
@@ -116,13 +117,13 @@ func TestClusterSyncVRFDeviceUsesSelectedTransport11384(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			d := &Daemon{}
-			d.publishMgmtVRFIfaces(tc.members)
-			got := d.resolveClusterSyncVRFDevice(tc.cc)
+			iface0, iface1 := clusterSyncVRFTransportIfaces(tc.cc)
+			d := vrfBindingTestDaemon11384(tc.members, iface0, iface1)
 			want := ""
 			if tc.wantVRF {
 				want = config.ManagementVRFDeviceName
 			}
+			got := d.resolveClusterSyncVRFDevice(tc.cc)
 			if got != want {
 				t.Errorf("resolveClusterSyncVRFDevice() = %q, want %q", got, want)
 			}
@@ -166,4 +167,35 @@ func TestUnboundControlTransportStartsHeartbeatSocket11384(t *testing.T) {
 	if !manager.HeartbeatRunning() {
 		t.Fatal("heartbeat socket did not start without a VRF binding")
 	}
+}
+
+func vrfBindingTestDaemon11384(members map[string]bool, selected ...string) *Daemon {
+	vrf := &netlink.Vrf{LinkAttrs: netlink.LinkAttrs{Name: config.ManagementVRFDeviceName, Index: 77}}
+	links := map[string]netlink.Link{config.ManagementVRFDeviceName: vrf}
+	for name := range members {
+		links[name] = &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: name, Index: len(links) + 10}}
+	}
+	for _, iface := range selected {
+		if iface == "" {
+			continue
+		}
+		name := config.LinuxIfName(iface)
+		if _, ok := links[name]; !ok {
+			links[name] = &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: name, Index: len(links) + 10}}
+		}
+	}
+	for name := range members {
+		links[name].Attrs().MasterIndex = vrf.Attrs().Index
+	}
+	d := &Daemon{
+		linkByNameFn: func(name string) (netlink.Link, error) {
+			link, ok := links[name]
+			if !ok {
+				return nil, errors.New("unknown test link")
+			}
+			return link, nil
+		},
+	}
+	d.publishMgmtVRFIfaces(members)
+	return d
 }

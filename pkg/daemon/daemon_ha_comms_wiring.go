@@ -13,113 +13,76 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/configstore"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
-	"github.com/vishvananda/netlink"
 )
 
 // Cluster-comms construction helpers extracted from Daemon.startClusterComms
 // (#6428). Their call sites in daemon_ha_sync.go retain the same startup
 // ordering and goroutine spawn points.
 
-// resolveClusterVRFDevice returns vrf-mgmt only when every cluster transport
-// interface belongs to it. The published set uses post-LinuxIfName spellings;
-// an unrelated management interface must not determine a transport's routing
-// table. Non-members stay unbound so their routes resolve in the main table.
+// resolveClusterVRFDevice is the startup-warning form of transportVRFBinding.
 func (d *Daemon) resolveClusterVRFDevice(transportIfaces ...string) string {
-	return d.clusterVRFDeviceForTransports(true, transportIfaces...)
+	return d.transportVRFBinding(true, transportIfaces...)
 }
 
-// clusterVRFDeviceForTransportKey uses kernel master state without logging.
-// Step 20 calls it on each apply, so an interface outside vrf-mgmt must not
-// emit the startup warning on every commit.
-//
-// #12168 F1: the decision is KERNEL-EVIDENCED, not desired-set publication.
-// A failed applyVRFReconcile/rebind can publish desired membership while the
-// interface still sits in the main table; resolving from that set alone lets
-// the failure consume the transition and destroy working main-table comms.
-// Comparing kernel evidence against the active key leaves that epoch intact,
-// then lets genuine convergence restart even if the desired set never changed.
-func (d *Daemon) clusterVRFDeviceForTransportKey(transportIfaces ...string) string {
-	hasTransport := false
+// transportVRFBinding is the single predicate for socket binding and the
+// transport restart key. Every selected interface must be both published and
+// a kernel member of vrf-mgmt. Desired-only membership after EBUSY must not
+// destroy working main-table comms; kernel-only membership after a warm restart
+// must not consume the later publication transition while sockets are unbound.
+// Empty selections, missing links and failed lookups remain unbound.
+func (d *Daemon) transportVRFBinding(warn bool, transportIfaces ...string) string {
+	members := d.mgmtVRFIfaceSet()
+	vrfIndex := 0
 	for _, iface := range transportIfaces {
 		if iface == "" {
 			continue
 		}
-		hasTransport = true
 		linuxName := config.LinuxIfName(iface)
-		if !d.transportIfaceInMgmtVRF(linuxName) {
+		if !members[linuxName] {
+			if warn && (len(members) > 0 || config.IsManagementIfName(iface)) {
+				slog.Warn("cluster transport interface is not a management VRF member; leaving sockets unbound to VRF",
+					"interface", linuxName, "vrf", config.ManagementVRFDeviceName)
+			}
+			return ""
+		}
+		if vrfIndex == 0 {
+			vrf, err := d.fabricLinkByName(config.ManagementVRFDeviceName)
+			if err != nil || vrf == nil || vrf.Attrs() == nil || vrf.Attrs().Index == 0 {
+				return ""
+			}
+			vrfIndex = vrf.Attrs().Index
+		}
+		link, err := d.fabricLinkByName(linuxName)
+		if err != nil || link == nil || link.Attrs() == nil || link.Attrs().MasterIndex != vrfIndex {
 			return ""
 		}
 	}
-	if !hasTransport {
+	if vrfIndex == 0 {
 		return ""
 	}
 	return config.ManagementVRFDeviceName
 }
 
-// transportIfaceInMgmtVRF reports whether the kernel master of a selected
-// cluster transport interface is vrf-mgmt (#12168 F1). Missing links (or a
-// daemon without link resolution) report not-converged rather than failing the
-// commit: a transport whose kernel state cannot be evidenced keeps its
-// main-table binding until convergence is observable.
-func (d *Daemon) transportIfaceInMgmtVRF(linuxName string) bool {
-	linkByName := d.linkByNameFn
-	if linkByName == nil {
-		linkByName = netlink.LinkByName
-	}
-	link, err := linkByName(linuxName)
-	if err != nil || link == nil || link.Attrs() == nil {
-		return false
-	}
-	vrf, err := linkByName(config.ManagementVRFDeviceName)
-	if err != nil || vrf == nil || vrf.Attrs() == nil {
-		return false
-	}
-	return link.Attrs().MasterIndex != 0 && link.Attrs().MasterIndex == vrf.Attrs().Index
-}
-
-func (d *Daemon) clusterVRFDeviceForTransports(warn bool, transportIfaces ...string) string {
-	members := d.mgmtVRFIfaceSet()
-	hasTransport := false
-	for _, iface := range transportIfaces {
-		if iface == "" {
-			continue
-		}
-		hasTransport = true
-		linuxName := config.LinuxIfName(iface)
-		if members[linuxName] {
-			continue
-		}
-		if warn && (len(members) > 0 || config.IsManagementIfName(iface)) {
-			slog.Warn("cluster transport interface is not a management VRF member; leaving sockets unbound to VRF",
-				"interface", linuxName, "vrf", config.ManagementVRFDeviceName)
-		}
-		return ""
-	}
-	if !hasTransport {
-		return ""
-	}
-	return config.ManagementVRFDeviceName
-}
-
-// resolveClusterSyncVRFDevice scopes CLI and gRPC peer dials to the same
-// transport selected for session sync, including a configured secondary
-// fabric when fabric transport is active.
+// resolveClusterSyncVRFDevice scopes session sync, fabric gRPC, peer dials and
+// the transport key to exactly the same selected interfaces, including a
+// configured secondary fabric. It is quiet because keys and dials are frequent.
 func (d *Daemon) resolveClusterSyncVRFDevice(cc *config.ClusterConfig) string {
 	iface, iface1 := clusterSyncVRFTransportIfaces(cc)
-	if iface == "" {
-		return ""
-	}
-	return d.resolveClusterVRFDevice(iface, iface1)
+	return d.transportVRFBinding(false, iface, iface1)
 }
 
-// clusterSyncVRFDeviceForTransportKey is the quiet counterpart used by the
-// per-apply transport key comparison.
-func (d *Daemon) clusterSyncVRFDeviceForTransportKey(cc *config.ClusterConfig) string {
-	iface, iface1 := clusterSyncVRFTransportIfaces(cc)
-	if iface == "" {
+// clusterPeerVRFDevice is the live resolver installed on the daemon-owned
+// CLI and gRPC peer dialers. Read the active config and re-evaluate the same
+// published-plus-kernel predicate for each dial.
+func (d *Daemon) clusterPeerVRFDevice() string {
+	if d.store == nil {
 		return ""
 	}
-	return d.clusterVRFDeviceForTransportKey(iface, iface1)
+	cfg := d.store.ActiveConfig()
+	if cfg == nil || cfg.Chassis.Cluster == nil {
+		return ""
+	}
+	return d.resolveClusterSyncVRFDevice(cfg.Chassis.Cluster)
 }
 
 func clusterSyncVRFTransportIfaces(cc *config.ClusterConfig) (string, string) {
@@ -245,7 +208,7 @@ func (d *Daemon) wireSessionSyncTransportRefs(ss *cluster.SessionSync, cc *confi
 // listener(s) once d.grpcSrv exists (it is set after startClusterComms
 // returns). Extracted verbatim from startClusterComms (#6428) — pure code
 // motion; the goroutine is spawned at the same point in the sequence.
-func (d *Daemon) startFabricGRPCListeners(commsCtx context.Context, syncIP, syncLocal1, vrfDevice string) {
+func (d *Daemon) startFabricGRPCListeners(commsCtx context.Context, syncIP, syncLocal1 string, vrfDeviceFn func() string) {
 	// Start gRPC fabric listener(s) so peer can proxy monitor requests.
 	// d.grpcSrv is set after startClusterComms returns, so we poll briefly.
 	// Uses the sync interface address (fabric or control-link).
@@ -264,10 +227,10 @@ func (d *Daemon) startFabricGRPCListeners(commsCtx context.Context, syncIP, sync
 					// Extract fab1 local IP (syncLocal1 is "ip:4785").
 					fab1Host, _, _ := net.SplitHostPort(syncLocal1)
 					grpcAddr1 := net.JoinHostPort(fab1Host, "50051")
-					go d.grpcSrv.RunFabricListener(commsCtx, grpcAddr1, vrfDevice)
+					go d.grpcSrv.RunFabricListenerWithVRFDeviceFunc(commsCtx, grpcAddr1, vrfDeviceFn)
 					slog.Info("gRPC dual fabric listeners", "fab0", grpcAddr, "fab1", grpcAddr1)
 				}
-				d.grpcSrv.RunFabricListener(commsCtx, grpcAddr, vrfDevice)
+				d.grpcSrv.RunFabricListenerWithVRFDeviceFunc(commsCtx, grpcAddr, vrfDeviceFn)
 				return
 			}
 			time.Sleep(time.Second)

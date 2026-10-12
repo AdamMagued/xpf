@@ -1128,6 +1128,13 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 		return
 	}
 	cc := cfg.Chassis.Cluster
+	// Heartbeat restarts run from the VRF rebind path, outside the startup
+	// retry loop. Resolve their socket device again before each bind attempt.
+	if d.cluster != nil {
+		d.cluster.SetHeartbeatVRFDeviceFunc(func(controlIface string) string {
+			return d.transportVRFBinding(false, controlIface)
+		})
+	}
 
 	// Create an independently-cancellable sub-context so cluster comms can
 	// be restarted on config change (#87) without cancelling the daemon ctx.
@@ -1247,11 +1254,13 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// concurrent stopClusterComms that nils the field cannot turn a
 			// re-dereference into a nil-deref panic, and a superseded epoch's
 			// late publish is dropped rather than clobbering the live epoch.
-			syncTransportIfaces := []string{syncIface}
-			if syncLocal1 != "" {
-				syncTransportIfaces = append(syncTransportIfaces, cc.Fabric1Interface)
+			selectedSyncIface, selectedSyncIface1 := clusterSyncVRFTransportIfaces(cc)
+			syncTransportIfaces := []string{selectedSyncIface}
+			if selectedSyncIface1 != "" {
+				syncTransportIfaces = append(syncTransportIfaces, selectedSyncIface1)
 			}
-			syncVRFDevice := d.resolveClusterVRFDevice(syncTransportIfaces...)
+			// The predicate matches the transport key exactly. The selected
+			// device is refreshed before every ss.Start attempt below.
 
 			var ss *cluster.SessionSync
 			if syncLocal1 != "" {
@@ -1269,7 +1278,9 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			}
 			d.wireSessionSyncTransportRefs(ss, cc, syncTransport, syncPeerAddr, syncLocal1)
 
-			d.startFabricGRPCListeners(commsCtx, syncIP, syncLocal1, syncVRFDevice)
+			d.startFabricGRPCListeners(commsCtx, syncIP, syncLocal1, func() string {
+				return d.transportVRFBinding(false, syncTransportIfaces...)
+			})
 
 			// Wire sync stats into cluster manager for CLI display.
 			d.cluster.SetSyncStats(ss)
@@ -1284,7 +1295,8 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 
 			d.wireClusterFenceCallbacks(commsCtx, ss)
 
-			ss.SetVRFDevice(syncVRFDevice)
+			// (SetVRFDevice runs per attempt below because kernel membership
+			// may converge while the constructor is retrying.)
 
 			wiredStream := d.wireUserspaceEventStreamForSync(commsCtx)
 
@@ -1360,6 +1372,8 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 						return d.cluster.LocalProcessToken()
 					}
 				}
+				syncVRFDevice := d.transportVRFBinding(false, syncTransportIfaces...)
+				ss.SetVRFDevice(syncVRFDevice)
 				if err := ss.Start(commsCtx); err != nil {
 					if i < 5 {
 						slog.Info("cluster: sync bind not ready, retrying",
@@ -1739,18 +1753,17 @@ func clusterTransportFromConfig(cfg *config.Config) clusterTransportKey {
 	}
 }
 
-// clusterTransportForConfig adds the kernel-evidenced binding for the selected
-// sync transport to the configured endpoints. clusterSyncTransport uses the
-// control pair when configured (the same pair heartbeat uses), and otherwise
-// selects fabric. Desired membership can be published before the interface is
-// actually enslaved, so this key uses the kernel master rather than the
-// published membership set to avoid consuming a failed transition.
+// clusterTransportForConfig adds the unified transport VRF binding predicate
+// for the selected sync transport to the configured endpoints. The same
+// published-membership and kernel-master evidence controls heartbeat,
+// session-sync and fabric-gRPC sockets, so the key changes exactly when all
+// selected sockets can bind to the management VRF.
 func (d *Daemon) clusterTransportForConfig(cfg *config.Config) clusterTransportKey {
 	key := clusterTransportFromConfig(cfg)
 	if cfg == nil || cfg.Chassis.Cluster == nil {
 		return key
 	}
-	key.VRFDevice = d.clusterSyncVRFDeviceForTransportKey(cfg.Chassis.Cluster)
+	key.VRFDevice = d.resolveClusterSyncVRFDevice(cfg.Chassis.Cluster)
 	return key
 }
 

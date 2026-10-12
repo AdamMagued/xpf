@@ -17,6 +17,9 @@ tab completion. The wire schema is `proto/xpf/v1`.
   network-exposed peer-proxy listener (see trust boundary below). Blocks
   until ctx is cancelled; the caller starts it **once** and the retry
   supervision is internal (#5047).
+- `RunFabricListenerWithVRFDeviceFunc(ctx, addr, fn)` — `server.go`.
+  Refreshes `SO_BINDTODEVICE` on every listener attempt when the binding can
+  converge while the comms epoch is retrying.
 - Tab completion: `Complete` RPC, backed by `pkg/cmdtree`.
 
 ## Trust boundary (loopback-only, #5035 + per-principal, #5278)

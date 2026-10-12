@@ -458,7 +458,8 @@ type Manager struct {
 	hbThreshold      int
 	hbLocalAddr      string // last StartHeartbeat localAddr (for restart)
 	hbPeerAddr       string // last StartHeartbeat peerAddr (for restart)
-	hbVRFDevice      string // last StartHeartbeat vrfDevice (for restart)
+	hbVRFDevice      string // last StartHeartbeat vrfDevice (for status/direct callers)
+	hbVRFDeviceFn    func(controlIface string) string
 	// hbControlIface is the control INTERFACE this heartbeat was started on
 	// (#8987). Recorded alongside the other StartHeartbeat args so a restart
 	// carries it unchanged and it can never describe a different heartbeat than

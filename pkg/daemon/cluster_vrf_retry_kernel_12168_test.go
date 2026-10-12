@@ -2,17 +2,25 @@ package daemon
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/grpcapi"
 	"github.com/psaab/xpf/pkg/networkd"
+	"github.com/psaab/xpf/pkg/routing"
 	"github.com/psaab/xpf/pkg/vrrp"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sync/semaphore"
 	"golang.org/x/sys/unix"
 )
 
@@ -75,13 +83,16 @@ func newKernelVRFRetryFixture12168(t *testing.T) (*Daemon, *config.Config, netli
 	if err := netlink.LinkSetUp(control); err != nil {
 		t.Fatalf("bring up control interface: %v", err)
 	}
-	addr, err := netlink.ParseAddr("198.51.100.1/24")
-	if err != nil {
-		t.Fatalf("parse control address: %v", err)
+	for _, cidr := range []string{"198.51.100.1/24", "198.51.100.2/24"} {
+		addr, err := netlink.ParseAddr(cidr)
+		if err != nil {
+			t.Fatalf("parse control address %s: %v", cidr, err)
+		}
+		if err := netlink.AddrAdd(control, addr); err != nil {
+			t.Fatalf("assign control address %s: %v", cidr, err)
+		}
 	}
-	if err := netlink.AddrAdd(control, addr); err != nil {
-		t.Fatalf("assign control address: %v", err)
-	}
+
 	store := testStoreWithSetConfig(t, []string{
 		"set chassis cluster cluster-id 1",
 		"set chassis cluster node 0",
@@ -103,6 +114,7 @@ func newKernelVRFRetryFixture12168(t *testing.T) (*Daemon, *config.Config, netli
 		daemonCtx: ctx,
 		opts:      Options{NoDataplane: true},
 	}
+	d.grpcSrv = grpcapi.NewServer("", grpcapi.Config{Store: store, Cluster: d.cluster})
 	t.Cleanup(func() {
 		d.stopClusterComms()
 		d.cluster.Stop() // join keyed-epoch persistence before the state mount is removed
@@ -188,4 +200,305 @@ func waitForHeartbeatVRF12168(t *testing.T, manager *cluster.Manager, want strin
 	}
 	t.Fatalf("heartbeat did not become running with VRF device %q (running=%v device=%q)",
 		want, manager.HeartbeatRunning(), manager.HeartbeatVRFDevice())
+}
+
+func warmVRFCommsGeneration12168(d *Daemon) uint64 {
+	d.clusterCommsMu.Lock()
+	defer d.clusterCommsMu.Unlock()
+	return d.clusterCommsGen
+}
+
+type warmVRFSocket12168 struct {
+	FD, Port, Kind, Ifindex int
+	Device, Identity        string
+}
+
+func warmVRFSockets12168(t *testing.T) []warmVRFSocket12168 {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result []warmVRFSocket12168
+	for _, entry := range entries {
+		fd, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		sa, err := unix.Getsockname(fd)
+		if err != nil {
+			continue
+		}
+		ip, ok := sa.(*unix.SockaddrInet4)
+		if !ok || ip.Addr != [4]byte{198, 51, 100, 1} {
+			continue
+		}
+		kind, _ := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_TYPE)
+		if kind == unix.SOCK_STREAM {
+			accepting, _ := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_ACCEPTCONN)
+			if accepting != 1 {
+				continue
+			}
+		}
+		device, deviceErr := unix.GetsockoptString(fd, unix.SOL_SOCKET, unix.SO_BINDTODEVICE)
+		if deviceErr != nil {
+			device = "ERROR:" + deviceErr.Error()
+		}
+		ifindex, _ := unix.GetsockoptInt(fd, unix.SOL_SOCKET, 62)
+		identity, _ := os.Readlink("/proc/self/fd/" + entry.Name())
+		result = append(result, warmVRFSocket12168{
+			FD: fd, Port: ip.Port, Kind: kind, Ifindex: ifindex, Device: device, Identity: identity,
+		})
+	}
+	return result
+}
+
+func waitWarmVRFSockets12168(t *testing.T, want string) []warmVRFSocket12168 {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		sockets := warmVRFSockets12168(t)
+		ports := map[int]bool{}
+		clean := true
+		for _, socket := range sockets {
+			if socket.Port == 4784 || socket.Port == 4785 || socket.Port == 50051 {
+				ports[socket.Port] = true
+				if socket.Device != want {
+					clean = false
+				}
+			}
+		}
+		if clean && ports[4784] && ports[4785] && ports[50051] {
+			return sockets
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("all comms listeners did not converge to %q: %+v", want, warmVRFSockets12168(t))
+	return nil
+}
+
+func warmVRFSocketControl12168(device string) func(string, string, syscall.RawConn) error {
+	return func(_, _ string, raw syscall.RawConn) error {
+		var socketErr error
+		if err := raw.Control(func(fd uintptr) {
+			if device != "" {
+				socketErr = unix.SetsockoptString(int(fd), unix.SOL_SOCKET, unix.SO_BINDTODEVICE, device)
+			}
+		}); err != nil {
+			return err
+		}
+		return socketErr
+	}
+}
+
+func warmVRFTraffic12168(t *testing.T, device string) {
+	t.Helper()
+	listenConfig := net.ListenConfig{Control: warmVRFSocketControl12168(device)}
+	pc, err := listenConfig.ListenPacket(context.Background(), "udp4", "198.51.100.2:4784")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pc.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 2048)
+	n, from, err := pc.ReadFrom(buf)
+	_ = pc.Close()
+	if err != nil {
+		t.Fatalf("heartbeat wire receive device=%q: %v", device, err)
+	}
+	if n < 4 || string(buf[:4]) != "BPFX" {
+		t.Fatalf("unexpected heartbeat frame: %x", buf[:n])
+	}
+	for _, port := range []int{4785, 50051} {
+		dialer := net.Dialer{
+			Timeout:   time.Second,
+			Control:   warmVRFSocketControl12168(device),
+			LocalAddr: &net.TCPAddr{IP: net.ParseIP("198.51.100.2")},
+		}
+		conn, err := dialer.Dial("tcp4", fmt.Sprintf("198.51.100.1:%d", port))
+		if err != nil {
+			t.Fatalf("listener %d device=%q: %v", port, device, err)
+		}
+		_ = conn.Close()
+	}
+	t.Logf("wire heartbeat bytes=%d source=%s device=%q; TCP accepts on 4785/50051", n, from, device)
+}
+
+type failManagementBind12168 struct {
+	*netlink.Handle
+	fail bool
+}
+
+func (ops *failManagementBind12168) LinkSetMaster(link, master netlink.Link) error {
+	if ops.fail && link.Attrs().Name == "em0" {
+		return unix.EBUSY
+	}
+	return ops.Handle.LinkSetMaster(link, master)
+}
+
+func TestWarmFailedBootPublishInRetryWindow12168(t *testing.T) {
+	if !isolatedVRFRetryChild12168(t) {
+		return
+	}
+	d, cfg, control, vrf := newKernelVRFRetryFixture12168(t)
+	if err := netlink.LinkSetMaster(control, vrf); err != nil {
+		t.Fatal(err)
+	}
+	d.publishMgmtVRFIfaces(nil)
+	d.startClusterComms(d.daemonCtx)
+	time.Sleep(1500 * time.Millisecond)
+	d.publishMgmtVRFIfaces(map[string]bool{"em0": true})
+	_ = d.applyTailReconciles(cfg, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	sockets := waitWarmVRFSockets12168(t, config.ManagementVRFDeviceName)
+	if got := d.activeTransport().VRFDevice; got != config.ManagementVRFDeviceName {
+		t.Fatalf("warm publish in retry window transport = %q, want vrf-mgmt", got)
+	}
+	t.Logf("warm publish in retry window: gen=%d key=%+v sockets=%+v",
+		warmVRFCommsGeneration12168(d), d.activeTransport(), sockets)
+	warmVRFTraffic12168(t, config.ManagementVRFDeviceName)
+}
+
+func TestWarmFailedBootPublishAfterRetryWindow12168(t *testing.T) {
+	if !isolatedVRFRetryChild12168(t) {
+		return
+	}
+	d, cfg, control, vrf := newKernelVRFRetryFixture12168(t)
+	if err := netlink.LinkSetMaster(control, vrf); err != nil {
+		t.Fatal(err)
+	}
+	d.publishMgmtVRFIfaces(nil)
+	d.startClusterComms(d.daemonCtx)
+	time.Sleep(63 * time.Second)
+	d.publishMgmtVRFIfaces(map[string]bool{"em0": true})
+	_ = d.applyTailReconciles(cfg, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	sockets := waitWarmVRFSockets12168(t, config.ManagementVRFDeviceName)
+	if got := d.activeTransport().VRFDevice; got != config.ManagementVRFDeviceName {
+		t.Fatalf("warm publish after retry window transport = %q, want vrf-mgmt", got)
+	}
+	t.Logf("warm publish after retry window: gen=%d key=%+v sockets=%+v",
+		warmVRFCommsGeneration12168(d), d.activeTransport(), sockets)
+	warmVRFTraffic12168(t, config.ManagementVRFDeviceName)
+}
+
+func TestReassertConvergenceRestartsCommsWithoutCommit12168(t *testing.T) {
+	if !isolatedVRFRetryChild12168(t) {
+		return
+	}
+	d, cfg, _, _ := newKernelVRFRetryFixture12168(t)
+	d.startClusterComms(d.daemonCtx)
+	waitWarmVRFSockets12168(t, "")
+	waitForHeartbeatVRF12168(t, d.cluster, "")
+	handle, err := netlink.NewHandle()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handle.Close()
+	ops := &failManagementBind12168{Handle: handle, fail: true}
+	d.routing = routing.NewManagerWithLinkOpsForTest(ops)
+	d.applySem = semaphore.NewWeighted(1)
+	if ctxErr, vrfErr := d.applyVRFReconcile(context.Background(), cfg); ctxErr != nil || vrfErr != nil {
+		t.Fatalf("device reconcile: %v %v", ctxErr, vrfErr)
+	}
+	if err := d.rebindManagementVRFIfaces(); !errors.Is(err, unix.EBUSY) {
+		t.Fatalf("expected injected EBUSY, got %v", err)
+	}
+	if err := restartHeartbeatAfterRebind(d.cluster); err != nil {
+		t.Fatalf("still-main heartbeat restart: %v", err)
+	}
+	_ = d.applyTailReconciles(cfg, unix.EBUSY, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	before := warmVRFCommsGeneration12168(d)
+	ops.fail = false
+	d.reassertMgmtVRFOnce(context.Background())
+	if after := warmVRFCommsGeneration12168(d); after == before {
+		t.Fatalf("reassert-only convergence did not restart comms: generation=%d", before)
+	}
+	waitForHeartbeatVRF12168(t, d.cluster, config.ManagementVRFDeviceName)
+	waitWarmVRFSockets12168(t, config.ManagementVRFDeviceName)
+	warmVRFTraffic12168(t, config.ManagementVRFDeviceName)
+}
+
+func TestReassertConvergencePersistsWithoutCommit12168(t *testing.T) {
+	if !isolatedVRFRetryChild12168(t) {
+		return
+	}
+	d, cfg, _, _ := newKernelVRFRetryFixture12168(t)
+	d.startClusterComms(d.daemonCtx)
+	waitWarmVRFSockets12168(t, "")
+	waitForHeartbeatVRF12168(t, d.cluster, "")
+	handle, err := netlink.NewHandle()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handle.Close()
+	ops := &failManagementBind12168{Handle: handle, fail: true}
+	d.routing = routing.NewManagerWithLinkOpsForTest(ops)
+	d.applySem = semaphore.NewWeighted(1)
+	_, _ = d.applyVRFReconcile(context.Background(), cfg)
+	bindErr := d.rebindManagementVRFIfaces()
+	if !errors.Is(bindErr, unix.EBUSY) {
+		t.Fatalf("expected injected EBUSY, got %v", bindErr)
+	}
+	_ = restartHeartbeatAfterRebind(d.cluster)
+	_ = d.applyTailReconciles(cfg, bindErr, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	ops.fail = false
+	before := warmVRFCommsGeneration12168(d)
+	d.reassertMgmtVRFOnce(context.Background())
+	if after := warmVRFCommsGeneration12168(d); after == before {
+		t.Fatalf("reassert-only convergence did not restart comms: generation=%d", before)
+	}
+	gen := warmVRFCommsGeneration12168(d)
+	active := d.activeTransport()
+	waitForHeartbeatVRF12168(t, d.cluster, config.ManagementVRFDeviceName)
+	waitWarmVRFSockets12168(t, config.ManagementVRFDeviceName)
+	warmVRFTraffic12168(t, config.ManagementVRFDeviceName)
+	time.Sleep(10 * time.Second)
+	d.reassertMgmtVRFOnce(context.Background())
+	if after := warmVRFCommsGeneration12168(d); after != gen || d.activeTransport() != active {
+		t.Fatalf("idle reassert changed transport epoch without drift: gen=%d->%d key=%+v->%+v",
+			gen, after, active, d.activeTransport())
+	}
+	warmVRFTraffic12168(t, config.ManagementVRFDeviceName)
+}
+
+func TestConvergingCommitRestartsHeartbeatWithoutStaleRetries12168(t *testing.T) {
+	if !isolatedVRFRetryChild12168(t) {
+		return
+	}
+	d, cfg, _, _ := newKernelVRFRetryFixture12168(t)
+	d.startClusterComms(d.daemonCtx)
+	waitWarmVRFSockets12168(t, "")
+	waitForHeartbeatVRF12168(t, d.cluster, "")
+	handle, err := netlink.NewHandle()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handle.Close()
+	d.routing = routing.NewManagerWithLinkOpsForTest(&failManagementBind12168{Handle: handle})
+	if ctxErr, vrfErr := d.applyVRFReconcile(context.Background(), cfg); ctxErr != nil || vrfErr != nil {
+		t.Fatalf("device reconcile: %v %v", ctxErr, vrfErr)
+	}
+	var networkdErr error
+	if err := d.rebindManagementVRFIfaces(); err != nil {
+		networkdErr = errors.Join(networkdErr, err)
+	}
+	started := time.Now()
+	if err := restartHeartbeatAfterRebind(d.cluster); err != nil {
+		networkdErr = errors.Join(networkdErr, err)
+	}
+	restartDuration := time.Since(started)
+	commitErr := d.applyTailReconciles(cfg, networkdErr, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	if commitErr != nil {
+		t.Fatalf("converging commit returned error: %v", commitErr)
+	}
+	if restartDuration >= 2*time.Second {
+		t.Fatalf("2.7 heartbeat restart took %v, want one fresh-device attempt, not stale-device retries", restartDuration)
+	}
+	waitForHeartbeatVRF12168(t, d.cluster, config.ManagementVRFDeviceName)
+	if !d.cluster.HeartbeatRunning() || d.cluster.HeartbeatVRFDevice() != config.ManagementVRFDeviceName {
+		t.Fatalf("heartbeat did not restart on vrf-mgmt: running=%v device=%q",
+			d.cluster.HeartbeatRunning(), d.cluster.HeartbeatVRFDevice())
+	}
+	waitWarmVRFSockets12168(t, config.ManagementVRFDeviceName)
+	warmVRFTraffic12168(t, config.ManagementVRFDeviceName)
 }

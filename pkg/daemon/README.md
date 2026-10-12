@@ -3031,10 +3031,13 @@ never lock an operator out of a remote box it manages.
     `vrf-mgmt`, and takes `applySem` only for drift (rechecking after acquire).
     It warns and rebinds only drifted links, then reapplies management DHCP
     routes; failures latch #11450 management-route debt, whose 30s routing
-    owner retries without a new config or DHCP event. A healthy node makes no
-    bind or route writes. The set can include `fab*`, which the #9813 fabric
-    loop also owns; semaphore serialization and the in-lock drift check keep
-    those owners from issuing duplicate binds.
+    owner retries without a new config or DHCP event. After any successful
+    rebind, the same pass compares the effective cluster transport binding and
+    restarts comms if it changed; an EBUSY commit can then recover when the next
+    reassert tick converges without another commit (#12168). A healthy node
+    makes no bind or route writes. The set can include `fab*`, which the #9813
+    fabric loop also owns; semaphore serialization and the in-lock drift check
+    keep those owners from issuing duplicate binds.
     `mgmt_vrf_reassert_11448_test.go` covers drift, healthy-path silence, route
     debt, cancellation, periodic convergence, and an out-of-band kernel unbind
     in a private netns (skipped without `CAP_NET_ADMIN`).

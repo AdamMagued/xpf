@@ -21,6 +21,8 @@ locating any symbol below is now a matter of opening the named file.
   `buildHeartbeat`, `handlePeerHeartbeat`, `handlePeerTimeout`,
   `handlePeerNeverSeen`, `HeartbeatStats`,
   `vrfListenConfig` — `heartbeat_manager.go`.
+- `SetHeartbeatVRFDeviceFunc` — `hooks.go`. Supplies a live device resolver
+  for each `RestartHeartbeat` bind attempt.
 
   **Start/stop lifecycle tenure (#7257).** `StartHeartbeat` publishes
   `hbSender`/`hbReceiver` and *starts* them in ONE critical section, and refuses

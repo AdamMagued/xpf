@@ -44,6 +44,7 @@ func (d *Daemon) reassertMgmtVRFOnce(ctx context.Context) {
 	if len(drifted) == 0 {
 		return
 	}
+	rebound := false
 	for _, name := range drifted {
 		slog.Warn("management interface outside the management VRF — re-binding",
 			"interface", name)
@@ -52,7 +53,15 @@ func (d *Daemon) reassertMgmtVRFOnce(ctx context.Context) {
 				"interface", name, "err", err)
 			continue
 		}
+		rebound = true
 		slog.Info("management interface bound to the management VRF", "interface", name)
+	}
+	if rebound {
+		var cfg *config.Config
+		if d.store != nil {
+			cfg = d.store.ActiveConfig()
+		}
+		d.reconcileClusterTransportBinding(cfg)
 	}
 	routeErr := mgmtVRFRouteReconcileFn(d)
 	d.noteMgmtRouteReconcileResult(routeErr)

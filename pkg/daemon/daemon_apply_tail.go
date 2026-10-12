@@ -346,55 +346,12 @@ func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, 
 		// No manual GARP registration needed.
 	}
 
-	// 20. Detect cluster transport config changes and restart comms (#87).
-	// Only restart if comms were previously started (activeClusterTransport
-	// is non-zero) and the new config differs.
-	if d.cluster != nil && d.daemonCtx != nil {
-		newTransport := d.clusterTransportForConfig(cfg)
-		// #6290: ONE guarded snapshot. The boot startClusterComms writes this
-		// field holding neither applySem nor clusterCommsMu, and a DHCP
-		// lease-change callback re-enters this step on a goroutine started
-		// before that write — see setActiveTransportIfCurrent for the full
-		// ordering.
-		active := d.activeTransport()
-		// #7901: also restart when a teardown left comms down without one. The
-		// flag is CONSUMED here, so the recovery happens once per teardown --
-		// deliberately not a live "are comms down?" predicate, which would fire
-		// on every apply in that state and break #5078 (a key commit must not
-		// restart: it drops session-sync exactly when the primary becomes keyed)
-		// and #6878 (an unchanged transport must not restart).
-		//
-		// `active != zero` is UNCHANGED and still load-bearing: the boot
-		// applyConfig runs before daemon_run.go's startClusterComms, so step 20
-		// runs during boot with the field still zero
-		// (TestStepTwentyIgnoresANeverStartedNode_7072 brackets it).
-		restartOwed := d.takeClusterCommsRestartNeeded()
-		if active != (clusterTransportKey{}) && (newTransport != active || restartOwed) {
-			// #7073: the pairs are derived from clusterTransportKey, the same
-			// struct the comparison above compares whole. Writing them out by
-			// hand had already dropped the two fab1 fields, so a fab1-only
-			// change logged four identical old/new pairs.
-			// #7901: say WHICH disjunct fired. "transport config changed" on an
-			// identical key sends an operator looking for a delta that is not there.
-			if newTransport != active {
-				slog.Info("cluster: transport config changed, restarting comms",
-					transportChangeLogArgs(active, newTransport)...)
-			} else {
-				slog.Info("cluster: restarting comms owed by a teardown that did not "+
-					"restart them (#7901)", transportChangeLogArgs(active, newTransport)...)
-			}
-			d.stopClusterComms()
-			// #6878: through the seam so a test can bind restart COMPLETION.
-			// stopClusterComms bumps clusterCommsGen first, so the generation
-			// alone cannot tell a completed restart from a teardown that never
-			// came back up.
-			start := d.startClusterCommsFn
-			if start == nil {
-				start = d.startClusterComms
-			}
-			start(d.daemonCtx)
-		}
+	// 20. Detect cluster transport changes and restart comms (#87). The same
+	// compare-and-restart helper also owns kernel convergence from the
+	// management-VRF reassert loop.
+	d.reconcileClusterTransportBinding(cfg)
 
+	if d.cluster != nil && d.daemonCtx != nil {
 		// #4647 BUG-B: reconcile the #2239 DHCP lease-sync push loop against
 		// the just-committed `dhcp-lease-synchronization` knob. Without this a
 		// runtime knob-ON commit on a running cluster was a silent no-op (the
@@ -503,6 +460,37 @@ func (d *Daemon) applyTailReconciles(cfg *config.Config, networkdErr, applyErr, 
 	return errors.Join(networkdErr, applyErr, dhcpServerErr, hostInboundErr, lo0Err, dnsErr,
 		loginErr, sudoersErr, absentUsersErr, sshConfigErr, rootAuthErr,
 		ipsecErr, ifaceErr, routeLeakErr, routingRuleErr, mgmtRouteErr, vrfErr, fabricErr, vrrpErr, frrErr)
+}
+
+// reconcileClusterTransportBinding compares the live transport epoch with
+// current kernel/published evidence and restarts it when the binding changed.
+// Callers serialize this with config applies via applySem; in particular the
+// management-VRF reassert loop calls it only after a successful rebind.
+func (d *Daemon) reconcileClusterTransportBinding(cfg *config.Config) {
+	if d.cluster == nil || d.daemonCtx == nil {
+		return
+	}
+	newTransport := d.clusterTransportForConfig(cfg)
+	// #6290: ONE guarded snapshot. Boot startup writes this field without
+	// applySem, so the snapshot must remain protected by clusterCommsMu.
+	active := d.activeTransport()
+	restartOwed := d.takeClusterCommsRestartNeeded()
+	if active == (clusterTransportKey{}) || (newTransport == active && !restartOwed) {
+		return
+	}
+	if newTransport != active {
+		slog.Info("cluster: transport config changed, restarting comms",
+			transportChangeLogArgs(active, newTransport)...)
+	} else {
+		slog.Info("cluster: restarting comms owed by a teardown that did not "+
+			"restart them (#7901)", transportChangeLogArgs(active, newTransport)...)
+	}
+	d.stopClusterComms()
+	start := d.startClusterCommsFn
+	if start == nil {
+		start = d.startClusterComms
+	}
+	start(d.daemonCtx)
 }
 
 // reconcileDHCPRelay re-applies the DHCP relay config on every commit (#2348).

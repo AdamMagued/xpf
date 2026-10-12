@@ -146,3 +146,27 @@ func TestStopDuringTheRetryWindowRecordsNoDebt_9751(t *testing.T) {
 			"resurrect a heartbeat that was stopped on purpose")
 	}
 }
+
+func TestHeartbeatRestartResolvesVRFForEveryAttempt12168(t *testing.T) {
+	fastRestartRetries9751(t)
+	m := startedManager9751(t)
+	var resolves atomic.Int32
+	m.SetHeartbeatVRFDeviceFunc(func(controlIface string) string {
+		if controlIface != "em0" {
+			t.Errorf("resolver control interface = %q, want em0", controlIface)
+		}
+		if resolves.Add(1) == 1 {
+			return "xpf-missing-vrf-12168"
+		}
+		return "lo"
+	})
+	if !m.RestartHeartbeat() {
+		t.Fatal("RestartHeartbeat did not use the fresh VRF device after the first bind failed")
+	}
+	if got := resolves.Load(); got != 2 {
+		t.Fatalf("VRF resolver ran %d times, want once per failed/successful bind attempt", got)
+	}
+	if got := m.HeartbeatVRFDevice(); got != "lo" {
+		t.Fatalf("successful heartbeat device = %q, want lo", got)
+	}
+}
