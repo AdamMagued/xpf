@@ -286,10 +286,15 @@ fn unstamped_fabric_ingress_legacy_controls_remain_explicit_11061() {
     );
 }
 
-#[test]
-fn unique_established_ri_snat_reply_is_admitted_without_stamp_11061() {
-    let now_ns = monotonic_nanos();
-    let now_secs = now_ns / 1_000_000_000;
+/// #11061/#12257: the routing-instance SNAT receiver behind the unstamped
+/// fabric reply cells. `lan` (ifindex 24) is in `tenant-a`, and the table
+/// holds one established interface-SNAT forward session in that tenant
+/// domain (10.0.61.102:12345 -> 8.8.8.8:443, sent as 172.16.80.8). The
+/// returned shared entry mirrors that session; each cell decides what to
+/// publish.
+fn established_ri_snat_forward_11061(
+    now_ns: u64,
+) -> (ForwardingState, SessionTable, SyncedSessionEntry) {
     let mut snapshot = fabric_snapshot_with_lan_neighbor_7770();
     let (tenant_domain, tenant_check) = crate::session::install_table_identity("tenant-a");
     for interface in &mut snapshot.interfaces {
@@ -367,6 +372,22 @@ fn unique_established_ri_snat_reply_is_admitted_without_stamp_11061() {
         PROTO_TCP,
         TCP_FLAG_ACK,
     ));
+    // This manually injected session stands in for a locally admitted,
+    // interface-SNAT forward flow. Seed its receiver-local verdict and NAT
+    // provenance so this cell exercises reply admission, not the independent
+    // fail-closed stale-policy/stale-NAT gates.
+    sessions.set_policy_revalidation_phase(
+        7,
+        forwarding
+            .policy
+            .scheduler_rules_expired_at(123_000_000_000),
+    );
+    sessions.mark_policy_revalidated(
+        &forward_key,
+        crate::session::PolicyRevalidationKind::LiveEgress,
+    );
+    sessions.set_forwarding_revalidation_gen(7, 9);
+    sessions.mark_source_nat_revalidated(&forward_key, Some(false));
 
     let shared_entry = SyncedSessionEntry {
         key: forward_key,
@@ -382,6 +403,15 @@ fn unique_established_ri_snat_reply_is_admitted_without_stamp_11061() {
         tcp_handshake_state: 0,
         source_nat_static: None,
     };
+    (forwarding, sessions, shared_entry)
+}
+
+#[test]
+fn unique_established_ri_snat_reply_is_admitted_without_stamp_11061() {
+    let now_ns = monotonic_nanos();
+    let now_secs = now_ns / 1_000_000_000;
+    let (forwarding, mut sessions, shared_entry) = established_ri_snat_forward_11061(now_ns);
+    let decision = shared_entry.decision;
     let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
@@ -536,6 +566,223 @@ fn unique_established_ri_snat_reply_is_admitted_without_stamp_11061() {
         sessions.len(),
         2,
         "an ambiguous unstamped reply must not install or mutate session state"
+    );
+}
+
+/// #12257: the shared HA maps the session-miss resolver consults, empty
+/// until a cell publishes into them.
+struct SharedSessionMaps12257 {
+    sessions: Arc<Mutex<FastMap<crate::session::SessionKey, SyncedSessionEntry>>>,
+    nat_sessions: Arc<Mutex<FastMap<crate::session::SessionKey, SyncedSessionEntry>>>,
+    forward_wire_sessions: Arc<Mutex<FastMap<crate::session::SessionKey, SyncedSessionEntry>>>,
+    owner_rg_indexes: SharedSessionOwnerRgIndexes,
+}
+
+impl SharedSessionMaps12257 {
+    fn new() -> Self {
+        Self {
+            sessions: Arc::new(Mutex::new(FastMap::default())),
+            nat_sessions: Arc::new(Mutex::new(FastMap::default())),
+            forward_wire_sessions: Arc::new(Mutex::new(FastMap::default())),
+            owner_rg_indexes: SharedSessionOwnerRgIndexes::default(),
+        }
+    }
+
+    fn publish(&self, entry: &SyncedSessionEntry) {
+        crate::afxdp::shared_ops::publish_shared_session(
+            &self.sessions,
+            &self.nat_sessions,
+            &self.forward_wire_sessions,
+            &self.owner_rg_indexes,
+            entry,
+        );
+    }
+}
+
+/// #12257: the domain-zero wire reply to `forward`, as an unstamped fabric
+/// frame carries it.
+fn unstamped_reply_key_12257(forward: &SyncedSessionEntry) -> crate::session::SessionKey {
+    let mut reply_key = crate::session::reverse_session_key(&forward.key, forward.decision.nat);
+    reply_key.routing_domain = 0;
+    reply_key
+}
+
+/// #12257: consume a unique-reply proof the way the unstamped-fabric
+/// exception does. The poll gate moves the reply into the proven forward
+/// session's routing domain, then hands the proof to the session-miss
+/// resolver for a frame that arrived on the fabric parent (ifindex 21).
+fn resolve_with_unique_reply_proof_12257(
+    sessions: &mut SessionTable,
+    forwarding: &ForwardingState,
+    shared: &SharedSessionMaps12257,
+    reply_key: &crate::session::SessionKey,
+    proof: crate::session::ForwardSessionMatch,
+    now_ns: u64,
+) -> Option<ResolvedFlowSessionDecision> {
+    let now_secs = now_ns / 1_000_000_000;
+    let ha_state = BTreeMap::from([(1, active_rg(now_secs)), (2, active_rg(now_secs))]);
+    let mut forward_key = reply_key.clone();
+    forward_key.routing_domain = proof.key.routing_domain;
+    let flow = SessionFlow {
+        src_ip: forward_key.src_ip,
+        dst_ip: forward_key.dst_ip,
+        forward_key,
+    };
+    crate::afxdp::session_glue::resolve_flow_session_decision_with_conntrack(
+        sessions,
+        crate::afxdp::bpf_map::SteeringMap::unshared_for_test(-1),
+        -1,
+        -1,
+        &shared.sessions,
+        &shared.nat_sessions,
+        &shared.forward_wire_sessions,
+        &shared.owner_rg_indexes,
+        &[],
+        empty_worker_commands_by_id(),
+        forwarding,
+        &ha_state,
+        &Arc::new(ShardedNeighborMap::new()),
+        &flow,
+        now_ns,
+        now_secs,
+        PROTO_TCP,
+        TCP_FLAG_ACK,
+        21,
+        0,
+        true,
+        true,
+        0,
+        0,
+        Some(proof),
+    )
+}
+
+/// #12257 fail-on-revert for the consumption recheck's local leg. The poll
+/// gate's proof names one forward session. If the table's unique established
+/// reverse-NAT match is no longer that session, the resolver must refuse
+/// rather than synthesize a companion from the stale proof. Control: the
+/// current proof installs the tenant-domain companion. Consuming the proof
+/// without the recheck installs a companion on the stale leg.
+#[test]
+fn unique_reply_proof_must_name_the_current_local_match_12257() {
+    let now_ns = monotonic_nanos();
+    let (forwarding, mut sessions, shared_entry) = established_ri_snat_forward_11061(now_ns);
+    let shared = SharedSessionMaps12257::new();
+    shared.publish(&shared_entry);
+    let reply_key = unstamped_reply_key_12257(&shared_entry);
+    let current = sessions
+        .find_unique_established_forward_nat_match_at(&reply_key, now_ns)
+        .expect("FIXTURE: the forward session must be the unique established reply match");
+    assert_eq!(current.key, shared_entry.key);
+
+    // The gate proved a tenant-b session that has since been replaced.
+    let mut stale = current.clone();
+    stale.key.routing_domain = crate::session::install_table_identity("tenant-b").0;
+    let refused = resolve_with_unique_reply_proof_12257(
+        &mut sessions,
+        &forwarding,
+        &shared,
+        &reply_key,
+        stale,
+        now_ns,
+    );
+    assert!(
+        refused.is_none(),
+        "a proof naming a session other than the current unique match must not admit the reply"
+    );
+    assert_eq!(
+        sessions.len(),
+        1,
+        "a stale proof must not install a reverse companion"
+    );
+
+    let admitted = resolve_with_unique_reply_proof_12257(
+        &mut sessions,
+        &forwarding,
+        &shared,
+        &reply_key,
+        current,
+        now_ns,
+    )
+    .expect("control: the current proof must admit the reply");
+    assert!(
+        admitted.created,
+        "control: the current proof installs the reverse companion"
+    );
+    assert_eq!(
+        admitted.key.routing_domain, shared_entry.key.routing_domain,
+        "control: the companion follows the proven forward session's tenant domain"
+    );
+    assert_eq!(sessions.len(), 2);
+}
+
+/// #12257 fail-on-revert for the consumption recheck's shared leg. Another
+/// worker can withdraw or contest the published reverse-NAT alias after the
+/// poll gate checked it, so the resolver must prove the alias unique again
+/// before it synthesizes a companion. Consuming the proof without the
+/// recheck installs a companion on the first leg.
+#[test]
+fn unique_reply_proof_must_keep_a_unique_shared_alias_12257() {
+    let now_ns = monotonic_nanos();
+    let (forwarding, mut sessions, shared_entry) = established_ri_snat_forward_11061(now_ns);
+    let shared = SharedSessionMaps12257::new();
+    let reply_key = unstamped_reply_key_12257(&shared_entry);
+    let proof = sessions
+        .find_unique_established_forward_nat_match_at(&reply_key, now_ns)
+        .expect("FIXTURE: the forward session must be the unique established reply match");
+    assert_eq!(proof.key, shared_entry.key);
+
+    let withdrawn = resolve_with_unique_reply_proof_12257(
+        &mut sessions,
+        &forwarding,
+        &shared,
+        &reply_key,
+        proof.clone(),
+        now_ns,
+    );
+    assert!(
+        withdrawn.is_none(),
+        "a proof whose shared alias is missing must not admit the reply"
+    );
+    assert_eq!(
+        sessions.len(),
+        1,
+        "a missing alias must not install a reverse companion"
+    );
+
+    shared.publish(&shared_entry);
+    assert!(
+        crate::afxdp::shared_ops::shared_forward_nat_candidate_is_unique(
+            &shared.nat_sessions,
+            &shared.owner_rg_indexes,
+            &reply_key,
+            &shared_entry.key,
+            shared_entry.decision.nat,
+        ),
+        "FIXTURE: the published alias is unique before the competing tenant arrives"
+    );
+    let (other_domain, _) = crate::session::install_table_identity("tenant-b");
+    let mut competing_entry = shared_entry.clone();
+    competing_entry.key.src_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 61, 103));
+    competing_entry.key.routing_domain = other_domain;
+    competing_entry.decision.install_table_domain = other_domain;
+    shared.publish(&competing_entry);
+    let contested = resolve_with_unique_reply_proof_12257(
+        &mut sessions,
+        &forwarding,
+        &shared,
+        &reply_key,
+        proof,
+        now_ns,
+    );
+    assert!(
+        contested.is_none(),
+        "a proof whose shared alias became ambiguous must not admit the reply"
+    );
+    assert_eq!(
+        sessions.len(),
+        1,
+        "an ambiguous alias must not install a reverse companion"
     );
 }
 
@@ -2423,12 +2670,22 @@ fn stamped_fabric_owner_icmp_hit_is_type_checked_without_stamp_11064() {
     assert_eq!(sessions.len(), 2, "a packet deny must retain the session pair");
 }
 
-/// #10670 fail-on-revert for the reverse cache case: the imported reverse
-/// companion retains its forward owner's RG (2), while this node's reverse
-/// egress is locally active RG (1). The HA cache gate therefore accepts the
-/// same-zone cache hit. A foreign zone stamp on the same tuple must preflight
-/// against the reverse entry's ingress zone and fall through to session
-/// authority instead of replaying that descriptor.
+/// #10670 fail-on-revert for a stamped reverse companion. The imported
+/// companion is owned the way production writers own it: by its client-side
+/// egress RG (LAN, RG 1 here). Reverse synthesis stamps
+/// `owner_rg_for_resolution`, the Go sync sender reports the same FIB egress
+/// RG, and #11373 re-homes to it on a generation-stale hit. That RG is
+/// locally active, so `cached_flow_decision_valid` deliberately invalidates
+/// the descriptor for every stamped fabric packet on this flow: a same-zone
+/// cache hit is unreachable here, the posture
+/// `stamped_fabric_punt_miss_is_judged_after_adjudicated_hit_10670` already
+/// pins. This cell therefore pins the authority decision and the cache
+/// preflight's side effects, not a cache hit. A foreign zone stamp on the
+/// same tuple must be judged under dmz -> lan default-deny without revoking
+/// the import, and must fall through the preflight without evicting the
+/// owner's descriptor. Reverting the stamped-zone session authority loses
+/// the dmz -> lan judgment; reverting the preflight lets the HA gate evict
+/// the owner's descriptor.
 #[test]
 fn foreign_fabric_stamp_cannot_serve_reverse_cache_10670() {
     let mut snapshot = frag_stamp_snapshot();
@@ -2470,8 +2727,9 @@ fn foreign_fabric_stamp_cannot_serve_reverse_cache_10670() {
         egress_zone_check: 0,
         ingress_ifindex: 0,
         ingress_vlan_id: 0,
-        // Reverse companions carry the original forward egress owner RG.
-        owner_rg_id: 2,
+        // Production writers own a reverse companion by its client-side
+        // egress RG: LAN's RG 1, not the peer-owned forward egress RG 2.
+        owner_rg_id: 1,
         fabric_ingress: true,
         is_reverse: true,
         nat64_reverse: None,
@@ -2569,7 +2827,9 @@ fn foreign_fabric_stamp_cannot_serve_reverse_cache_10670() {
         "the hit seeds its descriptor"
     );
 
-    let (_batch, cached_owner) = txn_run_descriptor_checked(
+    // The owner RG is locally active, so the HA cache gate re-adjudicates the
+    // same-zone repeat through the reverse session and reseeds its slot.
+    let (_batch, repeat_owner) = txn_run_descriptor_checked(
         &mut binding,
         &mut sessions,
         &forwarding,
@@ -2579,14 +2839,21 @@ fn foreign_fabric_stamp_cannot_serve_reverse_cache_10670() {
         true,
     );
     assert_eq!(
-        cached_owner.session_hit, 0,
-        "the RG-mismatched reverse companion must prove a real same-zone cache hit"
+        (repeat_owner.session_hit, repeat_owner.tx),
+        (1, 1),
+        "the same-zone repeat must be re-adjudicated by the reverse session and forward"
     );
     assert_eq!(
-        cached_owner.tx, 1,
-        "the adjudicated cached ACK still forwards"
+        binding.flow.flow_cache.hits, 0,
+        "FIXTURE: a served stamped reverse hit means the foreign-stamp cache-serve case \
+         is reachable again and needs its own non-vacuous proof"
     );
-    assert_eq!(binding.flow.flow_cache.hits, 1);
+    assert_eq!(
+        txn_flow_cache_entries(&binding),
+        1,
+        "the re-adjudicated repeat reseeds the owner's descriptor"
+    );
+    let evictions_before_foreign = binding.flow.flow_cache.evictions;
 
     let punted_miss = reverse_ack(TEST_DMZ_ZONE_ID);
     let punted_meta = reverse_meta(&punted_miss);
@@ -2612,7 +2879,7 @@ fn foreign_fabric_stamp_cannot_serve_reverse_cache_10670() {
     );
     assert_eq!(
         foreign.session_hit, 1,
-        "the foreign stamp must fall through the cache to reverse-session authority"
+        "the foreign stamp must reach reverse-session authority"
     );
     assert_eq!(
         foreign.foreign_authority_drops, 1,
@@ -2620,7 +2887,7 @@ fn foreign_fabric_stamp_cannot_serve_reverse_cache_10670() {
     );
     assert_eq!(
         foreign.tx, 0,
-        "the punt cannot inherit the peer-adjudicated cache permit"
+        "the punt cannot inherit the owner's adjudicated permit"
     );
     assert_eq!(foreign.policy_revoked_sessions, 0);
     assert_eq!(
@@ -2634,7 +2901,12 @@ fn foreign_fabric_stamp_cannot_serve_reverse_cache_10670() {
         "the foreign stamp must not evict the matching-zone reverse descriptor"
     );
     assert_eq!(
-        binding.flow.flow_cache.hits, 1,
+        binding.flow.flow_cache.evictions, evictions_before_foreign,
+        "the preflight must turn the foreign stamp away before the HA gate can evict \
+         the owner's descriptor"
+    );
+    assert_eq!(
+        binding.flow.flow_cache.hits, 0,
         "the foreign stamp must not be accounted as a served cache hit"
     );
 
@@ -2647,11 +2919,10 @@ fn foreign_fabric_stamp_cannot_serve_reverse_cache_10670() {
         reverse_meta(&owner_ack),
         true,
     );
-    assert_eq!(owner_after_foreign.session_hit, 0);
-    assert_eq!(owner_after_foreign.tx, 1);
     assert_eq!(
-        binding.flow.flow_cache.hits, 2,
-        "the same-zone reverse cache entry remains usable after the punt"
+        (owner_after_foreign.session_hit, owner_after_foreign.tx),
+        (1, 1),
+        "the owner's reverse flow still forwards after the denied punt"
     );
 }
 
