@@ -13,6 +13,7 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/configstore"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	"github.com/vishvananda/netlink"
 )
 
 // Cluster-comms construction helpers extracted from Daemon.startClusterComms
@@ -27,11 +28,53 @@ func (d *Daemon) resolveClusterVRFDevice(transportIfaces ...string) string {
 	return d.clusterVRFDeviceForTransports(true, transportIfaces...)
 }
 
-// clusterVRFDeviceForTransportKey resolves the same membership decision without
-// logging. Step 20 calls it on every apply to detect membership changes, so a
-// non-member transport must not emit the startup warning on every commit.
+// clusterVRFDeviceForTransportKey uses kernel master state without logging.
+// Step 20 calls it on each apply, so an interface outside vrf-mgmt must not
+// emit the startup warning on every commit.
+//
+// #12168 F1: the decision is KERNEL-EVIDENCED, not desired-set publication.
+// A failed applyVRFReconcile/rebind can publish desired membership while the
+// interface still sits in the main table; resolving from that set alone lets
+// the failure consume the transition and destroy working main-table comms.
+// Comparing kernel evidence against the active key leaves that epoch intact,
+// then lets genuine convergence restart even if the desired set never changed.
 func (d *Daemon) clusterVRFDeviceForTransportKey(transportIfaces ...string) string {
-	return d.clusterVRFDeviceForTransports(false, transportIfaces...)
+	hasTransport := false
+	for _, iface := range transportIfaces {
+		if iface == "" {
+			continue
+		}
+		hasTransport = true
+		linuxName := config.LinuxIfName(iface)
+		if !d.transportIfaceInMgmtVRF(linuxName) {
+			return ""
+		}
+	}
+	if !hasTransport {
+		return ""
+	}
+	return config.ManagementVRFDeviceName
+}
+
+// transportIfaceInMgmtVRF reports whether the kernel master of a selected
+// cluster transport interface is vrf-mgmt (#12168 F1). Missing links (or a
+// daemon without link resolution) report not-converged rather than failing the
+// commit: a transport whose kernel state cannot be evidenced keeps its
+// main-table binding until convergence is observable.
+func (d *Daemon) transportIfaceInMgmtVRF(linuxName string) bool {
+	linkByName := d.linkByNameFn
+	if linkByName == nil {
+		linkByName = netlink.LinkByName
+	}
+	link, err := linkByName(linuxName)
+	if err != nil || link == nil || link.Attrs() == nil {
+		return false
+	}
+	vrf, err := linkByName(config.ManagementVRFDeviceName)
+	if err != nil || vrf == nil || vrf.Attrs() == nil {
+		return false
+	}
+	return link.Attrs().MasterIndex != 0 && link.Attrs().MasterIndex == vrf.Attrs().Index
 }
 
 func (d *Daemon) clusterVRFDeviceForTransports(warn bool, transportIfaces ...string) string {

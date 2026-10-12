@@ -58,8 +58,8 @@ func (f *escapeRecorderDP) ClearPolicyCounters() error {
 }
 
 // newEscapeTestDaemon builds a daemon with just enough wiring for
-// startGRPCServer: a real store (FabricVRFDevice reads ActiveConfig
-// synchronously at construction) and a loopback ephemeral bind.
+// startGRPCServer: a real store for its per-dial transport resolver and a
+// loopback ephemeral bind.
 func newEscapeTestDaemon(t *testing.T) *Daemon {
 	t.Helper()
 	store, err := configstore.New(filepath.Join(t.TempDir(), "xpf.conf"))

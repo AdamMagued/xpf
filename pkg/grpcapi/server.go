@@ -170,13 +170,13 @@ type Config struct {
 	// returns the error, and the SystemAction handler does NOT stop the daemon.
 	// nil in NoDataplane / unit-test builds with no daemon, in which case the
 	// handler falls back to an ungated direct wipe (the pre-#5281 behavior).
-	ZeroizeFn        func(ctx context.Context, wipe func() error) error
-	VRRPMgr          *vrrp.Manager      // native VRRP manager
-	RAMgr            *ra.Manager        // embedded RA sender manager
-	Version          string             // software version string
-	FabricPeerAddrFn func() []string    // returns peer fabric IPs (fab0, fab1; empty if standalone)
-	FabricVRFDevice  string             // VRF for the selected cluster transport interface(s), e.g. "vrf-mgmt"
-	FwdSampler       *fwdstatus.Sampler // #881: 5s/1m/5m CPU windows for `show chassis forwarding`
+	ZeroizeFn         func(ctx context.Context, wipe func() error) error
+	VRRPMgr           *vrrp.Manager      // native VRRP manager
+	RAMgr             *ra.Manager        // embedded RA sender manager
+	Version           string             // software version string
+	FabricPeerAddrFn  func() []string    // returns peer fabric IPs (fab0, fab1; empty if standalone)
+	FabricVRFDeviceFn func() string      // resolves the selected cluster transport VRF at dial time
+	FwdSampler        *fwdstatus.Sampler // #881: 5s/1m/5m CPU windows for `show chassis forwarding`
 	// ListenersFn returns the EFFECTIVE (post-clamp, post-bind) management
 	// listener addresses `show system services` reports (#6385). The daemon
 	// wires it to Daemon.effectiveListeners so the remote gRPC renderer and the
@@ -307,7 +307,7 @@ type Server struct {
 	// property rather than by matching log text.
 	primaryEscalations atomic.Uint64
 	fabricPeerAddrFn   func() []string
-	fabricVRFDevice    string
+	fabricVRFDeviceFn  func() string
 	peerSystemActionFn func(ctx context.Context, req *pb.SystemActionRequest) (*pb.SystemActionResponse, error)
 	// peerZonePairSummaryFn is a test seam for the GetZonePairSummary peer
 	// fan-out leg (#3592). Production leaves it nil and proxyPeerZonePairSummary
@@ -447,7 +447,7 @@ func NewServer(addr string, cfg Config) *Server {
 		requestedAddr:               addr,
 		version:                     cfg.Version,
 		fabricPeerAddrFn:            cfg.FabricPeerAddrFn,
-		fabricVRFDevice:             cfg.FabricVRFDevice,
+		fabricVRFDeviceFn:           cfg.FabricVRFDeviceFn,
 		listenersFn:                 cfg.ListenersFn,
 		kernelUpgradeStatusFn:       cfg.KernelUpgradeStatusFn,
 		bootstrapImportFn:           cfg.BootstrapImportFn,

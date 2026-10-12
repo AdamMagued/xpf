@@ -18,34 +18,37 @@ import (
 
 const vrfRetry12168ChildEnv = "XPF_VRF_RETRY_12168_CHILD"
 
-// TestFailedBootConvergenceBindsHeartbeatToManagementVRF12168 drives the real
-// apply-tail restart path and verifies the replacement heartbeat records a
-// successful SO_BINDTODEVICE bind to vrf-mgmt. The child process owns temporary
-// user, network and mount namespaces, so daemon goroutines and keyed epoch
-// persistence cannot escape into host state.
-func TestFailedBootConvergenceBindsHeartbeatToManagementVRF12168(t *testing.T) {
-	if os.Getenv(vrfRetry12168ChildEnv) != "1" {
-		unshare, err := exec.LookPath("unshare")
-		if err != nil {
-			t.Skipf("unshare unavailable for isolated VRF test: %v", err)
-		}
-		cmd := exec.Command(unshare, "-Urnm", "--propagation", "private", "--", os.Args[0],
-			"-test.run=^TestFailedBootConvergenceBindsHeartbeatToManagementVRF12168$", "-test.v")
-		cmd.Env = append(os.Environ(), vrfRetry12168ChildEnv+"=1")
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			if strings.Contains(strings.ToLower(string(output)), "operation not permitted") {
-				t.Skipf("cannot create isolated user/network/mount namespaces: %s", output)
-			}
-			t.Fatalf("isolated VRF acceptance process failed: %v\n%s", err, output)
-		}
-		if strings.Contains(string(output), "--- SKIP:") {
-			t.Skipf("isolated kernel VRF prerequisite unavailable: %s", output)
-		}
-		t.Logf("isolated kernel VRF acceptance output:\n%s", output)
-		return
+// isolatedVRFRetryChild12168 gives each real-kernel test its own user, network,
+// and mount namespaces. The child test name is explicit so the outer process
+// can invoke one acceptance case without rerunning the whole package.
+func isolatedVRFRetryChild12168(t *testing.T) bool {
+	t.Helper()
+	if os.Getenv(vrfRetry12168ChildEnv) == t.Name() {
+		return true
 	}
+	unshare, err := exec.LookPath("unshare")
+	if err != nil {
+		t.Skipf("unshare unavailable for isolated VRF test: %v", err)
+	}
+	cmd := exec.Command(unshare, "-Urnm", "--propagation", "private", "--", os.Args[0],
+		"-test.run=^"+t.Name()+"$", "-test.v")
+	cmd.Env = append(os.Environ(), vrfRetry12168ChildEnv+"="+t.Name())
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		if strings.Contains(strings.ToLower(string(output)), "operation not permitted") {
+			t.Skipf("cannot create isolated user/network/mount namespaces: %s", output)
+		}
+		t.Fatalf("isolated VRF acceptance process failed: %v\n%s", err, output)
+	}
+	if strings.Contains(string(output), "--- SKIP:") {
+		t.Skipf("isolated kernel VRF prerequisite unavailable: %s", output)
+	}
+	t.Logf("isolated kernel VRF acceptance output:\n%s", output)
+	return false
+}
 
+func newKernelVRFRetryFixture12168(t *testing.T) (*Daemon, *config.Config, netlink.Link, netlink.Link) {
+	t.Helper()
 	installFakeNetworkctl(t)
 	useTemporaryDNSReconciler12168(t)
 	stateDir := t.TempDir()
@@ -79,9 +82,6 @@ func TestFailedBootConvergenceBindsHeartbeatToManagementVRF12168(t *testing.T) {
 	if err := netlink.AddrAdd(control, addr); err != nil {
 		t.Fatalf("assign control address: %v", err)
 	}
-
-	// The valid committed fixture needs a PSK; its durable epoch path is isolated
-	// above so the test never writes outside its temporary state directory.
 	store := testStoreWithSetConfig(t, []string{
 		"set chassis cluster cluster-id 1",
 		"set chassis cluster node 0",
@@ -108,11 +108,22 @@ func TestFailedBootConvergenceBindsHeartbeatToManagementVRF12168(t *testing.T) {
 		d.cluster.Stop() // join keyed-epoch persistence before the state mount is removed
 		cancel()
 	})
+	return d, cfg, control, vrf
+}
+
+// TestFailedBootConvergenceBindsHeartbeatToManagementVRF12168 drives the real
+// apply-tail restart path and verifies the replacement heartbeat records a
+// successful SO_BINDTODEVICE bind to vrf-mgmt.
+func TestFailedBootConvergenceBindsHeartbeatToManagementVRF12168(t *testing.T) {
+	if !isolatedVRFRetryChild12168(t) {
+		return
+	}
+	d, cfg, control, vrf := newKernelVRFRetryFixture12168(t)
 
 	// Failed boot apply: comms starts while the published management-VRF set is
 	// still nil, so the first heartbeat is successfully installed unbound.
 	d.publishMgmtVRFIfaces(nil)
-	d.startClusterComms(ctx)
+	d.startClusterComms(d.daemonCtx)
 	waitForHeartbeatVRF12168(t, d.cluster, "")
 	if got := d.activeTransport().VRFDevice; got != "" {
 		t.Fatalf("failed-boot transport unexpectedly selected VRF %q", got)
@@ -130,6 +141,40 @@ func TestFailedBootConvergenceBindsHeartbeatToManagementVRF12168(t *testing.T) {
 	if got := d.activeTransport().VRFDevice; got != config.ManagementVRFDeviceName {
 		t.Fatalf("converged transport VRF = %q, want %q", got, config.ManagementVRFDeviceName)
 	}
+}
+
+// TestWarmHeartbeatRetryResolvesNewVRFMembership12168 exercises the warm
+// retry transition with a real kernel VRF and assigned control address. The
+// resolver must run inside each attempt: after em0 is enslaved but before its
+// membership is published, an unbound bind fails; publishing membership lets
+// the next attempt bind its real sockets to vrf-mgmt.
+func TestWarmHeartbeatRetryResolvesNewVRFMembership12168(t *testing.T) {
+	if !isolatedVRFRetryChild12168(t) {
+		return
+	}
+	d, _, control, vrf := newKernelVRFRetryFixture12168(t)
+	if err := netlink.LinkSetMaster(control, vrf); err != nil {
+		t.Fatalf("enslave control interface to management VRF: %v", err)
+	}
+	d.publishMgmtVRFIfaces(nil)
+	ctx, cancel := context.WithTimeout(d.daemonCtx, 7*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		d.startHeartbeatWithRetry(ctx, "em0", "198.51.100.2")
+		close(done)
+	}()
+	time.Sleep(150 * time.Millisecond)
+	if d.cluster.HeartbeatRunning() {
+		t.Fatal("premise failed: heartbeat started before VRF membership was published")
+	}
+	d.publishMgmtVRFIfaces(map[string]bool{"em0": true})
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("heartbeat retry did not finish after publishing VRF membership")
+	}
+	waitForHeartbeatVRF12168(t, d.cluster, config.ManagementVRFDeviceName)
 }
 
 func waitForHeartbeatVRF12168(t *testing.T, manager *cluster.Manager, want string) {

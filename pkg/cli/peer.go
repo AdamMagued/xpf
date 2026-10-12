@@ -64,6 +64,10 @@ func (c *CLI) dialPeer() *grpc.ClientConn {
 		return nil
 	}
 
+	vrfDevice := ""
+	if c.fabricVRFDeviceFn != nil {
+		vrfDevice = c.fabricVRFDeviceFn()
+	}
 	dialOpts := []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		// #5324: authenticate every RPC we dial on the peer's fabric listener
@@ -75,13 +79,13 @@ func (c *CLI) dialPeer() *grpc.ClientConn {
 		grpc.WithUnaryInterceptor(grpcapi.FabricAuthUnaryClientInterceptor),
 		grpc.WithStreamInterceptor(grpcapi.FabricAuthStreamClientInterceptor),
 	}
-	if c.fabricVRFDevice != "" {
+	if vrfDevice != "" {
 		dialOpts = append(dialOpts, grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
 			dialer := &net.Dialer{
 				Control: func(network, address string, rc syscall.RawConn) error {
 					var err error
 					rc.Control(func(fd uintptr) {
-						err = unix.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, c.fabricVRFDevice)
+						err = unix.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, vrfDevice)
 					})
 					return err
 				},
@@ -99,11 +103,11 @@ func (c *CLI) dialPeer() *grpc.ClientConn {
 		}
 		// Quick TCP probe to verify the address is reachable.
 		d := &net.Dialer{Timeout: 2 * time.Second}
-		if c.fabricVRFDevice != "" {
+		if vrfDevice != "" {
 			d.Control = func(network, address string, rc syscall.RawConn) error {
 				var err error
 				rc.Control(func(fd uintptr) {
-					err = unix.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, c.fabricVRFDevice)
+					err = unix.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, vrfDevice)
 				})
 				return err
 			}

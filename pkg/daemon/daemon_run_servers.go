@@ -290,12 +290,12 @@ func (d *Daemon) startGRPCServer(ctx context.Context, wg *sync.WaitGroup, eventB
 			}
 			return addrs
 		},
-		FabricVRFDevice: func() string {
+		FabricVRFDeviceFn: func() string {
 			if c := d.store.ActiveConfig(); c != nil && c.Chassis.Cluster != nil {
-				return d.resolveClusterSyncVRFDevice(c.Chassis.Cluster)
+				return d.clusterSyncVRFDeviceForTransportKey(c.Chassis.Cluster)
 			}
 			return ""
-		}(),
+		},
 		FwdSampler: fwdSampler,
 		// #6385: the remote gRPC `show system services` renderer reports the
 		// EFFECTIVE post-bind listener addresses from this daemon-owned snapshot,

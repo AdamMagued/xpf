@@ -1666,10 +1666,10 @@ func (d *Daemon) stopClusterComms() {
 	}
 }
 
-// clusterTransportKey extracts the cluster endpoints and resolved VRF device
-// that determine heartbeat and session sync sockets. Used to detect config and
-// management-membership changes that require restarting cluster comms: step 20
-// compares the WHOLE struct, so every field here participates in the decision.
+// clusterTransportKey extracts the cluster endpoints and kernel-evidenced VRF
+// binding that determine heartbeat and session sync sockets. Used to detect
+// config and kernel-membership changes that require restarting cluster comms:
+// step 20 compares the WHOLE struct, so every field here participates.
 //
 // The `log` tag is the key suffix step 20 uses when it reports that decision.
 // It exists so transportChangeLogArgs can derive the line from the struct
@@ -1739,11 +1739,12 @@ func clusterTransportFromConfig(cfg *config.Config) clusterTransportKey {
 	}
 }
 
-// clusterTransportForConfig adds the currently selected socket VRF binding to
-// the configured endpoints. clusterSyncTransport uses the control pair when
-// configured (the same pair heartbeat uses), and otherwise selects fabric.
-// Management-VRF membership is published by apply, not represented in
-// ClusterConfig, so step 20 resolves it from the current membership snapshot.
+// clusterTransportForConfig adds the kernel-evidenced binding for the selected
+// sync transport to the configured endpoints. clusterSyncTransport uses the
+// control pair when configured (the same pair heartbeat uses), and otherwise
+// selects fabric. Desired membership can be published before the interface is
+// actually enslaved, so this key uses the kernel master rather than the
+// published membership set to avoid consuming a failed transition.
 func (d *Daemon) clusterTransportForConfig(cfg *config.Config) clusterTransportKey {
 	key := clusterTransportFromConfig(cfg)
 	if cfg == nil || cfg.Chassis.Cluster == nil {

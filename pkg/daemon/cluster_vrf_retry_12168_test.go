@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 
@@ -9,6 +10,7 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/networkd"
 	"github.com/psaab/xpf/pkg/vrrp"
+	"github.com/vishvananda/netlink"
 )
 
 // Keep apply-tail's DNS reconciliation inside the test tempdir; the real
@@ -23,9 +25,9 @@ func useTemporaryDNSReconciler12168(t *testing.T) {
 
 // TestVRFMembershipConvergenceRestartsClusterComms12168 reproduces a failed
 // boot apply that starts cluster comms before management-VRF membership is
-// published, followed by an apply that publishes the membership. Step 20 must
-// select a restart from that membership transition, not leave the original
-// unbound epoch active.
+// published. Publishing desired membership after a failed kernel bind must not
+// restart working comms; the later kernel-master transition must still select
+// one restart even though the published set did not change.
 func TestVRFMembershipConvergenceRestartsClusterComms12168(t *testing.T) {
 	useTemporaryDNSReconciler12168(t)
 
@@ -51,6 +53,18 @@ func TestVRFMembershipConvergenceRestartsClusterComms12168(t *testing.T) {
 	if d.activeClusterTransport == (clusterTransportKey{}) {
 		t.Fatal("fixture requires an active, non-zero cluster transport")
 	}
+	vrf := &netlink.Vrf{LinkAttrs: netlink.LinkAttrs{Name: config.ManagementVRFDeviceName, Index: 77}}
+	control := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "em0", Index: 10}}
+	d.linkByNameFn = func(name string) (netlink.Link, error) {
+		switch name {
+		case "em0":
+			return control, nil
+		case config.ManagementVRFDeviceName:
+			return vrf, nil
+		default:
+			return nil, errors.New("unknown fixture link")
+		}
+	}
 	d.publishMgmtVRFIfaces(nil) // failed boot apply did not publish membership
 
 	starts := 0
@@ -62,17 +76,27 @@ func TestVRFMembershipConvergenceRestartsClusterComms12168(t *testing.T) {
 	}
 	before := generation()
 
-	// The later successful apply publishes the interface after binding it to
-	// vrf-mgmt. No real network interface or cluster socket is needed to observe
-	// step 20's restart decision; this fixture asserts the production call site.
+	// Desired membership can publish before the authoritative post-networkd
+	// bind succeeds. That is not kernel evidence and must leave comms intact.
 	d.publishMgmtVRFIfaces(map[string]bool{"em0": true})
 	_ = d.applyTailReconciles(cfg, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
-
-	if starts != 1 {
-		t.Fatalf("VRF membership convergence started comms %d times, want 1 restart", starts)
+	if starts != 0 || generation() != before {
+		t.Fatalf("desired-only membership restarted comms: starts=%d generation=%d->%d",
+			starts, before, generation())
 	}
-	if got := d.resolveClusterVRFDevice("em0"); got != config.ManagementVRFDeviceName {
-		t.Fatalf("converged heartbeat VRF device = %q, want %q", got, config.ManagementVRFDeviceName)
+	if got := d.activeTransport().VRFDevice; got != "" {
+		t.Fatalf("desired-only membership published active VRF %q", got)
+	}
+
+	// Genuine kernel convergence, without changing the published set, is the
+	// transition that must restart the unbound comms epoch.
+	control.Attrs().MasterIndex = vrf.Attrs().Index
+	_ = d.applyTailReconciles(cfg, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	if starts != 1 {
+		t.Fatalf("kernel membership convergence started comms %d times, want 1 restart", starts)
+	}
+	if got := d.clusterTransportForConfig(cfg).VRFDevice; got != config.ManagementVRFDeviceName {
+		t.Fatalf("converged transport VRF device = %q, want %q", got, config.ManagementVRFDeviceName)
 	}
 	if after := generation(); after == before {
 		t.Fatalf("VRF membership convergence did not advance comms generation: %d", after)
@@ -81,6 +105,26 @@ func TestVRFMembershipConvergenceRestartsClusterComms12168(t *testing.T) {
 
 func TestClusterTransportKeyTracksVRFConvergence12168(t *testing.T) {
 	d := &Daemon{}
+	control := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "em0", Index: 10}}
+	fab0 := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "fab0", Index: 11}}
+	fab1 := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "fab1", Index: 12}}
+	vrf := &netlink.Vrf{LinkAttrs: netlink.LinkAttrs{Name: config.ManagementVRFDeviceName, Index: 77}}
+	d.linkByNameFn = func(name string) (netlink.Link, error) {
+		switch name {
+		case "em0":
+			return control, nil
+		case "fab0":
+			return fab0, nil
+		case "fab1":
+			return fab1, nil
+		case config.ManagementVRFDeviceName:
+			return vrf, nil
+		default:
+			return nil, errors.New("unknown fixture link")
+		}
+	}
+	// Desired membership alone cannot make a main-table transport look bound.
+
 	controlCfg := &config.Config{}
 	controlCfg.Chassis.Cluster = &config.ClusterConfig{
 		ControlInterface: "em0",
@@ -88,19 +132,20 @@ func TestClusterTransportKeyTracksVRFConvergence12168(t *testing.T) {
 	}
 
 	d.publishMgmtVRFIfaces(nil)
-	controlUnpublished := d.clusterTransportForConfig(controlCfg)
-	if controlUnpublished.VRFDevice != "" {
-		t.Fatalf("unpublished control membership resolved VRF %q", controlUnpublished.VRFDevice)
-	}
-	d.publishMgmtVRFIfaces(map[string]bool{"fxp0": true})
-	if got := d.clusterTransportForConfig(controlCfg); got != controlUnpublished {
-		t.Fatalf("unrelated management member changed transport key: before=%+v after=%+v",
-			controlUnpublished, got)
+	controlUnbound := d.clusterTransportForConfig(controlCfg)
+	if controlUnbound.VRFDevice != "" {
+		t.Fatalf("unbound control interface resolved VRF %q", controlUnbound.VRFDevice)
 	}
 	d.publishMgmtVRFIfaces(map[string]bool{"em0": true})
+	if got := d.clusterTransportForConfig(controlCfg); got != controlUnbound {
+		t.Fatalf("desired-only control membership changed transport key: before=%+v after=%+v",
+			controlUnbound, got)
+	}
+	control.Attrs().MasterIndex = vrf.Attrs().Index
+	d.publishMgmtVRFIfaces(nil)
 	controlBound := d.clusterTransportForConfig(controlCfg)
-	if controlBound == controlUnpublished || controlBound.VRFDevice != config.ManagementVRFDeviceName {
-		t.Fatalf("control membership produced key %+v, want VRF %q",
+	if controlBound == controlUnbound || controlBound.VRFDevice != config.ManagementVRFDeviceName {
+		t.Fatalf("kernel control membership produced key %+v, want VRF %q",
 			controlBound, config.ManagementVRFDeviceName)
 	}
 
@@ -111,21 +156,20 @@ func TestClusterTransportKeyTracksVRFConvergence12168(t *testing.T) {
 		Fabric1Interface:   "fab1",
 		Fabric1PeerAddress: "192.0.2.4",
 	}
-	d.publishMgmtVRFIfaces(nil)
-	fabricUnpublished := d.clusterTransportForConfig(fabricCfg)
-	if fabricUnpublished.VRFDevice != "" {
-		t.Fatalf("unpublished fabric membership resolved VRF %q", fabricUnpublished.VRFDevice)
+	fabricUnbound := d.clusterTransportForConfig(fabricCfg)
+	if fabricUnbound.VRFDevice != "" {
+		t.Fatalf("unbound fabric interfaces resolved VRF %q", fabricUnbound.VRFDevice)
 	}
-	d.publishMgmtVRFIfaces(map[string]bool{"fab0": true})
+	fab0.Attrs().MasterIndex = vrf.Attrs().Index
 	primaryOnly := d.clusterTransportForConfig(fabricCfg)
-	if primaryOnly != fabricUnpublished {
-		t.Fatalf("dual-fabric key selected VRF with only one member: before=%+v after=%+v",
-			fabricUnpublished, primaryOnly)
+	if primaryOnly != fabricUnbound {
+		t.Fatalf("dual-fabric key selected VRF with only one kernel member: before=%+v after=%+v",
+			fabricUnbound, primaryOnly)
 	}
-	d.publishMgmtVRFIfaces(map[string]bool{"fab0": true, "fab1": true})
+	fab1.Attrs().MasterIndex = vrf.Attrs().Index
 	fabricBound := d.clusterTransportForConfig(fabricCfg)
-	if fabricBound == fabricUnpublished || fabricBound.VRFDevice != config.ManagementVRFDeviceName {
-		t.Fatalf("dual-fabric membership produced key %+v, want VRF %q",
+	if fabricBound == fabricUnbound || fabricBound.VRFDevice != config.ManagementVRFDeviceName {
+		t.Fatalf("dual-fabric kernel membership produced key %+v, want VRF %q",
 			fabricBound, config.ManagementVRFDeviceName)
 	}
 }

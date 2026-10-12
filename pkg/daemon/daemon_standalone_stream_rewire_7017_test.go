@@ -45,8 +45,8 @@ func TestRunUserspaceEventStream_StandaloneRewiresReplacementStream(t *testing.T
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	first, firstPath := startEventStreamForRewireTest(t, ctx, "first.sock")
-	replacement, replacementPath := startEventStreamForRewireTest(t, ctx, "replacement.sock")
+	first, firstPath := startEventStreamForRewireTest(t, ctx, "a")
+	replacement, replacementPath := startEventStreamForRewireTest(t, ctx, "b")
 
 	d := &Daemon{store: storeWithActiveConfigForDrainTest(t)}
 	if d.cluster != nil || d.getSessionSync() != nil {
@@ -104,7 +104,7 @@ func TestRunUserspaceEventStream_StandaloneRewiresReplacementStream(t *testing.T
 func TestRunUserspaceEventStream_StandaloneReturnsOnContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	es, _ := startEventStreamForRewireTest(t, ctx, "shutdown.sock")
+	es, _ := startEventStreamForRewireTest(t, ctx, "s")
 	d := &Daemon{store: storeWithActiveConfigForDrainTest(t)}
 	backend := &replaceableStreamDP{}
 	backend.es.Store(es)

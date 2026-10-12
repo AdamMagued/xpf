@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"net"
+	"sync/atomic"
 	"testing"
 
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
@@ -103,5 +104,38 @@ func TestPeerProbeControls_8597(t *testing.T) {
 	if _, err := dialProbePeer(t, status.Error(codes.Internal, "boom")); err == nil {
 		t.Fatal("#8597: a peer failing the probe for any reason OTHER than scan capacity " +
 			"must still be reported as unreachable")
+	}
+}
+
+// #12168 F2: every peer RPC must resolve the current kernel-selected VRF.
+// A long-lived grpcapi.Server survives comms rebinding; capturing this value
+// once would keep later dials pinned to the old (main-table) routing context.
+func TestDialPeerRefreshesVRFPerDial12168(t *testing.T) {
+	host, port := startProbePeer(t, nil)
+	oldPort := peerFabricGRPCPort
+	peerFabricGRPCPort = port
+	t.Cleanup(func() { peerFabricGRPCPort = oldPort })
+
+	device := ""
+	var resolves atomic.Int32
+	s := &Server{
+		fabricPeerAddrFn: func() []string { return []string{host} },
+		fabricVRFDeviceFn: func() string {
+			resolves.Add(1)
+			return device
+		},
+	}
+	for i, nextDevice := range []string{"", "lo"} {
+		device = nextDevice
+		conn, err := s.dialPeer(context.Background())
+		if err != nil {
+			t.Fatalf("peer GetStatus dial %d with device %q: %v", i+1, nextDevice, err)
+		}
+		if err := conn.Close(); err != nil {
+			t.Fatalf("close peer dial %d: %v", i+1, err)
+		}
+		if got, want := resolves.Load(), int32(i+1); got != want {
+			t.Fatalf("dial %d sampled VRF resolver %d times, want %d", i+1, got, want)
+		}
 	}
 }
