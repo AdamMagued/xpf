@@ -216,6 +216,14 @@ func applyBGPNeighborProps9192(neighbor *BGPNeighbor, child *Node, ownExport, ow
 					if !opts.lenientBGPCrossFamily12185 {
 						return fmt.Errorf("%s", msg)
 					}
+					// Retain SAFI diagnostics on tolerant cross-family peers too.
+					// This family remains inert, but unsupported SAFI evidence and
+					// its merged-activation warning still belong to the compiler.
+					_, unsupported, err := applyBGPFamilySAFI11815(familyNode, afi, scope, opts, warnings, warningRecords)
+					if err != nil {
+						return err
+					}
+					neighbor.UnsupportedInetSAFI = neighbor.UnsupportedInetSAFI || unsupported
 					if !neighbor.CrossFamilyInet && warnings != nil {
 						*warnings = append(*warnings, msg)
 					}

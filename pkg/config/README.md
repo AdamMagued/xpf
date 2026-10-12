@@ -1670,6 +1670,8 @@ activate the peer without its inet policies. A separately declared inet6 family
 remains independent. Group-inherited families use the shared `FRRAddrFamily`
 predicate (#9820), which classifies IPv4-mapped IPv6 literals as IPv6, matching
 the FRR renderer and preventing them from inheriting inet only (#2454).
+Tolerant handling also retains independent unsupported-SAFI diagnostics and
+finalizes their activation wording against the merged neighbor state (#11815).
 
 **Policy-referenced application protocols are validated against the dataplane
 resolver (#3150 — codex-review-067 finding 067-06):** a user-defined
