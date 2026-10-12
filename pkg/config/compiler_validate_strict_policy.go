@@ -79,7 +79,7 @@ func policyMatchAddressTokenRecognized(tok string, named map[string]bool) bool {
 	if named[tok] {
 		return true
 	}
-	if CIDRMaskHasRedundantLeadingZero(tok) {
+	if CIDRMaskHelperRefusesPadding(tok) {
 		return false
 	}
 	if _, _, err := net.ParseCIDR(tok); err == nil {
@@ -973,8 +973,8 @@ func validatePolicyLogActionStrict(cfg *Config) error {
 
 func policyMatchAddressError(scope, polName, field, addr string) error {
 	problem := "is not a defined address-book entry, the `any` keyword, or a valid CIDR/IP address"
-	if CIDRMaskHasRedundantLeadingZero(addr) {
-		problem = "has redundant leading-zero CIDR mask digits; use a canonical decimal mask"
+	if CIDRMaskHelperRefusesPadding(addr) {
+		problem = "has redundant leading-zero CIDR mask digits the userspace helper cannot parse; use a helper-compatible mask spelling"
 	}
 	if scope != "" {
 		return fmt.Errorf("%s policy %q: %s %q %s", scope, polName, field, addr, problem)

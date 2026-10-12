@@ -49,12 +49,15 @@ func TestFRRAddrIsMapped(t *testing.T) {
 		{"0:0:0:0:0:ffff:c000:0201", true},
 		{"::FFFF:C000:201", true},
 		{"::ffff:10.0.0.0/104", true},
+		{"::ffff:10.0.0.0/096", true},
+		{"::ffff:10.0.0.0/0096", true},
 		{"192.168.50.1", false},
 		{"10.0.0.0/8", false},
 		{"2001:db8::1", false},
 		{"2001:db8::/32", false},
 		{"fe80::1", false},
 		{"not-an-address", false},
+		{"::ffff:10.0.0.0/0129", false},
 		{"", false},
 	} {
 		if got := FRRAddrIsMapped(c.in); got != c.want {

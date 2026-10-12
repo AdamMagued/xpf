@@ -1,6 +1,7 @@
 package config
 
 import (
+	"net"
 	"net/netip"
 	"strings"
 )
@@ -72,6 +73,14 @@ func junosHostResolveAddrSet(cfg *Config, tokens []string, feedBound map[string]
 				anyV6 = true
 			}
 			return
+		}
+		// netip.ParsePrefix rejects every padded mask, including forms the
+		// userspace helper accepts. Only normalize a Go-valid mask that the
+		// helper accepts; helper-refused or malformed values remain
+		// unrepresentable on this direct-enforcement path.
+		if _, _, err := net.ParseCIDR(val); err == nil &&
+			!CIDRMaskHelperRefusesPadding(val) {
+			val = normalizeCIDRMaskPadding(val)
 		}
 		pfx, perr := netip.ParsePrefix(val)
 		if perr != nil {

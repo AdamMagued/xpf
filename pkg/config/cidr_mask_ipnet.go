@@ -5,9 +5,9 @@ import (
 	"strings"
 )
 
-// CIDRMaskHasRedundantLeadingZero reports whether cidr has a valid Go CIDR
-// spelling whose prefix mask has redundant leading-zero digits that the
-// pinned userspace helper (ipnet 2.12.0) cannot parse.
+// CIDRMaskHelperRefusesPadding reports whether cidr is a valid Go CIDR whose
+// zero-padded prefix mask the pinned userspace helper (ipnet 2.12.0) cannot
+// parse, so strict commit and the publication mirror must refuse it.
 //
 // The predicate is deliberately narrower than "any zero-padded mask" (#12178):
 // ipnet reads the v4 mask with read_number(10, 2, 33) and the v6 mask with
@@ -19,7 +19,11 @@ import (
 // drops. Determine the family from the address text, as the helper does:
 // IPv4-mapped IPv6 literals are parsed as IPv6 by ipnet even though Go's
 // address-book snapshot builder files them as IPv4 (#10688).
-func CIDRMaskHasRedundantLeadingZero(cidr string) bool {
+//
+// The name states the verdict, not the spelling: a leading zero in "/08" is
+// not refused by the helper. Consumers that accept such a mask must normalize
+// it before passing it to stricter parsers such as netip.ParsePrefix (#12178).
+func CIDRMaskHelperRefusesPadding(cidr string) bool {
 	slash := strings.LastIndexByte(cidr, '/')
 	if slash < 0 {
 		return false
@@ -38,4 +42,22 @@ func CIDRMaskHasRedundantLeadingZero(cidr string) bool {
 		maxDigits = 3
 	}
 	return len(mask) > maxDigits
+}
+
+// normalizeCIDRMaskPadding removes only leading zeros from a CIDR mask. It
+// leaves signs, whitespace, and all other syntax untouched so the caller's
+// parser still decides whether the rest of the token is valid.
+func normalizeCIDRMaskPadding(cidr string) string {
+	slash := strings.LastIndexByte(cidr, '/')
+	if slash < 0 {
+		return cidr
+	}
+	mask := cidr[slash+1:]
+	for len(mask) > 1 && mask[0] == '0' {
+		mask = mask[1:]
+	}
+	if len(mask) == len(cidr)-slash-1 {
+		return cidr
+	}
+	return cidr[:slash+1] + mask
 }

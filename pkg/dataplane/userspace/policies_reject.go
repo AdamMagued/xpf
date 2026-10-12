@@ -284,16 +284,16 @@ func collectAddressBookCIDRMaskRejections(books []AddressBookSnapshot) []string 
 	var reasons []string
 	for _, book := range books {
 		for _, prefix := range book.PrefixesV4 {
-			if config.CIDRMaskHasRedundantLeadingZero(prefix) {
+			if config.CIDRMaskHelperRefusesPadding(prefix) {
 				reasons = append(reasons, fmt.Sprintf(
-					"address-book %q prefix %q has redundant leading-zero CIDR mask digits; userspace publication is refused (#12047)",
+					"address-book %q prefix %q has redundant leading-zero CIDR mask digits the userspace helper cannot parse; userspace publication is refused (#12047/#12178)",
 					book.Name, prefix))
 			}
 		}
 		for _, prefix := range book.PrefixesV6 {
-			if config.CIDRMaskHasRedundantLeadingZero(prefix) {
+			if config.CIDRMaskHelperRefusesPadding(prefix) {
 				reasons = append(reasons, fmt.Sprintf(
-					"address-book %q prefix %q has redundant leading-zero CIDR mask digits; userspace publication is refused (#12047)",
+					"address-book %q prefix %q has redundant leading-zero CIDR mask digits the userspace helper cannot parse; userspace publication is refused (#12047/#12178)",
 					book.Name, prefix))
 			}
 		}
@@ -309,9 +309,9 @@ func collectPolicyCIDRMaskRejections(policies []PolicyRuleSnapshot) []string {
 			addrs = legacy
 		}
 		for _, addr := range addrs {
-			if config.CIDRMaskHasRedundantLeadingZero(addr) {
+			if config.CIDRMaskHelperRefusesPadding(addr) {
 				reasons = append(reasons, fmt.Sprintf(
-					"policy %s %s %q has redundant leading-zero CIDR mask digits; userspace publication is refused (#12047)",
+					"policy %s %s %q has redundant leading-zero CIDR mask digits the userspace helper cannot parse; userspace publication is refused (#12047/#12178)",
 					policyRejectionScope(rule), side, addr))
 			}
 		}

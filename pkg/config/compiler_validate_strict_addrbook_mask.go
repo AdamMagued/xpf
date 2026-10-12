@@ -29,11 +29,11 @@ func validateAddressBookCIDRMaskSpellingStrict(cfg *Config) error {
 				continue
 			}
 			value := address.UsableValue()
-			if !CIDRMaskHasRedundantLeadingZero(value) {
+			if !CIDRMaskHelperRefusesPadding(value) {
 				continue
 			}
 			return fmt.Errorf(
-				"%s address-book address %q has CIDR prefix %q with redundant leading-zero mask digits refused by the userspace helper (#12047)",
+				"%s address-book address %q has CIDR prefix %q with redundant leading-zero mask digits the userspace helper cannot parse; use a helper-compatible mask spelling (#12047/#12178)",
 				scope, name, value)
 		}
 		return nil

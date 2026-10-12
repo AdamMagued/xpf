@@ -2219,9 +2219,10 @@ type compileOpts struct {
 	// snapshot builder and helper disagree on its family. Strict commits reject
 	// it before an entire policy snapshot can be refused.
 	lenientAddressBookMappedPrefixes bool
-	// lenientAddressBookCIDRMaskSpelling (#12047) keeps an already-persisted
-	// address-book prefix with redundant mask zeros loadable while warning;
-	// strict commits reject it and the userspace mirror prevents publication.
+	// lenientAddressBookCIDRMaskSpelling (#12047/#12178) keeps an already-
+	// persisted prefix with helper-refused zero padding loadable while warning.
+	// Strict commits reject it and the userspace mirror prevents publication;
+	// padded forms within ipnet's family-specific digit limit remain accepted.
 	lenientAddressBookCIDRMaskSpelling bool
 	// lenientFlowAging (#3440 H2) downgrades the flow-aging gate
 	// (validateFlowAgingStrict) from a hard compile error to a cfg.Warnings

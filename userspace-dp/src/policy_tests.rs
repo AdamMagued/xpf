@@ -13,6 +13,8 @@ fn padded_policy_masks_match_helper_ipnet_grammar_12178() {
         ("2001:db8::/032", true, false),
         ("2001:db8::/064", true, false),
         ("2001:db8::/024", true, false),
+        ("::ffff:10.0.0.0/096", true, false),
+        ("::ffff:10.0.0.0/0096", false, false),
         ("10.0.0.0/024", false, true),
         ("2001:db8::/0064", false, false),
     ] {
