@@ -83,6 +83,8 @@ docs.
   code → review → merge.
 - [`engineering-style.md`](engineering-style.md) — coding/review
   discipline, hot-path rules, review severity.
+- [`ci-gate-contract.md`](ci-gate-contract.md) — what ordinary CI runs and
+  which packet-level gates remain manual.
 - [`testing-procedures.md`](testing-procedures.md) /
   [`testing.md`](testing.md) — test categories and procedures.
 - [`firewall-validation-harness-design.md`](firewall-validation-harness-design.md)

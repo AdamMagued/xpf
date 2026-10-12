@@ -6,55 +6,56 @@
 > Rust-test-only regression in policy/NAT/HA packet behavior could pass
 > the ordinary green gate unobserved, with no contract saying so.
 
-`.github/workflows/test.yml` is the ordinary green gate: it reports on
-every PR but does not block merges until its status contexts are required
-in master branch rulesets. This contract records the complete list of
-commands a green run examined, the issue-relevant manual policy/NAT/HA
-dataplane gates it does not run, and where their results are recorded.
+`.github/workflows/test.yml` (`CI tests`) runs on every PR. Its three
+status contexts—`CI tests / Harness census and self-test`, `CI tests / Go
+build and affected tests`, and `CI tests / Rust workspace compile
+check`—do not block merges until required in master branch rulesets. This
+contract lists every job command in that workflow and the issue-relevant
+manual policy/NAT/HA dataplane gates it does not run, plus where results
+are recorded.
 
 ## What ordinary green CI runs
 
 | Job | Command | Source of truth |
 |---|---|---|
-| Go build and affected tests | `go build ./...`, then `bash scripts/ci_affected_go_tests.sh "$BASE_SHA" "$HEAD_SHA"` (changed packages + reverse dependents; the full Go suite is red on master) | `test.yml:22-41` |
-| Rust workspace compile check | `cargo check --manifest-path userspace-dp/Cargo.toml --workspace --all-targets` | `test.yml:74-77` |
+| Harness census and self-test | `sh scripts/harness-census.sh`, then `bash ./test/incus/harness-census-selftest.sh` (runnable-harness reachability census and mutation self-test; examines no packets) | `test.yml` job `census` |
+| Go build and affected tests | `go build ./...`, then `bash scripts/ci_affected_go_tests.sh "$BASE_SHA" "$HEAD_SHA"` (changed packages + reverse dependents) | `test.yml` job `go` (`Go build and affected tests`) |
+| Rust workspace compile check | `cargo check --manifest-path userspace-dp/Cargo.toml --workspace --all-targets` | `test.yml` job `rust`, step `Check Rust workspace and all targets` |
 
-That is the whole gate. In particular:
+That is the whole `CI tests` workflow gate. In particular:
 
 - CI compiles the Rust workspace; it does **not** run the Rust
-  dataplane test suite. The suite is red on master. The workflow header's
+  dataplane test suite. The suite is red on master (tracked by #11649; the
+  policy-revocation slice is #12262). The workflow header's
   `cargo test --workspace` command is a future CI promotion goal once green;
   it is not the current manual suite command. That gate is `make test-rust`
   as detailed below.
 
 ## Manual policy/NAT/HA dataplane gates (out of scope of the green gate)
 
-A green CI run says nothing about the issue-relevant gates below; these
-tables are not a census of every Makefile integration target. The Rust
-suite is developer-invoked, runs without a cluster, and reports to
+A green CI run says nothing about the issue-relevant packet-level gates
+below; these tables are not a census of every Makefile integration target.
+The Rust suite is developer-invoked, runs without a cluster, and reports to
 terminal output. The `harness-result.sh run`-wrapped gates record one JSON
 row per invocation in `test/results/ledger.d/<run_id>.json` (the tracked
-record; see `test/incus/harness-result.sh:2-10`).
+record; see the one-row-per-run contract in `test/incus/harness-result.sh`).
 
 ### Rust dataplane test suite
 
 | Gate | Command | Results |
 |---|---|---|
-| `make test-rust` | Pinned-toolchain `cargo check --benches` (leg 0), full release `cargo test --bins --tests` with `--test-threads=1` (leg 1), debug-leg oracle census + one debug argv (leg 2); see the `test-rust` recipe in `Makefile` | Terminal output; no wire-ledger row. Durable result location is described below. |
+| `make test-rust` | Pinned-toolchain `cargo check --benches` (leg 0), full release `cargo test --bins --tests` with `--test-threads=1` (leg 1), debug-leg oracle census + one debug argv (leg 2); see the `test-rust` recipe and its `check-userspace-dt-needed` prerequisite (#10204 release relink + DT_NEEDED check) in `Makefile` | Terminal output; no wire-ledger row. Durable result location is described below. |
 
 Record each manual Rust run durably in the associated `docs/log/<issue>.md`
 entry: include the commit SHA, exact command, PASS/FAIL, and a concise result
 summary. `make test-rust` does not write to `test/results/ledger.d/`; that
 ledger is for the harness-wrapped wire/cluster gates below. Do not treat
-terminal output alone as a durable result record. The suite was not run for
-#12228, so this issue log does not claim a Rust result.
+terminal output alone as a durable result record.
 
-
-`query_strategy` (`userspace-dp/src/policy_prop_tests/strategy.rs:48-73`)
-generates synthetic packet tuples, and `generated_config_strategy`
-(`userspace-dp/src/policy_prop_tests/strategy.rs:120-124,179-204,307-314`)
-constructs synthetic policy configurations, rather than observed forwarding,
-so the prop-test leg cannot substitute for the wire gates below.
+`query_strategy` in `userspace-dp/src/policy_prop_tests/strategy.rs`
+generates synthetic packet tuples, and `generated_config_strategy` in that
+file constructs synthetic policy configurations, rather than observed
+forwarding, so the prop-test leg cannot substitute for the wire gates below.
 
 ### Wire dataplane gates
 
@@ -66,7 +67,7 @@ harness rather than observed wire behavior.
 `make test-wire-properties` is different: it uses local Incus instances
 `xpf-fw`, `trust-host`, and `untrust-host`, not the shared loss cluster,
 and does not take the #1875 lock. Despite the wrapper's `--hermetic` flag,
-it still needs those instances; see `test/incus/test-wire-properties.sh:25-31`.
+it still needs those instances; see `test/incus/test-wire-properties.sh`.
 
 | Gate | Makefile target | Wire proof |
 |---|---|---|
@@ -78,7 +79,8 @@ it still needs those instances; see `test/incus/test-wire-properties.sh:25-31`.
 | Wire hostinbound-deny | `make test-wire-hostinbound-deny` (the `test-wire-hostinbound-deny` recipe in `Makefile`) | Host-inbound deny verdicts observed on the wire |
 | Wire conntrack lifecycle | `make test-wire-conntrack-lifecycle` (the `test-wire-conntrack-lifecycle` recipe in `Makefile`) | Create/witness/evict lifecycle observed on the wire |
 | Wire routing separation | `make test-wire-routing-separation` (the `test-wire-routing-separation` recipe in `Makefile`) | Routing-separation probes observed on the wire |
-| Wire properties | `make test-wire-properties` (the `test-wire-properties` recipe in `Makefile`) | IPv6 transit plus a DF/1500-byte probe that accepts either PMTUD feedback or ordinary delivery (a passing run does not necessarily exercise reflection), through the local Incus hosts (see `test/incus/test-wire-properties.sh:80-98`) |
+| Wire properties | `make test-wire-properties` (the `test-wire-properties` recipe in `Makefile`) | IPv6 transit plus a DF/1500-byte probe that accepts either PMTUD feedback or ordinary delivery (a passing run does not necessarily exercise reflection), through the local Incus hosts (see the PMTUD Reflection and Dual-Stack IPv6 Transit sections in `test/incus/test-wire-properties.sh`) |
+| Connectivity smoke | `make test-connectivity` (the `test-connectivity` recipe in `Makefile`) | Cross-zone policy permit + SNAT (IPv4/IPv6) and cluster session sync |
 
 ### HA continuity and NAT failover gates
 
@@ -94,6 +96,7 @@ rows through `harness-result.sh`:
 | HA crash | `make test-ha-crash` (the `test-ha-crash` recipe in `Makefile`) | Traffic behavior across a hard-crash/hung-node recovery |
 | Persistent NAT failover | `make test-persistent-nat-failover` (the `test-persistent-nat-failover` recipe in `Makefile`) | Persistent NAT behavior across RG failover |
 | Chained crash | `make test-chained-crash` (the `test-chained-crash` recipe in `Makefile`) | Traffic behavior across chained hard resets and recoveries |
+| Rolling upgrade | `make test-rolling-upgrade` (the `test-rolling-upgrade` recipe in `Makefile`, #12200) | Version-asserted traffic through two rolling upgrade cuts |
 
 Results for every wrapped run in the tables above live in
 `test/results/ledger.d/` (one `<run_id>.json` per run, #8346);
@@ -103,10 +106,13 @@ packet-level run with no ledger row was not measured.
 
 ## The contract, in one paragraph
 
-If it is not in the "What ordinary green CI runs" table, a green CI run
-did not examine it. In particular: **a Rust-test-only policy/NAT/HA
-regression is explicitly out of scope of the ordinary green gate** until
-the `test.yml:13` promotion lands. The gates that would catch it are
-`make test-rust` (suite output) and the cluster wire gates above
-(`test/results/ledger.d/` rows). Silence was the defect (#9052); a green
-run whose contract names what it did not examine is not a clean board.
+If it is not in the "What ordinary green CI runs" table, a green `CI tests`
+run did not examine it; `.github/workflows/close-keyword-lint.yml` also runs
+on every PR, but checks only PR text and commit messages. In particular: **a
+Rust-test-only policy/NAT/HA regression is explicitly out of scope of the
+ordinary green gate** until the workflow header's promotion note ("Keep the
+all-targets compile check until `cargo test --workspace` is green") is
+satisfied. Gates that can catch it include `make test-rust` (suite output)
+and the cluster wire gates above (`test/results/ledger.d/` rows). Silence was
+the defect (#9052); a green run whose contract names what it did not examine
+is not a clean board.

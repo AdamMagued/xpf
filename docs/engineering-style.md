@@ -464,15 +464,9 @@ the mechanics, so this section is sequencing only.
    push and request a re-review — both Copilot and Codex re-fire on the
    new HEAD.
 
-   **"Once CI is green" used to stand here, and there is no CI (#9052
-   item 3).** `.github/` contains only `instructions/`; the Makefile says
-   so twice in as many words — *"There is no CI in this repo, so this is a
-   developer convenience, not an automated gate: nothing runs it unless
-   invoked"*. So the written merge criterion was **vacuously satisfiable**:
-   a PR could satisfy the procedure with `make test` alone, and every gate
-   below is developer-invoked and chained from no default target. Naming
-   the gates is the fix; a criterion that cannot be unsatisfied is not a
-   criterion.
+   **CI exists but is advisory and does not run the Rust test suite** (see
+   [`ci-gate-contract.md`](ci-gate-contract.md); the table below remains the
+   merge criterion. Run the gates that apply to your diff.
 
    Run what your diff touches, not all of them every time:
 
