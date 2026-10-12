@@ -448,6 +448,9 @@ const (
 	// absent from ConfigSnapshot JSON. The changed rejection-reason string is
 	// diagnostic-only; Rust has no consumer for it, so no helper-visible
 	// behavior or snapshot wire shape changes.
+	// Master already had independent shape drift (golden b579834b, master
+	// 6daa3234), tracked by #12509. Fold that drift and this field into the v45
+	// golden below; do not blame the digest change solely on the base.
 	// v45 STANDS (#12185): BGPNeighbor.CrossFamilyInet is compiler-only
 	// state (`json:"-"`) used by the Go FRR renderer to suppress default AF
 	// activation for an IPv6 peer. ConfigSnapshot embeds Config, so this
@@ -456,9 +459,6 @@ const (
 	// for this field (grep userspace-dp/src returns no CrossFamilyInet use).
 	// No helper-visible behavior or wire shape changes; ProtocolVersion stays
 	// at 45. This is the same v45 STANDS arm used for #12288.
-	// Master already had independent shape drift (golden b579834b, master
-	// 6daa3234), tracked by #12509. Fold that drift and this field into the v45
-	// golden below; do not blame the digest change solely on the base.
 	// v44 -> v45 BUMPED (#11812): single-rate PolicerSnapshot adds optional
 	// marking-action and logical-interface-policer JSON fields. The keys are
 	// omitted by default and the current Rust runtime ignores them; warnings
