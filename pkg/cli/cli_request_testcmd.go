@@ -49,10 +49,10 @@ func (c *CLI) testPolicy(args []string) error {
 	// #3696: parse through the single strict SSOT selector parser shared by all
 	// four CLI surfaces + the gRPC test-policy bridge. A value-taking selector
 	// with no value, an unknown selector token, an explicit-empty typed value,
-	// and a malformed IP / port / protocol / icmp value are HARD ERRORS instead
-	// of silently degrading to the wildcard — the simulator answers the query
-	// the operator typed, not a broader one. Per-value validation (#3116 /
-	// #3108 / #3284 / #1711) now lives in the parser.
+	// and a malformed IP / port / protocol / ICMP value are hard errors; they
+	// cannot silently become an omitted (unspecified) selector. The simulator
+	// answers the query the operator typed, not a broader one. Per-value
+	// validation (#3116 / #3108 / #3284 / #1711) now lives in the parser.
 	sel, err := policymatch.ParseSelectorArgs(args)
 	if err != nil {
 		return err

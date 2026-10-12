@@ -748,20 +748,20 @@ func (s *Server) matchPoliciesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// #5316: reject an UNKNOWN / misspelled selector key (fail closed). The
-	// handler reads ONLY matchPoliciesSelectorKeys; any other key is never
-	// examined, so a typo such as `protcol` for `protocol` silently degrades
-	// that dimension to the wildcard-any default — q.Get("protocol") returns
-	// "" — and the shared simulator can certify a broad PERMIT for a packet
-	// class the caller never intended to test. That is a FAIL-OPEN on a
-	// security-verification endpoint. Enumerate every key the caller supplied
-	// and 400 any that is not in the selector allowlist, naming the offender.
+	// handler reads ONLY matchPoliciesSelectorKeys, so a typo such as `protcol`
+	// for `protocol` would otherwise silently become an omitted (unspecified)
+	// selector (`q.Get("protocol")` returns ""). The shared simulator may then
+	// report a broad PERMIT for a packet class the caller never intended to test.
+	// That is a FAIL-OPEN on a security-verification endpoint. Enumerate every
+	// key the caller supplied and 400 any that is not in the selector allowlist.
 	// The allowlist is the SAME slice the reads use, so adding a selector later
-	// cannot re-open the gap. Absent keys are unchanged: an unspecified
-	// dimension is still the intentional match-any wildcard — only UNKNOWN keys
-	// are rejected, not missing ones. Reached AFTER the duplicate check so a
-	// repeated known selector still surfaces its #3709 duplicate error, and
-	// (like the checks above) BEFORE the cfg == nil verdict so the boot window
-	// rejects an unknown key identically to the config-present path.
+	// cannot re-open the gap. Absent keys stay unspecified: an omitted IP matches
+	// any address, while an omitted protocol/port/ICMP value never matches a term
+	// constrained on it (#12227). Only UNKNOWN keys are rejected, not missing
+	// ones. Reached AFTER the duplicate check so a repeated known selector still
+	// surfaces its #3709 duplicate error, and (like the checks above) BEFORE the
+	// cfg == nil verdict so the boot window rejects an unknown key identically to
+	// the config-present path.
 	var unknown []string
 	for key := range q {
 		if !isMatchPoliciesSelector(key) {

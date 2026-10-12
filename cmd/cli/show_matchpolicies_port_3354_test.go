@@ -16,8 +16,8 @@ import (
 // too, returning an explicit error before any RPC.
 //
 // FAIL-ON-REVERT: restoring the inline `if v, err := strconv.Atoi(...); err ==
-// nil (no error) and silently left the field unspecified, turning the assertions
-// red.
+// nil` drop makes these want-error cases return nil (no error) and silently
+// leave the field unspecified, turning the assertions red.
 func TestShowMatchPoliciesRejectsInvalidPort(t *testing.T) {
 	cases := []struct {
 		name string

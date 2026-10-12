@@ -43,3 +43,29 @@ func TestShowMatchPoliciesUsageAdvertisesSelectors(t *testing.T) {
 		}
 	}
 }
+
+// TestTestPolicyUsageAdvertisesSelectors pins the local CLI `test policy`
+// usage path. Use a committed config so testPolicy reaches its missing-zone
+// usage branch instead of returning "No active configuration".
+func TestTestPolicyUsageAdvertisesSelectors(t *testing.T) {
+	c := newPolicyMatchCLIStore(t)
+	out := captureStdout(t, func() {
+		if err := c.testPolicy(nil); err != nil {
+			t.Fatalf("testPolicy: %v", err)
+		}
+	})
+	if !strings.Contains(out, "usage: test policy") {
+		t.Fatalf("test policy did not print its usage block:\n%s", out)
+	}
+	for _, tok := range []string{
+		"omitted source/destination IP matches", "any address.",
+		"An omitted protocol, port, or icmp-type/code never matches",
+		"a term constrained on that dimension; unconstrained terms may match.",
+		"A verdict for a partly specified query is not exhaustive — a skipped",
+		"deny can let a later permit match.",
+	} {
+		if !strings.Contains(out, tok) {
+			t.Fatalf("test policy usage missing %q:\n%s", tok, out)
+		}
+	}
+}

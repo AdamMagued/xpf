@@ -53,7 +53,7 @@ close this across every surface:
   `port=` token, and the remote `cli` client's `destination-port`/`source-port`
   — the remote surface was fixed in #3354 to route through `ParsePort` instead
   of a silent `strconv.Atoi` drop that coerced a malformed port to the `0`
-  unspecified value). An empty/whitespace token is unspecified `(0, nil);`
+  unspecified value). An empty/whitespace token is unspecified `(0, nil)`;
   a port-constrained term never matches without a port, while unconstrained
   terms may still match. A non-empty token must parse and pass `ValidatePort`;
   a malformed (`abc`), signed (`+80`/`-80`, #3679), or out-of-range token is

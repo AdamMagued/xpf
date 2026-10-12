@@ -198,6 +198,7 @@ func (s *Server) MatchPolicies(_ context.Context, req *pb.MatchPoliciesRequest) 
 	// shared matcher as an omitted port, so constrained terms never match while
 	// unconstrained terms may still match, yielding a misleading verdict (#3116).
 	// 0 is also unspecified (constrained terms do not match); proto3 cannot
+	// distinguish an unset scalar from 0.
 	if err := policymatch.ValidatePort(int(req.SourcePort)); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "invalid source-port: %v", err)
 	}

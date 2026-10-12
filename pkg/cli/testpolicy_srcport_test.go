@@ -56,8 +56,8 @@ security {
 //   - correct source-port 5000 (and dest 80) -> Policy match (permit)
 //   - wrong source-port 6000                  -> Default deny
 //   - absent source-port                      -> Default deny (#3415): an
-//     omitted query source port fails closed against a source-port-constrained
-//     app, since the runtime always carries a concrete source port and would
+//     omitted query source port never matches a source-port-constrained app,
+//     since the runtime always carries a concrete source port and would
 //     not match a packet whose source port differs from the app's `source-port`
 //     (supersedes #3107's earlier "absent matches" stance).
 //

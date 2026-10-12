@@ -326,9 +326,9 @@ func (s *Server) showTestPolicy(req *pb.ShowTextRequest, cfg *config.Config, buf
 	case parseErr != nil:
 		// #3696: report malformed grammar (a segment lacking key=value, an
 		// unknown key, or an explicit-empty typed value) before evaluating, so a
-		// typo cannot silently widen the query. Checked before the from/to-zone
-		// diagnostic so a malformed selector is not masked by a legit-looking
-		// missing-zone message.
+		// typo cannot silently become an omitted (unspecified) selector. Checked
+		// before the from/to-zone diagnostic so malformed input is not masked by
+		// a legit-looking missing-zone message.
 		fmt.Fprintf(buf, "%v\n", parseErr)
 	case fromZone == "" || toZone == "":
 		buf.WriteString("Missing from/to zone parameters\n")

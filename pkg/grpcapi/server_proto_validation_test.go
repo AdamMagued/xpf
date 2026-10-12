@@ -32,7 +32,7 @@ func TestMatchPoliciesRejectsInvalidProtocol(t *testing.T) {
 		{"out of range", "999", true},
 		{"valid name", "tcp", false},
 		{"valid number", "6", false},
-		{"absent wildcard", "", false},
+		{"absent unspecified", "", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

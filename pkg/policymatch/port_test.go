@@ -36,6 +36,7 @@ func TestValidatePort(t *testing.T) {
 // parses, and an explicit "0" is also unspecified. A constrained term does not
 // match without a port, while an unconstrained term may still match. A malformed,
 // negative, or out-of-range token is REJECTED rather than silently becoming 0.
+//
 // FAIL-ON-REVERT: restoring `dstPort, _ = strconv.Atoi(token)` (ignoring the
 // error) makes "abc" and "" both become 0 with no error, flipping the want-error
 // "abc"/"70000"/"-1" cases red.

@@ -261,7 +261,7 @@ func TestRESTPolicyMatchProtocol(t *testing.T) {
 		{"out of range", base + "&protocol=999", 400},
 		{"valid name", base + "&protocol=tcp", 200},
 		{"valid number", base + "&protocol=6", 200},
-		{"absent wildcard", base, 200},
+		{"absent unspecified", base, 200},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

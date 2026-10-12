@@ -233,9 +233,9 @@ func ParsePort(s string) (int, error) {
 // terms may still match. A non-empty token must be a canonical unsigned decimal
 // in [0, 255] (the 8-bit ICMP type/code space); a malformed, signed
 // ("+8"/"-8", #3679), or >255 token is REJECTED with an error so it can never
-// silently degrade to the nil unspecified value. The pointer return distinguishes
-// "unspecified" from a valid 0 (ICMP type 0 =
-// echo-reply, code 0 is common).
+// silently degrade to the nil unspecified value. The pointer return
+// distinguishes "unspecified" from a valid 0 (ICMP type 0 = echo-reply; code
+// 0 is common).
 //
 // #3679: like ParsePort, this diagnostic parser routes through
 // config.ParseCanonicalUint so a signed spelling (Atoi accepted "+8" as
@@ -320,7 +320,7 @@ const matchPoliciesUsageTail = ` from-zone <zone> to-zone <zone>
        A verdict for a partly specified query is not exhaustive — a skipped
        deny can let a later permit match.
        an unknown selector, or a selector given without a value, is an error
-       (the query is not silently widened to match traffic you did not type).
+       (it is not silently dropped and treated as a partly specified query).
        non-first-fragment is the only valueless selector; it makes the simulator
        reproduce the dataplane's fragment-associated deny (a port-bearing deny the
        first fragment would hit denies the fragment too).

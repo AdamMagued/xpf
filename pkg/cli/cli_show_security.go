@@ -536,14 +536,12 @@ func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
 
 	// #3696: parse the selector grammar through the single strict SSOT parser
 	// (policymatch.ParseSelectorArgs) shared by all four CLI surfaces + the gRPC
-	// test-policy bridge. A value-taking selector present WITHOUT a value, an
-	// UNKNOWN selector token, an explicit-empty typed value, and a malformed
-	// IP / port / protocol / icmp value are all HARD ERRORS instead of silently
-	// degrading to the wildcard — a firewall policy simulator must answer the
-	// query the operator typed, not a broader one. The per-value validation
-	// (ParsePort / ParseICMPValue / ValidateProtocol / net.ParseIP, #3116 /
-	// #3108 / #3284 / #1711) is folded into the parser, so the redundant
-	// per-surface checks are gone.
+	// test-policy bridge. A value-taking selector with no value, an unknown
+	// selector token, an explicit-empty typed value, and a malformed IP / port /
+	// protocol / ICMP value are hard errors; they cannot silently become an
+	// omitted (unspecified) selector. The simulator answers the query the
+	// operator typed, not a broader one. Per-value validation (#3116 / #3108 /
+	// #3284 / #1711) lives in the parser, so per-surface checks are unnecessary.
 	sel, err := policymatch.ParseSelectorArgs(args)
 	if err != nil {
 		return err
