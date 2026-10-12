@@ -120,6 +120,12 @@ fn nat64_build_none_attributes_exthdr_before_fragment_6922() {
     decision.nat.nat64 = true;
     let mut request = test_live_forward_request_for_frame(frame.len(), decision);
     request.meta.addr_family = libc::AF_INET6 as u8;
+    // #12268: stamp the wire L3 addrs into meta — the XDP shim does this in
+    // production; zeroed meta reads as `::` and trips the #11074
+    // source-martian backstop before the NAT64 copy-fallback builder runs.
+    // Same pattern as nat64_fragment_11353.rs.
+    request.meta.flow_src_addr.copy_from_slice(&frame[22..38]);
+    request.meta.flow_dst_addr.copy_from_slice(&frame[38..54]);
     let mut pending = vec![request];
 
     let mut post_recycles = Vec::new();
@@ -323,6 +329,9 @@ fn nat64_tunnel_marked_build_none_attributes_tunnel_first_8890() {
 
     let mut request = test_live_forward_request_for_frame(frame.len(), decision);
     request.meta.addr_family = libc::AF_INET6 as u8;
+    // #12268: stamp wire addrs into meta (see the #6922 cell above).
+    request.meta.flow_src_addr.copy_from_slice(&frame[22..38]);
+    request.meta.flow_dst_addr.copy_from_slice(&frame[38..54]);
     let mut pending = vec![request];
 
     let mut post_recycles = Vec::new();
@@ -473,6 +482,10 @@ fn run_nat64_dispatch_8890(frame: &[u8], tunnel_endpoint_id: u16) -> (DebugPollC
 
     let mut request = test_live_forward_request_for_frame(frame.len(), decision);
     request.meta.addr_family = libc::AF_INET6 as u8;
+    // #12268: stamp wire addrs into meta (see the #6922 cell above), or the
+    // untunnelled control never reaches TX and the gate cell is vacuous.
+    request.meta.flow_src_addr.copy_from_slice(&frame[22..38]);
+    request.meta.flow_dst_addr.copy_from_slice(&frame[38..54]);
     let mut pending = vec![request];
 
     let mut post_recycles = Vec::new();

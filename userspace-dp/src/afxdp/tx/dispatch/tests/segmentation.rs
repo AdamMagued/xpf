@@ -668,6 +668,11 @@ fn segmentation_pat_translation_survives_expected_ports_9782() {
     };
     let mut req = test_live_forward_request_for_frame(frame.len(), decision);
     req.expected_ports = Some((src_port, dst_port));
+    // #12268: stamp the hand-rolled frame's wire L3 addrs into meta — the XDP
+    // shim does this in production; zeroed meta reads as 0.0.0.0 and trips
+    // the #11074 source-martian backstop before segmentation runs.
+    req.meta.flow_src_addr[..4].copy_from_slice(&frame[26..30]);
+    req.meta.flow_dst_addr[..4].copy_from_slice(&frame[30..34]);
     let mut pending = vec![req];
     let mut post_recycles = Vec::new();
     let ingress_ident = bindings[0].identity();
