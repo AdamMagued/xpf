@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/fsatomic"
@@ -628,13 +629,15 @@ func (r *Runner) Run(opts Options) (err error) {
 		// A resumed cut is the same argument with a crash in place of a verify
 		// failure.
 		//
-		// The STOPPED floor is load-bearing, not caution. From STOPPED onward
-		// the daemon is DOWN, so no commit can land and there is nothing to
-		// re-capture; and re-snapshotting at FLIPPED would be actively WRONG --
-		// versions/current already points at the new binary, which may have
-		// started and migrated the DB envelope, so the "pre-upgrade" snapshot
-		// would capture POST-upgrade state and defeat rollback entirely. The
-		// exposure is exactly State in {PREFLIGHT, COPIED, VERIFIED}.
+		// This preflight-resume snapshot is intentionally limited to
+		// PREFLIGHT/COPY/VERIFY: STOPPED is the cut boundary, and once FLIP
+		// repoints versions/current the new daemon may already have migrated
+		// the DB. The STOPPED-resume path below resolves current plus systemd's
+		// loaded ExecStart and running MainPID executable: in non-contradictory
+		// combinations it keeps the unit stopped, refreshes the snapshot when
+		// current still names PreviousVersion or either execution signal names
+		// PreviousVersion (even when current already names the target), and
+		// preserves the original snapshot otherwise.
 		if err := r.snapshotConfigDB(j); err != nil {
 			return fmt.Errorf("resume: re-snapshot config DB: %w", err)
 		}
@@ -776,6 +779,7 @@ func (r *Runner) Run(opts Options) (err error) {
 			}
 		}
 	}
+	resumingStopped := j.State == StateStopped
 	// ---- STOP + CUT-BOUNDARY DB SNAPSHOT (live mutation #1) ----
 	//
 	// PREFLIGHT, COPY and VERIFY all run while the old daemon is live, so a
@@ -812,6 +816,118 @@ func (r *Runner) Run(opts Options) (err error) {
 		r.logf("upgrade: captured cut-boundary config-DB snapshot after STOP")
 		if err := r.transition(j, StateStopped); err != nil {
 			return err
+		}
+	}
+	// STOPPED is durable before FLIP, but it is not proof that the daemon
+	// stayed down across an interruption: an enabled old unit may start again
+	// on reboot or by an external restart. Resolve current, systemd's loaded
+	// ExecStart, and the running MainPID executable. A daemon-reload changes
+	// loaded ExecStart but does not replace an already-running old daemon.
+	// Either old signal requires a fresh snapshot; target execution means the
+	// target may have migrated DB and the original snapshot must be preserved.
+	if resumingStopped {
+		currentVersion, err := r.readCurrentVersion()
+		if err != nil {
+			return fmt.Errorf("resume STOPPED: read current version: %w", err)
+		}
+		execStartVersion, runningVersion, err := r.stoppedResumeExecutionVersions(j)
+		if err != nil {
+			return err
+		}
+		if opts.UnitAlreadyStopped && runningVersion != "" {
+			return fmt.Errorf("resume STOPPED: caller marked unit already stopped but MainPID still runs %s; verify it is inactive before retrying",
+				runningVersion)
+		}
+
+		stoppedByResume := false
+		restorePreviousExecStartBeforeRestart := false
+		stopForResume := func() error {
+			if opts.UnitAlreadyStopped {
+				return nil
+			}
+			r.logf("upgrade: re-stopping %s on STOPPED resume before flip", r.cfg.Unit)
+			if err := r.cfg.Sys.StopUnit(r.cfg.Unit); err != nil {
+				return fmt.Errorf("resume STOPPED: stop unit before flip: %w", err)
+			}
+			stoppedByResume = true
+			return nil
+		}
+		restartOldAfterSnapshotFailure := func(cause error) error {
+			if !stoppedByResume {
+				return cause
+			}
+			if restorePreviousExecStartBeforeRestart {
+				if err := r.writeUnitDropin(j.PreviousVersion); err != nil {
+					return fmt.Errorf("%w; old ExecStart restore failed and unit remains stopped: %v",
+						cause, err)
+				}
+				if err := r.cfg.Sys.DaemonReload(); err != nil {
+					return fmt.Errorf("%w; old ExecStart reload failed and unit remains stopped: %v",
+						cause, err)
+				}
+			}
+			if err := r.cfg.Sys.StartUnit(r.cfg.Unit); err != nil {
+				return fmt.Errorf("%w; restart old daemon after STOPPED-resume snapshot failure: %v",
+					cause, err)
+			}
+			r.logf("upgrade: restarted old daemon after STOPPED-resume snapshot failure")
+			return cause
+		}
+		refreshSnapshot := func() error {
+			if err := r.snapshotConfigDB(j); err != nil {
+				return restartOldAfterSnapshotFailure(
+					fmt.Errorf("resume STOPPED: fresh cut-boundary snapshot config DB: %w", err))
+			}
+			if err := r.saveJournal(j); err != nil {
+				return restartOldAfterSnapshotFailure(
+					fmt.Errorf("resume STOPPED: persist fresh cut-boundary snapshot: %w", err))
+			}
+			r.logf("upgrade: refreshed the cut-boundary config-DB snapshot after ensuring the unit is stopped")
+			return nil
+		}
+
+		switch {
+		case currentVersion == j.PreviousVersion:
+			if j.TargetVersion != j.PreviousVersion &&
+				(execStartVersion == j.TargetVersion || runningVersion == j.TargetVersion) {
+				return fmt.Errorf("resume STOPPED: versions/current names previous version %q but unit execution names target %q; inspect the journal and unit state, restore a known-good runtime, then retry without deleting the journal or snapshot",
+					currentVersion, j.TargetVersion)
+			}
+			if err := stopForResume(); err != nil {
+				return err
+			}
+			if err := refreshSnapshot(); err != nil {
+				return err
+			}
+		case currentVersion == j.TargetVersion:
+			if j.PreviousVersion != j.TargetVersion &&
+				execStartVersion == j.PreviousVersion && runningVersion == j.TargetVersion {
+				return fmt.Errorf("resume STOPPED: current and running executable name target %q but loaded ExecStart still pins previous %q; inspect the journal and unit state, restore a known-good runtime, then retry without deleting the journal or snapshot",
+					j.TargetVersion, j.PreviousVersion)
+			}
+			if j.PreviousVersion != j.TargetVersion &&
+				(execStartVersion == j.PreviousVersion || runningVersion == j.PreviousVersion) {
+				r.logf("upgrade: current names target %s but the loaded or running unit still uses previous %s; refreshing the cut-boundary snapshot",
+					j.TargetVersion, j.PreviousVersion)
+				restorePreviousExecStartBeforeRestart =
+					runningVersion == j.PreviousVersion && execStartVersion != j.PreviousVersion
+				if err := stopForResume(); err != nil {
+					return err
+				}
+				if err := refreshSnapshot(); err != nil {
+					return err
+				}
+			} else {
+				// FLIP may have completed substeps before the interruption.
+				// Preserve the original rollback snapshot because the target
+				// may already have migrated the DB.
+				if err := stopForResume(); err != nil {
+					return fmt.Errorf("resume STOPPED after FLIP began: %w", err)
+				}
+			}
+		default:
+			return fmt.Errorf("resume STOPPED: current version %q is neither recorded previous version %q nor target version %q; inspect versions/current and the loaded unit ExecStart, restore a known-good runtime, then retry without deleting the journal or snapshot",
+				currentVersion, j.PreviousVersion, j.TargetVersion)
 		}
 	}
 
@@ -901,6 +1017,56 @@ func (r *Runner) Run(opts Options) (err error) {
 	}
 	r.recordCommittedCut(j.TargetVersion)
 	return nil
+}
+
+// stoppedResumeExecutionVersions resolves both the version systemd currently
+// has loaded for ExecStart and the executable of its MainPID. The on-disk
+// drop-in alone is insufficient: flip writes it before DaemonReload, and a
+// successful reload still does not replace a previously running process.
+// The base unit's sbin path follows the managed current symlink and returns
+// an empty loaded version; an inactive unit returns an empty running version.
+func (r *Runner) stoppedResumeExecutionVersions(j *Journal) (string, string, error) {
+	value, err := r.cfg.Sys.UnitExecStart(r.cfg.Unit)
+	if err != nil {
+		return "", "", fmt.Errorf("resume STOPPED: read loaded unit ExecStart: %w", err)
+	}
+	value = strings.TrimSpace(value)
+	if value == "" || strings.Contains(value, "\n") {
+		return "", "", fmt.Errorf("resume STOPPED: loaded unit ExecStart %q is empty or ambiguous; inspect the unit and restore a known-good runtime before retrying",
+			value)
+	}
+	matchesLoaded := func(binary string) bool {
+		prefix := fmt.Sprintf("{ path=%s ; argv[]=%s ;", binary, binary)
+		return strings.HasPrefix(value, prefix)
+	}
+	loadedVersion := ""
+	switch {
+	case j.PreviousVersion != "" && matchesLoaded(filepath.Join(r.versionDir(j.PreviousVersion), "xpfd")):
+		loadedVersion = j.PreviousVersion
+	case j.TargetVersion != "" && matchesLoaded(filepath.Join(r.versionDir(j.TargetVersion), "xpfd")):
+		loadedVersion = j.TargetVersion
+	case matchesLoaded(filepath.Join(r.cfg.SbinDir, "xpfd")):
+	default:
+		return "", "", fmt.Errorf("resume STOPPED: loaded unit ExecStart %q matches neither recorded previous version %q, target version %q, nor the managed sbin path; inspect the unit and restore a known-good runtime before retrying",
+			value, j.PreviousVersion, j.TargetVersion)
+	}
+
+	runningExe, err := r.cfg.Sys.RunningUnitExe(r.cfg.Unit)
+	if err != nil {
+		return "", "", fmt.Errorf("resume STOPPED: resolve running unit executable: %w", err)
+	}
+	runningVersion := ""
+	switch {
+	case runningExe == "":
+	case j.PreviousVersion != "" && runningExe == filepath.Join(r.versionDir(j.PreviousVersion), "xpfd"):
+		runningVersion = j.PreviousVersion
+	case j.TargetVersion != "" && runningExe == filepath.Join(r.versionDir(j.TargetVersion), "xpfd"):
+		runningVersion = j.TargetVersion
+	default:
+		return "", "", fmt.Errorf("resume STOPPED: running unit executable %q matches neither recorded previous version %q nor target version %q; inspect the unit and restore a known-good runtime before retrying",
+			runningExe, j.PreviousVersion, j.TargetVersion)
+	}
+	return loadedVersion, runningVersion, nil
 }
 
 // versionDirComplete reports a diagnostic error if the flipped-in version

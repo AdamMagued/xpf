@@ -24,8 +24,12 @@ type fakeSystem struct {
 
 	// unitRunning models systemd state.
 	unitRunning bool
-	// dropinContent is the last drop-in written.
-	dropinContent string
+	// dropinContent is the last drop-in written to disk; loadedExecStart models
+	// systemd's effective configuration, which changes only after daemon-reload.
+	dropinContent   string
+	baseExecStart   string
+	loadedExecStart string
+	runningUnitExe  string
 	// daemonReloaded counts daemon-reload calls.
 	daemonReloaded int
 
@@ -90,6 +94,24 @@ func newFakeSystem(t *testing.T, ver string) *fakeSystem {
 	}
 }
 
+func fakeSystemdExecStart(path string) string {
+	return fmt.Sprintf("{ path=%s ; argv[]=%s ; ignore_errors=no }", path, path)
+}
+
+func fakeSystemdExecPath(value string) string {
+	const prefix = "{ path="
+	const delimiter = " ; argv[]="
+	if !strings.HasPrefix(value, prefix) {
+		return ""
+	}
+	value = strings.TrimPrefix(value, prefix)
+	end := strings.Index(value, delimiter)
+	if end < 0 {
+		return ""
+	}
+	return value[:end]
+}
+
 func (f *fakeSystem) log(s string) { f.calls = append(f.calls, s) }
 func (f *fakeSystem) StopUnit(string) error {
 	f.log("stop")
@@ -99,6 +121,7 @@ func (f *fakeSystem) StopUnit(string) error {
 		hook()
 	}
 	f.unitRunning = false
+	f.runningUnitExe = ""
 	return nil
 }
 func (f *fakeSystem) StartUnit(string) error {
@@ -108,6 +131,9 @@ func (f *fakeSystem) StartUnit(string) error {
 	if f.startFailOnce {
 		f.startFailOnce = false
 		return fmt.Errorf("synthetic start failure")
+	}
+	if !f.unitRunning {
+		f.runningUnitExe = fakeSystemdExecPath(f.loadedExecStart)
 	}
 	f.unitRunning = true
 	return nil
@@ -119,6 +145,18 @@ func (f *fakeSystem) DaemonReload() error {
 		return fmt.Errorf("synthetic daemon-reload failure")
 	}
 	f.daemonReloaded++
+	path := f.baseExecStart
+	if f.dropinContent != "" {
+		for _, line := range strings.Split(f.dropinContent, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "ExecStart=" {
+				path = ""
+			} else if strings.HasPrefix(line, "ExecStart=") {
+				path = strings.TrimSpace(strings.TrimPrefix(line, "ExecStart="))
+			}
+		}
+	}
+	f.loadedExecStart = fakeSystemdExecStart(path)
 	return nil
 }
 func (f *fakeSystem) FreeBytes(string) (uint64, error) {
@@ -128,6 +166,19 @@ func (f *fakeSystem) WriteUnitDropin(_, _, content string) error {
 	f.log("dropin")
 	f.dropinContent = content
 	return nil
+}
+
+func (f *fakeSystem) UnitExecStart(string) (string, error) {
+	f.log("execstart")
+	return f.loadedExecStart, nil
+}
+
+func (f *fakeSystem) RunningUnitExe(string) (string, error) {
+	f.log("running-exe")
+	if !f.unitRunning {
+		return "", nil
+	}
+	return f.runningUnitExe, nil
 }
 func (f *fakeSystem) VerifyDataplane(string, []string) (bool, error) {
 	f.log("verify")
@@ -195,6 +246,9 @@ func testEnv(t *testing.T, fs *fakeSystem) (*Runner, Config) {
 		Sys:                 fs,
 		Logf:                func(format string, a ...any) { t.Logf("LOG "+format, a...) },
 	}
+	fs.baseExecStart = filepath.Join(cfg.SbinDir, "xpfd")
+	fs.loadedExecStart = fakeSystemdExecStart(fs.baseExecStart)
+	fs.runningUnitExe = fs.baseExecStart
 	r, err := NewRunner(cfg)
 	if err != nil {
 		t.Fatal(err)
