@@ -250,6 +250,7 @@ func Build(
 				fs.LastExitWasCrash = rec.LastExitWasCrash
 				fs.RestartPending = rec.RestartPending
 				fs.HelperCrashLooping = rec.CrashLooping()
+				fs.HelperRecovered = rec.RecoveredSinceCrash
 				fs.HelperExitCode = rec.ExitCode
 				fs.HelperSignal = rec.Signal
 				fs.HelperExitDetail = rec.Detail

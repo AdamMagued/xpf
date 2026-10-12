@@ -277,7 +277,14 @@ func (d *Daemon) markDataplaneArmed(stage string) {
 	kernelReady := d.attachedXDPLinks() > 0
 	helperRunning, crashLooping := d.helperSupervisorState()
 	opened := d.writeTransitGateLocked(stage, kernelReady && helperRunning)
-	d.applyTransitElectionDebt(kernelReady && (!helperRunning || opened), crashLooping)
+	// F2: a dead non-looping helper must not wipe a fenced arm debt (the
+	// old `!helperRunning || opened` disjunct reported dataplaneReady=true
+	// whenever the helper was down — fail-open). Preserve the arm bit.
+	if !helperRunning && !crashLooping {
+		d.applyTransitElectionDebtKeepArm(false, false, true)
+	} else {
+		d.applyTransitElectionDebt(kernelReady && opened, crashLooping)
+	}
 	d.transitGateMu.Unlock()
 	slog.Info("dataplane armed; transit gate re-evaluated", "stage", stage,
 		"kernel_transit_open", opened)

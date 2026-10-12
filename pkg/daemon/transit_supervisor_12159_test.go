@@ -174,9 +174,7 @@ func TestHelperCrashGateAndElectionDebt12159(t *testing.T) {
 			cm.SetRGReady(1, true, nil)
 			rt.setSupervisorState(true, false)
 			waitTransitKnobs9725(t, v4, v6, "1")
-			if got := rgWeight12159(cm, 1); got != 255 {
-				t.Fatalf("post-loop recovered weight = %d, want 255", got)
-			}
+			pollRGWeight12159(t, cm, 1, 255, "post-loop recovered weight")
 		})
 	}
 }

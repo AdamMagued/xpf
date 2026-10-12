@@ -101,6 +101,12 @@ type ForwardingStatus struct {
 	// restart deadline without this.
 	RestartPending bool
 
+	// HelperRecovered reports that a supervisor retry LANDED while episode
+	// debt is still on the books: the helper is RUNNING, but LastExitWasCrash
+	// is still true and Restarts still counts the episode. Renders as
+	// "recovered", never "stopped" (NM-3).
+	HelperRecovered bool
+
 	// HelperCrashLooping is HelperCrashRecord.CrashLooping() — backoff at the
 	// cap, not a restart count. Read as "this helper is not coming back".
 	HelperCrashLooping bool
@@ -277,8 +283,11 @@ func writeHelperCrash(b *strings.Builder, fs *ForwardingStatus) {
 		return
 	}
 
-	// FOUR NAMED STATES over (RestartPending x HelperCrashLooping), not a
-	// crash-looping boolean with qualifiers.
+	// FIVE NAMED STATES: the four below over (RestartPending x
+	// HelperCrashLooping), plus RECOVERED — a retry landed while episode
+	// debt is still on the books. Recovered is checked FIRST: the helper
+	// is RUNNING, and rendering LastExitWasCrash as "stopped" would lie
+	// about a live process (NM-3).
 	//
 	// CrashLooping() stays true after an intentional stop — LastExitWasCrash
 	// survives a stop because the retry path reads it as debt, and Restarts
@@ -293,6 +302,8 @@ func writeHelperCrash(b *strings.Builder, fs *ForwardingStatus) {
 	// firewallEffectiveLiveness, whose third arm carries an explicit reason
 	// instead of a flag.
 	switch {
+	case fs.HelperRecovered:
+		writeRow(b, "Helper", "recovered — running after a crash, episode debt still on record")
 	case fs.RestartPending && fs.HelperCrashLooping:
 		writeRow(b, "Helper", "CRASH LOOPING — retrying at the backoff maximum")
 	case fs.RestartPending:

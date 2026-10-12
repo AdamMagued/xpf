@@ -69,20 +69,23 @@ type HelperCrashEpisode struct {
 	// Restarts is how many restart ATTEMPTS the episode took before the helper
 	// reached readiness again.
 	Restarts int
-	// RecoveredAt is when the replacement helper reached readiness, closing the
-	// episode. Never zero: an episode is only appended once it has recovered,
-	// which is the one moment the live record is about to be destroyed.
+	// RecoveredAt is when the replacement helper reached readiness. The
+	// episode may be journaled after its quiet window expires.
 	RecoveredAt time.Time
 }
 
-// recordRecoveredCrashEpisodeLocked appends the episode that is about to be
-// wiped. Called from restartHelperAfterCrash immediately BEFORE
-// `m.helperCrash = HelperCrashRecord{}` — that clear is the only point at which
-// an episode is known to have ended in recovery, which is why the append lives
-// there and not at the crash.
+// recordRecoveredCrashEpisodeLocked appends an episode before its live record
+// is discarded. It runs after a quiet gap closes an episode with a landed
+// retry, or when a generation-advancing Compile proves recovery. `now` is the
+// Compile recovery time or quiet-gap detection time; a supervisor retry's
+// recorded ready time takes precedence when available.
 //
 // Caller must hold m.mu.
 func (m *Manager) recordRecoveredCrashEpisodeLocked(now time.Time) {
+	recoveredAt := m.helperCrash.RecoveredAt
+	if recoveredAt.IsZero() {
+		recoveredAt = now
+	}
 	ep := HelperCrashEpisode{
 		At:          m.helperCrash.At,
 		ExitCode:    m.helperCrash.ExitCode,
@@ -90,7 +93,7 @@ func (m *Manager) recordRecoveredCrashEpisodeLocked(now time.Time) {
 		Detail:      m.helperCrash.Detail,
 		PID:         m.helperCrash.PID,
 		Restarts:    m.helperCrash.Restarts,
-		RecoveredAt: now,
+		RecoveredAt: recoveredAt,
 	}
 	m.helperCrashEpisodes = append(m.helperCrashEpisodes, ep)
 	if len(m.helperCrashEpisodes) > helperCrashHistoryDepth {

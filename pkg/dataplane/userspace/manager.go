@@ -157,10 +157,9 @@ type Manager struct {
 	// helperCrash records the last UNEXPECTED helper exit for the operator and
 	// drives the restart backoff. Zero value means "no crash on record".
 	helperCrash HelperCrashRecord
-	// helperCrashStreak counts unexpected exits across ping-ready restarts. It
-	// is reset only after a quiet crash window or a successful ordinary Compile
-	// bring-up; ping-ready alone is not evidence that the helper is stable.
-	helperCrashStreak int
+	// helperCrashLastAt anchors the quiet window between unexpected exits.
+	// The status loop closes a recovered episode after >2x max backoff; a
+	// later exit also applies the reset before counting itself.
 	helperCrashLastAt time.Time
 	// restartAttemptInProgress distinguishes a supervisor retry from ordinary
 	// Compile bring-up, which is allowed to end a prior crash episode.

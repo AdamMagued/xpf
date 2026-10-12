@@ -684,18 +684,21 @@ would blackhole every flow handed to it.
 
 - **Named crash-loop state (#7250, #12159).** `HelperCrashRecord.CrashLooping()`
   is the predicate an operator, health surface, or the daemon's HA gate can
-  read as "this helper is not coming back". It is **backoff at the cap**, not
-  a raw restart count: a count is time-blind, and twenty restarts over a week
-  and twenty in a minute are different situations. With the shipped 1s base
-  and 60s cap it trips at seven consecutive attempts. The daemon's
-  `HelperSupervisorState` only treats it as election debt while the retry is
-  still armed; an intentional stop or cancelled retry does not resign an RG.
+  read as "this helper is not coming back". It is **backoff at the cap** within
+  one crash episode, not a lifetime restart count: a quiet interval longer than
+  twice the maximum backoff resets the consecutive-attempt count. With the
+  shipped 1s base and 60s cap it trips at seven consecutive attempts and clears
+  after more than 120s without another unexpected exit. `HelperSupervisorState`
+  treats it as election debt only while the helper is down and the retry is
+  still fenced to the current generation; an intentional stop does not resign.
 - **HA response (#12159).** Supervisor death wakes the daemon transit gate,
   which closes while the helper is down even though the xpfd-owned XDP shim is
   still attached. A fast restart reopens transit without changing RG weight.
-  When the restart backoff reaches its cap, a dedicated full-cost monitor debt
+  When restart backoff reaches its cap, a dedicated full-cost monitor debt
   takes the local RG weight to 0 so even a non-preempt incumbent yields. A
-  successful helper recovery clears that debt.
+  landed supervisor retry clears live HA debt while its episode record remains
+  visible until the quiet window expires; ordinary Compile recovery closes the
+  episode immediately.
 - **Operator surface (#7250).** `show chassis forwarding` renders the
   crash block, via `pkg/fwdstatus` so the in-process CLI and the remote
   `cli` binary share one implementation. It was chosen over the other
@@ -708,29 +711,33 @@ would blackhole every flow handed to it.
 
   Three properties of that render are load-bearing:
 
-  - It is **silent when there is nothing to report**. A successful
-    restart assigns a fresh `HelperCrashRecord{}`, so a recovered helper
-    holds the zero value and there is no episode to describe. It follows
-    that the surface describes the **current** crash episode, never a
-    history — once the helper recovers, the exit that preceded it is
-    gone from the record.
+  - It is **silent when there is nothing to report**. Ordinary Compile
+    recovery ends the current episode and journals it. A supervisor retry
+    instead retains the open episode record and marks the helper as running;
+    the headline says "recovered — running after a crash" until the episode
+    closes at the quiet-window or Compile boundary. The existing periodic
+    status loop journals and clears it after quiet expiry even if no later
+    crash occurs; a new exit that observes expiry first closes the prior
+    episode before counting the next. The journal uses the actual readiness
+    time and needs no extra timer. The surface reports the current open episode,
+    while #8397 history remains available separately.
   - `ForwardingStatus.HelperCrashKnown` gates every field, and is **not**
     redundant with `LastExitWasCrash`. A zero `HelperCrashRecord` is
     byte-identical to a healthy one, and `ExitCode: 0` satisfies the
     `ExitCode >= 0` discriminator, so a renderer keyed on the record
     alone prints "exit code 0" for a helper that never crashed. Same
     discipline as `BufferKnown` beside `BufferPercent`.
-  - The headline is one of **four named states** over
-    (`RestartPending` x `CrashLooping()`), and **`RestartPending` picks
-    it**. `CrashLooping()` stays true after an intentional stop —
-    `LastExitWasCrash` survives a stop by design and `Restarts` survives
-    with it — so a helper that is merely stopped is headlined
-    **"stopped — after a crash loop"**, with the loop history as
-    subordinate detail. An operator reads the first line and acts on it,
-    and "CRASH LOOPING" on a stopped helper sends them hunting a crash
-    that is not currently happening. Same shape as
-    `firewallEffectiveLiveness`, whose third arm carries an explicit
-    reason rather than a flag.
+  - The headline has **five named states**: four combinations of
+  (`RestartPending` x `CrashLooping()`), plus a recovered-running state.
+  The recovered state is checked first so a live retry is never rendered as
+  stopped. For the other four states, `RestartPending` picks the headline.
+  `CrashLooping()` can remain true after an intentional stop — `LastExitWasCrash`
+  and `Restarts` remain in the episode record — so the stopped helper is
+  headlined **"stopped — after a crash loop"** with loop history as subordinate
+  detail. An operator reads the first line and acts on it, and "CRASH LOOPING"
+  on a stopped helper sends them hunting a crash that is not currently
+  happening. Same shape as `firewallEffectiveLiveness`, whose third arm carries
+  an explicit reason rather than a flag.
   - The crash-loop **reason** is **derived, not stored**.
     `CrashLooping()` is
     `LastExitWasCrash && helperRestartDelay(Restarts) >= helperRestartBackoffMax`,

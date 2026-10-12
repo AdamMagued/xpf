@@ -33,13 +33,9 @@ if n % 6 == 1:
 os._exit(3)
 `
 
-func runCrashWindowCadence12159(t *testing.T, readyEverySixth bool) (bool, int) {
+func runCrashWindowCadence12159(t *testing.T, readyEverySixth bool) (bool, int, int) {
 	t.Helper()
-	dir, err := os.MkdirTemp("/var/tmp/ContinuedFalcon-12159", "cadence-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	dir := t.TempDir()
 	binary := filepath.Join(dir, "helper")
 	script := crashWindowHelper12159
 	if !readyEverySixth {
@@ -79,10 +75,10 @@ os._exit(7)
 		return nil
 	}
 	m.restartTimerFn = func(_ time.Duration, retry func()) {
-		go retry()
+		time.AfterFunc(10*time.Millisecond, retry)
 	}
 	m.mu.Lock()
-	err = m.ensureProcessLocked(cfg)
+	err := m.ensureProcessLocked(cfg)
 	m.mu.Unlock()
 	if err != nil {
 		t.Fatalf("initial helper bring-up failed: %v", err)
@@ -95,31 +91,48 @@ os._exit(7)
 	}
 	looping := false
 	attempts := 0
+	loopRestarts := 0
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		attempts = readAttempts()
-		_, looping = m.HelperSupervisorState()
-		if looping || attempts >= 45 {
+		_, supervisorLooping := m.HelperSupervisorState()
+		if supervisorLooping {
+			rec := m.HelperCrashState()
+			looping = rec.RestartPending && rec.CrashLooping()
+			if looping {
+				loopRestarts = rec.Restarts
+				break
+			}
+		}
+		if attempts >= 45 {
 			break
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(time.Millisecond)
 	}
 	m.mu.Lock()
 	m.stopLocked()
 	m.mu.Unlock()
-	return looping, attempts
+	return looping, attempts, loopRestarts
 }
 
 func TestCrashAfterEveryReadyStartCountsTowardLoop12159(t *testing.T) {
-	looping, attempts := runCrashWindowCadence12159(t, false)
+	looping, attempts, restarts := runCrashWindowCadence12159(t, false)
 	if !looping {
-		t.Fatalf("post-ready crash cadence never reached crash-loop verdict after %d real child starts", attempts)
+		t.Fatalf("post-ready crash cadence never reached the count-arm crash-loop verdict after %d real child starts", attempts)
+	}
+	if restarts < helperCrashLoopAttempt() {
+		t.Fatalf("count-arm verdict used only %d restart attempts, below cap threshold %d",
+			restarts, helperCrashLoopAttempt())
 	}
 }
 
 func TestFivePreReadyCrashesThenReadyCrashCountsTowardLoop12159(t *testing.T) {
-	looping, attempts := runCrashWindowCadence12159(t, true)
+	looping, attempts, restarts := runCrashWindowCadence12159(t, true)
 	if !looping {
-		t.Fatalf("mixed pre-/post-ready crash cadence never reached crash-loop verdict after %d real child starts", attempts)
+		t.Fatalf("mixed pre-/post-ready crash cadence never reached the count-arm crash-loop verdict after %d real child starts", attempts)
+	}
+	if restarts < helperCrashLoopAttempt() {
+		t.Fatalf("count-arm verdict used only %d restart attempts, below cap threshold %d",
+			restarts, helperCrashLoopAttempt())
 	}
 }

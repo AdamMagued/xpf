@@ -51,9 +51,10 @@ Three things about it are easy to break:
   satisfies the `ExitCode >= 0` discriminator, so a renderer keyed on the
   record alone prints "exit code 0" for a helper that never crashed. Same
   discipline as `BufferKnown` beside `BufferPercent`.
-- `Format` renders **nothing** when there is no episode. The record is wiped on
-  a successful restart, so the block reports the current crash episode, never a
-  history.
+- `Format` renders nothing when there is no open crash episode. Ordinary
+  Compile recovery journals and clears the record. A supervisor retry instead
+  retains the episode until its quiet window expires and renders a distinct
+  "recovered — running after a crash" headline while the helper is live.
 - #5838's "last restart timestamp" **is now backed** (#7967):
   `HelperLastRestartAttempt`, rendered as `Helper last restart attempt`. It is
   episode-scoped like every other field here and is cleared by the same wipe.
@@ -66,10 +67,11 @@ Three things about it are easy to break:
 - What is still missing is **history across episodes** — "has this helper
   crashed before?" — which no field on an episode-scoped record can answer and
   which is a different requirement from the bullet. Tracked as #8397.
-- The headline is four named states over (`RestartPending` x `CrashLooping`),
-  and `RestartPending` picks it — a stopped helper reads "stopped", never
-  "CRASH LOOPING", because the loop predicate stays true after an intentional
-  stop.
+- The headline has five named states: four combinations of (`RestartPending` x
+  `CrashLooping`), plus the recovered-running state. The retry state wins while
+  the helper is running; for the other four, `RestartPending` picks the
+  headline. An intentional stop is therefore "stopped", never "CRASH LOOPING",
+  even though the open episode's record still satisfies the loop predicate.
 - `Format` is exported and takes a flat struct, so its guards must hold for
   structs `Build` did not produce. Two mutations escaped the first matrix
   because every cell reached the guard *through* `Build`, which sanitizes on the

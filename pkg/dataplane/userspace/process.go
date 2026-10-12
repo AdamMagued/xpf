@@ -336,19 +336,28 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) (retErr error)
 	entryGen := m.procGen
 	defer func() {
 		if retErr != nil {
+			// NM-1: a FAILED supervisor retry is a NEW crash-loop data
+			// point, not a preserved one — schedule (Restarts++) so a
+			// helper that never starts escalates to crash-looping. Only
+			// the Compile path re-arms at the same count (MAJOR-3a):
+			// Compile bring-up retires the generation carrying an armed
+			// retry without proving anything about the helper.
+			if restartAttempt && pendingCrashRetry && m.proc == nil {
+				m.scheduleHelperRestartLocked(m.procGen)
+				m.notifyHelperSupervisorLocked()
+				return
+			}
 			if pendingCrashRetry && m.proc == nil &&
-				(restartAttempt || m.procGen != m.helperCrash.restartGen) {
+				m.procGen != m.helperCrash.restartGen {
 				m.rearmHelperRestartLocked()
 			}
 			return
 		}
-		// A supervisor retry that lands proves a helper READY, not STABLE —
-		// the retry path does its own episode accounting below, and a
-		// ping-ready answer from a helper that crashes 300ms later must
-		// not wipe the streak it is part of (MAJOR-1). An ordinary Compile
-		// bring-up that ADVANCES the generation (operator commit, peer
-		// sync — a genuinely new helper proven ready) DOES end the prior
-		// episode (MAJOR-3b).
+		// A supervisor retry proves READY, not STABLE; it preserves the
+		// current attempt count until the quiet window expires. An ordinary
+		// Compile bring-up that ADVANCES the generation (operator commit, peer
+		// sync — a genuinely new helper proven ready) DOES end the episode
+		// (MAJOR-3b).
 		if restartAttempt {
 			return
 		}
@@ -603,6 +612,10 @@ func (m *Manager) stopLocked() {
 	// re-fences its next attempt on whatever `m.procGen` reads after the failed
 	// spawn.
 	m.procGen++
+	// This record bit describes a currently running supervisor retry, not
+	// durable episode history; an intentional stop makes that claim stale.
+	m.helperCrash.RecoveredSinceCrash = false
+	m.helperCrash.RecoveredAt = time.Time{}
 	// Retire the helper-session epoch before teardown so a watchdog sender that
 	// passed its snapshot check cannot reach this generation after the stop.
 	// Do not wait on sessionMu here: explicit fail-closed disarm must happen

@@ -395,7 +395,12 @@ func (d *Daemon) quarantineRxVlanBinding(ctx context.Context, parent string, sta
 	kernelReady := d.dataplaneArmed.Load() && d.attachedXDPLinks() > 0
 	helperRunning, crashLooping := d.helperSupervisorState()
 	opened := d.writeTransitGateLocked("rxvlan-audit", kernelReady && helperRunning)
-	d.applyTransitElectionDebt(kernelReady && (!helperRunning || opened), crashLooping)
+	// F2: same preserve-only rule as markDataplaneArmed above.
+	if !helperRunning && !crashLooping {
+		d.applyTransitElectionDebtKeepArm(false, false, true)
+	} else {
+		d.applyTransitElectionDebt(kernelReady && opened, crashLooping)
+	}
 	if detachErr != nil {
 		return true, fmt.Errorf("rxvlan quarantine: %s removed from XDP census despite detach error: %w", parent, detachErr)
 	}

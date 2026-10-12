@@ -139,7 +139,11 @@ func (d *Daemon) reassertTransitGate(stage string) {
 	if !helperRunning && !crashLooping {
 		d.applyTransitElectionDebtKeepArm(false, false, true)
 	} else {
-		d.applyTransitElectionDebt(kernelReady && (!helperRunning || opened), crashLooping)
+		// Helper running (or looping): dataplaneReady follows whether the
+		// gate actually OPENED. A fence-install failure with the helper up
+		// reports not-ready (arm debt at weight 1); only a live opened
+		// gate reports ready.
+		d.applyTransitElectionDebt(kernelReady && opened, crashLooping)
 	}
 }
 

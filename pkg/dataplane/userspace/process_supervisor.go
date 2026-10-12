@@ -109,10 +109,10 @@ func (g *helperGeneration) exitCodeAndSignal() (int, string) {
 // thing it exists to feed. The type is named ...Record rather than ...State so
 // it does not collide with the Manager.HelperCrashState() accessor.
 type HelperCrashRecord struct {
-	// LastExitWasCrash is set while the manager is between an unexpected exit
-	// and a successful restart. It is what makes the staleness observable
-	// instead of having to be inferred from a nil pointer.
-	//
+	// LastExitWasCrash records that an unexpected exit remains in the open
+	// crash episode. A supervisor retry landing does not clear the record:
+	// the process can still crash before the quiet window ends. Ordinary
+	// generation-advancing Compile recovery closes the episode.
 	// #7250: renamed from `Crashed`, which was read as BOTH "the last exit was
 	// unexpected" and "a restart is coming" — two facts that diverge. This is
 	// the first one, and it is deliberately NOT cleared by an intentional stop:
@@ -139,8 +139,9 @@ type HelperCrashRecord struct {
 	PID int
 	// At is when the exit was observed.
 	At time.Time
-	// Restarts counts consecutive restart ATTEMPTS since the last helper that
-	// reached readiness.
+	// Restarts counts consecutive restart ATTEMPTS in this crash episode.
+	// A quiet interval longer than two maximum backoffs or a successful
+	// generation-advancing Compile ends the episode and resets the count.
 	Restarts int
 	// NextRestart is when the armed retry is due. Only meaningful when
 	// RestartPending is true — after an intentional stop this is a time in the
@@ -151,13 +152,10 @@ type HelperCrashRecord struct {
 	// `restartHelperAfterCrash` called into `ensureProcessLocked`, whatever the
 	// outcome. Zero when none has been attempted in this episode.
 	//
-	// #7967 / #5838: episode-scoped like every other field here, and cleared by
-	// the same successful-restart wipe. That was raised as an objection to the
-	// field existing at all — that it would be "wiped by the very event it
-	// records" — but the objection applies equally to `Restarts`, `NextRestart`,
-	// `ExitCode`, `Detail` and `LastExitWasCrash`, all of which are shipped and
-	// rendered. A rejection that would also reject five existing fields is not a
-	// reason to omit the sixth.
+	// This field is episode-scoped and cleared when ordinary Compile recovery
+	// ends that episode. A landed supervisor retry retains it alongside the
+	// last-exit record until the quiet window expires, so status can report the
+	// live recovery and the episode can still be journaled accurately.
 	//
 	// What it buys is ergonomic rather than informational: the scheduling time
 	// was always DERIVABLE, since `helperRestartDelay` is a pure function of
@@ -175,6 +173,14 @@ type HelperCrashRecord struct {
 	// crash record — so before this, a renderer would have reported a restart
 	// that was never going to happen.
 	RestartPending bool
+	// RecoveredSinceCrash reports that a supervisor retry LANDED while the
+	// episode debt is still on the books. The render distinguishes this
+	// running helper from a stopped process with a crash record. Cleared when
+	// the episode ends or when an intentional stop makes the helper non-live.
+	RecoveredSinceCrash bool
+	// RecoveredAt records when the retry first proved ready in this open
+	// episode; quiet-window closure may journal it later.
+	RecoveredAt time.Time
 	// restartGen is the process generation the pending retry was armed for.
 	// Unexported: it is an internal fence, not something a renderer should see
 	// or construct.
@@ -185,16 +191,14 @@ type HelperCrashRecord struct {
 //
 // #7250 asked for "a predicate an operator or a health surface can read", and
 // noted it needs deciding rather than plumbing. The decision: crash-looping is
-// BACKOFF AT THE CAP, not a raw restart count.
+// BACKOFF AT THE CAP within one open crash episode, not a lifetime count.
 //
-// A count threshold is time-blind — twenty restarts over a week and twenty in a
-// minute are different situations and a bare counter cannot tell them apart.
-// The backoff already encodes the time dimension: it doubles from
-// helperRestartBackoffBase and saturates at helperRestartBackoffMax, so reaching
-// the cap means the supervisor has exhausted its escalation and is now retrying
-// at its slowest rate. With the shipped 1s base and 60s cap that is roughly two
-// minutes of uninterrupted failure, and it does not fire for a helper that
-// crashed once an hour ago.
+// Restarts advances for consecutive failed retry attempts. A quiet interval
+// longer than twice the maximum backoff resets that count, so isolated crashes
+// do not accumulate into a false loop. The backoff doubles from
+// helperRestartBackoffBase and saturates at helperRestartBackoffMax; reaching
+// the cap means the supervisor exhausted its escalation and is retrying at its
+// slowest rate.
 //
 // Derived, never stored, for the same reason RestartPending is: a stored
 // judgement about the present is the thing that goes stale.
@@ -298,6 +302,26 @@ func (m *Manager) superviseHelper(g *helperGeneration) {
 	m.handleUnexpectedHelperExitLocked(g)
 }
 
+// resetQuietHelperCrashEpisodeLocked closes an episode after the quiet window.
+// The status loop calls it while a recovered helper is still running; the
+// next unexpected exit also calls it before starting a new episode. Thus a
+// healthy recovery is journaled on the existing periodic health tick without
+// a separate expiry timer.
+//
+// Caller must hold m.mu.
+func (m *Manager) resetQuietHelperCrashEpisodeLocked(now time.Time) bool {
+	if m.helperCrashLastAt.IsZero() ||
+		now.Sub(m.helperCrashLastAt) <= 2*helperRestartBackoffMax {
+		return false
+	}
+	if m.helperCrash.LastExitWasCrash && m.helperCrash.RecoveredSinceCrash {
+		m.recordRecoveredCrashEpisodeLocked(now)
+	}
+	m.helperCrash = HelperCrashRecord{}
+	m.helperCrashLastAt = time.Time{}
+	return true
+}
+
 // handleUnexpectedHelperExitLocked fails the node closed after a crash and
 // schedules a bounded restart.
 //
@@ -307,10 +331,11 @@ func (m *Manager) superviseHelper(g *helperGeneration) {
 // cluster peer.
 func (m *Manager) handleUnexpectedHelperExitLocked(g *helperGeneration) {
 	now := time.Now()
-	if m.helperCrashLastAt.IsZero() || now.Sub(m.helperCrashLastAt) > 2*helperRestartBackoffMax {
-		m.helperCrashStreak = 0
-	}
-	m.helperCrashStreak++
+	// A later observation closes the old episode before this exit begins a
+	// fresh one; quiet recovery may also have closed it on the status tick.
+	m.resetQuietHelperCrashEpisodeLocked(now)
+	m.helperCrash.RecoveredSinceCrash = false
+	m.helperCrash.RecoveredAt = time.Time{}
 	m.helperCrashLastAt = now
 	detail := g.describeExit()
 	pid := 0
@@ -404,7 +429,6 @@ func (m *Manager) completeHelperCrashRecoveryLocked(at time.Time) {
 		m.recordRecoveredCrashEpisodeLocked(at)
 		m.helperCrash = HelperCrashRecord{}
 	}
-	m.helperCrashStreak = 0
 	m.helperCrashLastAt = time.Time{}
 }
 
@@ -440,13 +464,13 @@ func (m *Manager) restartHelperAfterCrash(gen uint64) {
 	}
 	slog.Info("userspace dataplane helper restarted after unexpected exit",
 		"attempts", attempts)
-	// MAJOR-1: a landed retry proves the helper READY, not STABLE — the
-	// crash record (attempt count, backoff, restart fence) is the retry
-	// debt the NEXT crash in this episode depends on. Wiping here made
-	// every post-ready crash look like attempt #1. Preserve the record;
-	// the streak window or an ordinary Compile bring-up ends the episode.
-	// The #8397 recovered-episode journal entry is still appended.
-	m.recordRecoveredCrashEpisodeLocked(time.Now())
+	// A landed retry proves READY, not STABLE — preserve its attempt count
+	// until the quiet window expires or an ordinary Compile advances the
+	// generation. The current helper is live, so the status surface must not
+	// describe it as stopped. Episode history is appended only when recovery
+	// actually ends the episode.
+	m.helperCrash.RecoveredSinceCrash = true
+	m.helperCrash.RecoveredAt = time.Now()
 	m.notifyHelperSupervisorLocked()
 	// The crash tore the 1 Hz reconcile loop down with the generation it was
 	// polling; the replacement needs its own.
@@ -485,15 +509,10 @@ func (m *Manager) HelperSupervisorState() (running, crashLooping bool) {
 	if running {
 		return running, false
 	}
-	// The count arm stays fenced to the armed retry: an intentional stop
-	// orphans the timer and must not report a loop. The streak arm is
-	// INTENTIONALLY unfenced: the streak counts unexpected exits across
-	// ping-ready restarts (which advance procGen by design), so fencing
-	// it to the last-armed generation would never trip. Both arms share
-	// the !running gate — a live helper is never "looping".
-	crashLooping = (m.procGen == m.helperCrash.restartGen && m.helperCrash.CrashLooping()) ||
-		(m.helperCrashStreak >= helperCrashLoopAttempt() &&
-			!m.helperCrashLastAt.IsZero() && time.Since(m.helperCrashLastAt) <= 2*helperRestartBackoffMax)
+	// Only the retry count arm contributes to the HA verdict. It is fenced
+	// to the generation whose retry is armed, so an intentional stop cannot
+	// turn a stale crash record into current election debt.
+	crashLooping = m.procGen == m.helperCrash.restartGen && m.helperCrash.CrashLooping()
 	return running, crashLooping
 }
 
