@@ -449,6 +449,15 @@ func runUniformGatesClusterZone(tree *ConfigTree, cfg *Config, opts compileOpts)
 		}
 	}
 
+	// #12219: tolerant ingestion warns about retained unknown children at both
+	// zone and interface scope. Strict unknown-child validation is zone-level;
+	// per-interface packed-tail rejection remains owned by #6735.
+	if opts.lenientHostInboundTokens {
+		cfg.Warnings = append(cfg.Warnings, toleratedUnknownHostInboundChildWarnings(cfg)...)
+	} else if err := validateHostInboundUnknownChildrenStrict(cfg); err != nil {
+		return err
+	}
+
 	// #3200 host-inbound-traffic token gate. Strict on commit / commit-check
 	// (hard-reject an unknown/typo system-services or protocols token that can
 	// make the nft kernel mirror and Rust classifier enforce inconsistently);
