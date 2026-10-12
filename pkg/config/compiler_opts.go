@@ -2524,10 +2524,12 @@ type compileOpts struct {
 	// poisons the policy to prevent incomplete enforcement or audit content
 	// from being published.
 	lenientPolicyThenSiblings bool
-	// lenientPolicyEnforcementSubtrees (#11014) downgrades directly dropped
-	// term/session-options policy subtrees to warnings on tolerant ingress.
-	// compilePolicy also poisons a policy carrying these enforcement-bearing
-	// children instead of publishing its incomplete direct action.
+	// lenientPolicyEnforcementSubtrees (#11014/#12234) downgrades directly
+	// dropped term/session-options subtrees and unknown direct policy children
+	// to warnings on tolerant ingress, except scalar one-edit `description`
+	// typos with at most one value token and no children, plus Junos apply
+	// statements. compilePolicy poisons affected policies instead of publishing
+	// incomplete enforcement content.
 	lenientPolicyEnforcementSubtrees bool
 	// lenientPolicyMissingMatch (#3044) downgrades the security-policy
 	// required-match gate (validatePolicyRequiredMatchStrict) from a hard

@@ -171,7 +171,7 @@ func TestDroppedSecurityPolicyEnforcementSubtreesRejectStrictDirectCompile11014(
 
 func TestHarmlessUnknownSecurityPolicyChildRemainsAdvisory11014(t *testing.T) {
 	cfg, err := CompileConfigLenient(policyPoisonTree11013(t,
-		"then { permit; }\n                    session-optionz typo-control;"))
+		"then { permit; }\n                    descripton typo-control;"))
 	if err != nil {
 		t.Fatalf("lenient compile rejected harmless metadata: %v", err)
 	}
@@ -179,8 +179,11 @@ func TestHarmlessUnknownSecurityPolicyChildRemainsAdvisory11014(t *testing.T) {
 	if pol.LenientContentDropped {
 		t.Fatal("harmless policy metadata typo must remain advisory-only")
 	}
-	if len(pol.UnknownChildren) != 1 || pol.UnknownChildren[0] != "session-optionz" {
+	if len(pol.UnknownChildren) != 1 || pol.UnknownChildren[0] != "descripton" {
 		t.Fatalf("test fixture did not produce an unknown harmless child: %v", pol.UnknownChildren)
+	}
+	if !strings.Contains(strings.Join(cfg.Warnings, "\n"), "#4232") {
+		t.Fatalf("harmless policy metadata typo lost its advisory: %v", cfg.Warnings)
 	}
 }
 
@@ -193,5 +196,201 @@ func TestTermOnlySecurityPolicyStillDefaultsToDeny11014(t *testing.T) {
 	pol := policyPoisonPolicy11013(t, cfg)
 	if pol.Action != PolicyDeny {
 		t.Fatalf("term-only policy action = %v, want fail-closed PolicyDeny", pol.Action)
+	}
+}
+
+func policyUnknownEnforcementTree12234(t *testing.T, unknownChild string) *ConfigTree {
+	t.Helper()
+	text := `schedulers {
+    scheduler permit-window {
+        daily { start-time 08:30; stop-time 09:00; }
+    }
+}
+security {
+    zones {
+        security-zone trust;
+        security-zone untrust;
+    }
+    policies {
+        from-zone trust to-zone untrust {
+            policy p {
+                match {
+                    source-address any;
+                    destination-address any;
+                    application any;
+                }
+                then { permit; }
+                ` + unknownChild + `
+            }
+        }
+    }
+}`
+	tree, errs := NewParser(text).Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse policy fixture: %v", errs[0])
+	}
+	return tree
+}
+
+func TestUnknownEnforcementSecurityPolicyChildrenPoisonLenientCompile12234(t *testing.T) {
+	cases := []struct {
+		name         string
+		unknownChild string
+		keyword      string
+		schedulerRef bool
+	}{
+		{
+			name:         "scheduler-name typo",
+			unknownChild: "scheduler-nam permit-window;",
+			keyword:      "scheduler-nam",
+			schedulerRef: true,
+		},
+		{
+			name:         "scheduler-name extra letter",
+			unknownChild: "scheduler-naeme permit-window;",
+			keyword:      "scheduler-naeme",
+			schedulerRef: true,
+		},
+		{
+			name:         "scheduler-name repeated letter",
+			unknownChild: "scheduler-namme permit-window;",
+			keyword:      "scheduler-namme",
+			schedulerRef: true,
+		},
+		{
+			name:         "scheduler-name multiple edits",
+			unknownChild: "schedulr-namme permit-window;",
+			keyword:      "schedulr-namme",
+			schedulerRef: true,
+		},
+		{
+			name:         "match subtree typo",
+			unknownChild: "mach { source-address 192.0.2.0/24; }",
+			keyword:      "mach",
+		},
+		{
+			name:         "then typo with a conflicting action",
+			unknownChild: "thne deny;",
+			keyword:      "thne",
+		},
+		{
+			name:         "packed description typo with scheduler",
+			unknownChild: `descripton "web" scheduler-name permit-window;`,
+			keyword:      "descripton",
+			schedulerRef: true,
+		},
+		{
+			name:         "packed description typo with deny",
+			unknownChild: "descripton x then deny;",
+			keyword:      "descripton",
+		},
+		{
+			name:         "description typo with two value tokens",
+			unknownChild: "descripton x y;",
+			keyword:      "descripton",
+		},
+		{
+			name:         "nested description typo",
+			unknownChild: "descriptio { x; }",
+			keyword:      "descriptio",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tree := policyUnknownEnforcementTree12234(t, tc.unknownChild)
+			cfg, err := CompileConfigLenient(tree)
+			if err != nil {
+				t.Fatalf("lenient compile rejected policy: %v", err)
+			}
+			pol := policyPoisonPolicy11013(t, cfg)
+			if pol.Action != PolicyPermit {
+				t.Fatalf("control permit action = %v, want permit", pol.Action)
+			}
+			if !pol.LenientContentDropped {
+				t.Fatalf("unknown enforcement child %q did not poison the policy; the incomplete permit could be published", tc.keyword)
+			}
+			if len(pol.UnknownChildren) != 1 || pol.UnknownChildren[0] != tc.keyword {
+				t.Fatalf("compiled unknown children = %v, want [%q]", pol.UnknownChildren, tc.keyword)
+			}
+			if tc.schedulerRef && (cfg.Schedulers["permit-window"] == nil || pol.SchedulerName != "") {
+				t.Fatalf("fixture must define the window while the typo'd reference is dropped: schedulers=%v policy scheduler=%q",
+					cfg.Schedulers, pol.SchedulerName)
+			}
+			warnings := strings.Join(cfg.Warnings, "\n")
+			for _, want := range []string{"trust->untrust/p", tc.keyword, "#4232", "#12234"} {
+				if !strings.Contains(warnings, want) {
+					t.Errorf("lenient warning %q does not name %q", warnings, want)
+				}
+			}
+			if _, err := CompileConfig(tree); err == nil || !strings.Contains(err.Error(), "#12234") {
+				t.Fatalf("strict compiler must reject unknown enforcement child %q, got %v", tc.keyword, err)
+			}
+			if err := SchemaValidate(tree, nil); err == nil || !strings.Contains(err.Error(), tc.keyword) {
+				t.Fatalf("strict schema must reject unknown enforcement child %q, got %v", tc.keyword, err)
+			}
+		})
+	}
+}
+
+func TestUnknownSecurityPolicyDescriptionTyposAndApplyStatementsStayAdvisory12234(t *testing.T) {
+	cases := []struct {
+		name  string
+		child string
+		want  string
+	}{
+		{name: "adjacent transposition", child: "descriptoin x;", want: "descriptoin"},
+		{name: "multi-word description", child: `descripton "multi word";`, want: "descripton"},
+		{name: "apply-groups-except", child: "apply-groups-except LOG;", want: "apply-groups-except"},
+		{name: "apply-macro", child: "apply-macro M { k v; }", want: "apply-macro"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := CompileConfigLenient(policyUnknownEnforcementTree12234(t, tc.child))
+			if err != nil {
+				t.Fatalf("lenient compile rejected advisory child: %v", err)
+			}
+			pol := policyPoisonPolicy11013(t, cfg)
+			if pol.LenientContentDropped {
+				t.Fatalf("%s must remain advisory-only", tc.name)
+			}
+			if len(pol.UnknownChildren) != 1 || pol.UnknownChildren[0] != tc.want {
+				t.Fatalf("unknown children = %v, want [%s]", pol.UnknownChildren, tc.want)
+			}
+			if !strings.Contains(strings.Join(cfg.Warnings, "\n"), "#4232") {
+				t.Fatalf("%s lost its #4232 advisory: %v", tc.name, cfg.Warnings)
+			}
+		})
+	}
+}
+
+func TestUnknownGlobalSecurityPolicyChildPoisonsLenientCompile12234(t *testing.T) {
+	tree, errs := NewParser(`security {
+    policies {
+        global {
+            policy p {
+                match {
+                    source-address any;
+                    destination-address any;
+                    application any;
+                }
+                then { permit; }
+                descripton x scheduler-name permit-window;
+            }
+        }
+    }
+}`).Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse global policy fixture: %v", errs[0])
+	}
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("lenient compile rejected global policy: %v", err)
+	}
+	if len(cfg.Security.GlobalPolicies) != 1 {
+		t.Fatalf("global policies = %d, want 1", len(cfg.Security.GlobalPolicies))
+	}
+	pol := cfg.Security.GlobalPolicies[0]
+	if !pol.LenientContentDropped {
+		t.Fatal("packed description typo in global policy did not poison it")
 	}
 }
