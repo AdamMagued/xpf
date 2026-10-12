@@ -660,7 +660,6 @@ pub(super) fn revalidate_zone_policy_on_session_hit(
             ingress_ifindex,
             ha_startup_grace_until_secs,
             decision,
-            metadata,
             meta,
         );
     }
@@ -1332,7 +1331,6 @@ fn reverse_hit_zone_policy(
     ingress_ifindex: i32,
     ha_startup_grace_until_secs: u64,
     fallback_decision: SessionDecision,
-    hit_metadata: &SessionMetadata,
     meta: UserspaceDpMeta,
 ) -> Option<PolicyRevocation> {
     let PolicyGateAnswer {
@@ -1692,17 +1690,24 @@ fn reverse_hit_zone_policy(
                 policy_kind_for_resolution(input.decision.resolution),
             );
             if matches!(&rev_target, PolicyRevalidationTarget::Stale(_)) {
+                // #12191: worker installs publish a FORWARD conntrack row only
+                // (poll_descriptor `FORWARD ONLY`; reverse `show` skips
+                // `IsReverse`), so a reverse hit refreshes the user-visible
+                // forward row — never the reverse companion key, which has no
+                // row. The app resolution mirrors the create-time forward
+                // derivation (`lookup_admitted` with `is_reverse=false` and
+                // the forward NAT rewrite), best-effort like the forward arm.
                 let app_id = forwarding.app_catalog.lookup_admitted(
-                    rev_canonical.protocol,
-                    rev_canonical.src_port,
-                    rev_canonical.dst_port,
-                    hit_metadata.is_reverse,
-                    fallback_decision.nat.rewrite_dst_port,
+                    fwd_key.protocol,
+                    fwd_key.src_port,
+                    fwd_key.dst_port,
+                    false,
+                    fwd_decision.nat.rewrite_dst_port,
                 );
                 let _ = crate::afxdp::bpf_map::restamp_bpf_conntrack_app_id(
                     conntrack_v4_fd,
                     conntrack_v6_fd,
-                    &rev_canonical,
+                    &fwd_key,
                     app_id,
                 );
             }

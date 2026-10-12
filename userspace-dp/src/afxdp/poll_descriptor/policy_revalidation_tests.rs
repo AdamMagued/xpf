@@ -1379,4 +1379,582 @@ fn permitted_stale_hit_restamps_conntrack_app_id_12191() {
         after.session_id, session_id,
         "label refresh must preserve the stable session identity"
     );
+    // A current but non-live authorization can force a cold walk. It must not
+    // refresh the conntrack label: only stale-generation permits do so.
+    sessions.mark_policy_revalidated(&key, PolicyRevalidationKind::RecordedEgress);
+    forwarding.app_catalog = AppCatalog::from_snapshot(&[AppCatalogEntry {
+        app_id: 33,
+        protocol: PROTO_TCP,
+        dst_port_low: 443,
+        dst_port_high: 443,
+        src_port_low: 0,
+        src_port_high: 0,
+    }]);
+    let forced_fresh_revocation = revalidate_zone_policy_on_session_hit(
+        &forwarding,
+        crate::afxdp::bpf_map::CONNTRACK_TEST_MAP_FD,
+        crate::afxdp::bpf_map::CONNTRACK_TEST_MAP_FD,
+        &mut sessions,
+        &key,
+        &metadata,
+        decision,
+        Some(&flow),
+        crate::afxdp::tests_support::txn_meta_v4(24, 0x10, 54),
+        false,
+        false,
+        &BTreeMap::new(),
+        &Arc::new(ShardedNeighborMap::new()),
+        1_200_000_000,
+        1,
+        24,
+        0,
+        SessionOrigin::ForwardFlow,
+    );
+    assert!(
+        forced_fresh_revocation.is_none(),
+        "a Fresh-forced permit keeps the session"
+    );
+    assert_eq!(
+        crate::afxdp::bpf_map::conntrack_row_for_test(&key)
+            .expect("Fresh-forced revalidation preserves the row")
+            .app_id,
+        APP_B,
+        "Fresh-forced revalidation must not restamp the label"
+    );
+}
+
+/// #12191: reverse IPv6 hits restamp the worker-published forward row, not a
+/// reverse companion row (worker installs publish forward conntrack only).
+#[test]
+fn reverse_stale_hit_restamps_forward_ipv6_conntrack_row_12191() {
+    use crate::AppCatalogEntry;
+    use crate::policy::AppCatalog;
+
+    const PROTO_TCP: u8 = 6;
+    const APP_A: u16 = 11;
+    const APP_B: u16 = 22;
+    let fwd_key = SessionKey {
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_TCP,
+        src_ip: "2001:db8:1::10".parse().unwrap(),
+        dst_ip: "2001:db8:2::20".parse().unwrap(),
+        src_port: 40_000,
+        dst_port: 443,
+        discriminator: crate::session::TunnelDiscriminator::None,
+        routing_domain: 0,
+    };
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 12,
+            tunnel_endpoint_id: 0,
+            next_hop: Some("2001:db8:2::1".parse().unwrap()),
+            neighbor_mac: Some([0, 1, 2, 3, 4, 5]),
+            src_mac: None,
+            tx_vlan_id: 0,
+            route_mtu: 0,
+            transport_route_mtu: 0,
+        },
+        nat: NatDecision::default(),
+        install_table_domain: 0,
+        install_table_check: 0,
+    };
+    let metadata = SessionMetadata {
+        ingress_zone: crate::test_zone_ids::TEST_LAN_ZONE_ID,
+        egress_zone: crate::test_zone_ids::TEST_WAN_ZONE_ID,
+        ingress_zone_check: 0,
+        egress_zone_check: 0,
+        ingress_ifindex: 24,
+        ingress_vlan_id: 0,
+        owner_rg_id: 0,
+        fabric_ingress: false,
+        is_reverse: false,
+        nat64_reverse: None,
+        log_session_init: false,
+        log_session_close: false,
+        policy_id: 0,
+        inactivity_timeout_ns: None,
+        policy_counter_idx: 0,
+        policy_counter: None,
+    };
+    let mut reverse_metadata = metadata.clone();
+    reverse_metadata.is_reverse = true;
+    let reverse_decision = decision;
+    let reverse_key = crate::session::reverse_session_key(&fwd_key, decision.nat);
+    let catalog1 = AppCatalog::from_snapshot(&[AppCatalogEntry {
+        app_id: APP_A,
+        protocol: PROTO_TCP,
+        dst_port_low: 443,
+        dst_port_high: 443,
+        src_port_low: 0,
+        src_port_high: 0,
+    }]);
+    let catalog2 = AppCatalog::from_snapshot(&[AppCatalogEntry {
+        app_id: APP_B,
+        protocol: PROTO_TCP,
+        dst_port_low: 443,
+        dst_port_high: 443,
+        src_port_low: 0,
+        src_port_high: 0,
+    }]);
+    let mut snapshot = crate::afxdp::test_fixtures::policy_deny_snapshot();
+    snapshot.policies[0].from_zone = "lan".to_string();
+    let mut forwarding = crate::afxdp::forwarding_build::build_forwarding_state(&snapshot);
+    forwarding.app_catalog = catalog2;
+
+    let mut sessions = SessionTable::new();
+    sessions.set_policy_revalidation_gen(1);
+    assert!(sessions.install_with_protocol_with_origin(
+        fwd_key.clone(),
+        decision,
+        metadata.clone(),
+        SessionOrigin::ForwardFlow,
+        1_000_000_000,
+        PROTO_TCP,
+        0x02,
+    ));
+    assert!(sessions.install_with_protocol_with_origin(
+        reverse_key.clone(),
+        reverse_decision,
+        reverse_metadata.clone(),
+        SessionOrigin::ReverseFlow,
+        1_000_000_000,
+        PROTO_TCP,
+        0x10,
+    ));
+    sessions.mark_policy_revalidated(&fwd_key, PolicyRevalidationKind::LiveEgress);
+    sessions.set_policy_revalidation_gen(2);
+    let session_id = sessions.session_id_for(&fwd_key);
+    let timeout_secs = sessions.timeout_secs_for(&fwd_key);
+    let _publish_guard = crate::afxdp::bpf_map::take_conntrack_publish_guard();
+    crate::afxdp::bpf_map::clear_conntrack_rows_for_test();
+    assert_eq!(
+        crate::afxdp::bpf_map::publish_bpf_conntrack_entry(
+            -1,
+            crate::afxdp::bpf_map::CONNTRACK_TEST_MAP_FD,
+            &fwd_key,
+            decision,
+            &metadata,
+            &FastMap::default(),
+            0,
+            catalog1.lookup_admitted(
+                fwd_key.protocol,
+                fwd_key.src_port,
+                fwd_key.dst_port,
+                false,
+                decision.nat.rewrite_dst_port,
+            ),
+            session_id,
+            timeout_secs,
+            SessionOrigin::ForwardFlow,
+        ),
+        crate::afxdp::bpf_map::ConntrackPublishResult::Written
+    );
+    assert_eq!(
+        crate::afxdp::bpf_map::conntrack_row_for_test(&fwd_key)
+            .expect("the test publishes the forward v6 row")
+            .app_id,
+        APP_A
+    );
+    assert!(matches!(
+        sessions.policy_revalidation_target(&reverse_key),
+        PolicyRevalidationTarget::Stale(_)
+    ));
+    let flow = SessionFlow {
+        src_ip: fwd_key.src_ip,
+        dst_ip: fwd_key.dst_ip,
+        forward_key: fwd_key.clone(),
+    };
+    let revocation = revalidate_zone_policy_on_session_hit(
+        &forwarding,
+        -1,
+        crate::afxdp::bpf_map::CONNTRACK_TEST_MAP_FD,
+        &mut sessions,
+        &reverse_key,
+        &reverse_metadata,
+        reverse_decision,
+        Some(&flow),
+        crate::afxdp::tests_support::txn_meta_v4(24, 0x10, 54),
+        false,
+        false,
+        &BTreeMap::new(),
+        &Arc::new(ShardedNeighborMap::new()),
+        1_100_000_000,
+        1,
+        24,
+        0,
+        SessionOrigin::ReverseFlow,
+    );
+    assert!(
+        revocation.is_none(),
+        "the forward companion's current lan -> wan policy permits"
+    );
+    let after = crate::afxdp::bpf_map::conntrack_row_for_test(&fwd_key)
+        .expect("reverse evidence must update the forward v6 row");
+    assert_eq!(after.app_id, APP_B);
+    assert_eq!(after.session_id, session_id);
+}
+
+fn app_id_revalidation_decision(nat: NatDecision) -> SessionDecision {
+    SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 12,
+            tunnel_endpoint_id: 0,
+            next_hop: Some("172.16.80.1".parse().expect("next hop")),
+            neighbor_mac: Some([0, 1, 2, 3, 4, 5]),
+            src_mac: None,
+            tx_vlan_id: 0,
+            route_mtu: 0,
+            transport_route_mtu: 0,
+        },
+        nat,
+        install_table_domain: 0,
+        install_table_check: 0,
+    }
+}
+
+fn app_id_revalidation_metadata(is_reverse: bool) -> SessionMetadata {
+    SessionMetadata {
+        ingress_zone: crate::test_zone_ids::TEST_LAN_ZONE_ID,
+        egress_zone: crate::test_zone_ids::TEST_WAN_ZONE_ID,
+        ingress_zone_check: 0,
+        egress_zone_check: 0,
+        ingress_ifindex: 24,
+        ingress_vlan_id: 0,
+        owner_rg_id: 0,
+        fabric_ingress: false,
+        is_reverse,
+        nat64_reverse: None,
+        log_session_init: false,
+        log_session_close: false,
+        policy_id: 0,
+        inactivity_timeout_ns: None,
+        policy_counter_idx: 0,
+        policy_counter: None,
+    }
+}
+
+fn app_id_revalidation_hit(
+    forwarding: &ForwardingState,
+    sessions: &mut SessionTable,
+    key: &SessionKey,
+    metadata: &SessionMetadata,
+    decision: SessionDecision,
+    flow: &SessionFlow,
+    origin: SessionOrigin,
+) -> bool {
+    revalidate_zone_policy_on_session_hit(
+        forwarding,
+        crate::afxdp::bpf_map::CONNTRACK_TEST_MAP_FD,
+        crate::afxdp::bpf_map::CONNTRACK_TEST_MAP_FD,
+        sessions,
+        key,
+        metadata,
+        decision,
+        Some(flow),
+        crate::afxdp::tests_support::txn_meta_v4(24, 0x10, 54),
+        false,
+        false,
+        &BTreeMap::new(),
+        &Arc::new(ShardedNeighborMap::new()),
+        1_100_000_000,
+        1,
+        24,
+        0,
+        origin,
+    )
+    .is_none()
+}
+
+/// A new pair's first reverse and forward permits leave an already-correct
+/// AppID row alone; after a catalog change, the next stale permit restamps it.
+#[test]
+fn new_pair_same_app_id_skips_restamp_write_and_later_restock_works_12191() {
+    use crate::AppCatalogEntry;
+    use crate::policy::AppCatalog;
+
+    const PROTO_TCP: u8 = 6;
+    let fwd_key = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: "10.1.2.3".parse().expect("client"),
+        dst_ip: "172.16.80.9".parse().expect("server"),
+        src_port: 40_000,
+        dst_port: 443,
+        discriminator: crate::session::TunnelDiscriminator::None,
+        routing_domain: 0,
+    };
+    let decision = app_id_revalidation_decision(NatDecision::default());
+    let metadata = app_id_revalidation_metadata(false);
+    let reverse_metadata = app_id_revalidation_metadata(true);
+    let reverse_key = crate::session::reverse_session_key(&fwd_key, decision.nat);
+    let app_entry = |app_id| AppCatalogEntry {
+        app_id,
+        protocol: PROTO_TCP,
+        dst_port_low: 443,
+        dst_port_high: 443,
+        src_port_low: 0,
+        src_port_high: 0,
+    };
+    let mut snapshot = crate::afxdp::test_fixtures::policy_deny_snapshot();
+    snapshot.policies[0].from_zone = "lan".to_string();
+    snapshot.neighbors.push(crate::NeighborSnapshot {
+        interface: "ge-0-0-0.80".into(),
+        ifindex: 12,
+        family: "inet".into(),
+        ip: "172.16.80.9".into(),
+        mac: "00:01:02:03:04:05".into(),
+        state: "reachable".into(),
+        router: false,
+        link_local: false,
+        ..Default::default()
+    });
+    let mut forwarding = crate::afxdp::forwarding_build::build_forwarding_state(&snapshot);
+    forwarding.app_catalog = AppCatalog::from_snapshot(&[app_entry(11)]);
+
+    let mut sessions = SessionTable::new();
+    sessions.set_policy_revalidation_gen(5);
+    assert!(sessions.install_with_protocol_with_origin(
+        fwd_key.clone(),
+        decision,
+        metadata.clone(),
+        SessionOrigin::ForwardFlow,
+        1_000_000_000,
+        PROTO_TCP,
+        0x02,
+    ));
+    assert!(sessions.install_with_protocol_with_origin(
+        reverse_key.clone(),
+        decision,
+        reverse_metadata.clone(),
+        SessionOrigin::ReverseFlow,
+        1_000_000_000,
+        PROTO_TCP,
+        0x12,
+    ));
+    assert!(matches!(
+        sessions.policy_revalidation_target(&reverse_key),
+        PolicyRevalidationTarget::Stale(_)
+    ));
+    assert!(matches!(
+        sessions.policy_revalidation_target(&fwd_key),
+        PolicyRevalidationTarget::Stale(_)
+    ));
+
+    let _publish_guard = crate::afxdp::bpf_map::take_conntrack_publish_guard();
+    crate::afxdp::bpf_map::clear_conntrack_rows_for_test();
+    let session_id = sessions.session_id_for(&fwd_key);
+    let timeout_secs = sessions.timeout_secs_for(&fwd_key);
+    assert_eq!(
+        crate::afxdp::bpf_map::publish_bpf_conntrack_entry(
+            crate::afxdp::bpf_map::CONNTRACK_TEST_MAP_FD,
+            -1,
+            &fwd_key,
+            decision,
+            &metadata,
+            &FastMap::default(),
+            0,
+            11,
+            session_id,
+            timeout_secs,
+            SessionOrigin::ForwardFlow,
+        ),
+        crate::afxdp::bpf_map::ConntrackPublishResult::Written
+    );
+    let flow = SessionFlow {
+        src_ip: fwd_key.src_ip,
+        dst_ip: fwd_key.dst_ip,
+        forward_key: fwd_key.clone(),
+    };
+    assert!(app_id_revalidation_hit(
+        &forwarding,
+        &mut sessions,
+        &reverse_key,
+        &reverse_metadata,
+        decision,
+        &flow,
+        SessionOrigin::ReverseFlow,
+    ));
+    assert_eq!(
+        sessions.policy_revalidation_target(&reverse_key),
+        PolicyRevalidationTarget::Fresh,
+        "the first reverse permit must complete stale revalidation"
+    );
+    assert_eq!(
+        crate::afxdp::bpf_map::conntrack_app_id_restamp_writes_for_test(),
+        0,
+        "the first reverse hit must skip a same-AppID map update"
+    );
+    assert!(app_id_revalidation_hit(
+        &forwarding,
+        &mut sessions,
+        &fwd_key,
+        &metadata,
+        decision,
+        &flow,
+        SessionOrigin::ForwardFlow,
+    ));
+    assert_eq!(
+        sessions.policy_revalidation_target(&fwd_key),
+        PolicyRevalidationTarget::Fresh,
+        "the first forward permit must complete stale revalidation"
+    );
+    assert_eq!(
+        crate::afxdp::bpf_map::conntrack_app_id_restamp_writes_for_test(),
+        0,
+        "the first forward hit must skip a same-AppID map update"
+    );
+
+    forwarding.app_catalog = AppCatalog::from_snapshot(&[app_entry(22)]);
+    sessions.set_policy_revalidation_gen(6);
+    assert!(app_id_revalidation_hit(
+        &forwarding,
+        &mut sessions,
+        &reverse_key,
+        &reverse_metadata,
+        decision,
+        &flow,
+        SessionOrigin::ReverseFlow,
+    ));
+    assert_eq!(
+        crate::afxdp::bpf_map::conntrack_row_for_test(&fwd_key)
+            .expect("forward conntrack row")
+            .app_id,
+        22,
+        "a stale hit after catalog change must restock the live AppID"
+    );
+    assert_eq!(
+        crate::afxdp::bpf_map::conntrack_app_id_restamp_writes_for_test(),
+        1,
+        "a changed AppID must perform exactly one map update"
+    );
+}
+
+/// A reverse DNAT hit resolves the forward row with the post-NAT service port.
+#[test]
+fn reverse_stale_dnat_hit_restamps_post_nat_forward_row_12191() {
+    use crate::AppCatalogEntry;
+    use crate::policy::AppCatalog;
+
+    const PROTO_TCP: u8 = 6;
+    let entry = |app_id, port| AppCatalogEntry {
+        app_id,
+        protocol: PROTO_TCP,
+        dst_port_low: port,
+        dst_port_high: port,
+        src_port_low: 0,
+        src_port_high: 0,
+    };
+    let client = "10.1.2.3".parse().expect("client");
+    let vip = "203.0.113.7".parse().expect("VIP");
+    let real = "172.16.80.9".parse().expect("server");
+    let fwd_key = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: client,
+        dst_ip: vip,
+        src_port: 40_000,
+        dst_port: 443,
+        discriminator: crate::session::TunnelDiscriminator::None,
+        routing_domain: 0,
+    };
+    let fwd_nat = NatDecision {
+        rewrite_dst: Some(real),
+        rewrite_dst_port: Some(8443),
+        ..NatDecision::default()
+    };
+    let decision = app_id_revalidation_decision(fwd_nat);
+    let reverse_decision = app_id_revalidation_decision(fwd_nat.reverse(client, vip, 40_000, 443));
+    let metadata = app_id_revalidation_metadata(false);
+    let reverse_metadata = app_id_revalidation_metadata(true);
+    let reverse_key = crate::session::reverse_session_key(&fwd_key, fwd_nat);
+    assert_eq!(
+        crate::session::reverse_session_key(&reverse_key, reverse_decision.nat),
+        fwd_key
+    );
+
+    let catalog1 = AppCatalog::from_snapshot(&[entry(11, 8443), entry(33, 443)]);
+    let mut snapshot = crate::afxdp::test_fixtures::policy_deny_snapshot();
+    snapshot.policies[0].from_zone = "lan".to_string();
+    let mut forwarding = crate::afxdp::forwarding_build::build_forwarding_state(&snapshot);
+    forwarding.app_catalog = AppCatalog::from_snapshot(&[entry(22, 8443), entry(33, 443)]);
+    let mut sessions = SessionTable::new();
+    sessions.set_policy_revalidation_gen(1);
+    assert!(sessions.install_with_protocol_with_origin(
+        fwd_key.clone(),
+        decision,
+        metadata.clone(),
+        SessionOrigin::ForwardFlow,
+        1_000_000_000,
+        PROTO_TCP,
+        0x02,
+    ));
+    assert!(sessions.install_with_protocol_with_origin(
+        reverse_key.clone(),
+        reverse_decision,
+        reverse_metadata.clone(),
+        SessionOrigin::ReverseFlow,
+        1_000_000_000,
+        PROTO_TCP,
+        0x10,
+    ));
+    sessions.mark_policy_revalidated(&fwd_key, PolicyRevalidationKind::LiveEgress);
+    sessions.set_policy_revalidation_gen(2);
+    assert!(matches!(
+        sessions.policy_revalidation_target(&reverse_key),
+        PolicyRevalidationTarget::Stale(_)
+    ));
+
+    let _publish_guard = crate::afxdp::bpf_map::take_conntrack_publish_guard();
+    crate::afxdp::bpf_map::clear_conntrack_rows_for_test();
+    let session_id = sessions.session_id_for(&fwd_key);
+    let timeout_secs = sessions.timeout_secs_for(&fwd_key);
+    assert_eq!(
+        crate::afxdp::bpf_map::publish_bpf_conntrack_entry(
+            crate::afxdp::bpf_map::CONNTRACK_TEST_MAP_FD,
+            -1,
+            &fwd_key,
+            decision,
+            &metadata,
+            &FastMap::default(),
+            0,
+            catalog1.lookup_admitted(
+                PROTO_TCP,
+                fwd_key.src_port,
+                fwd_key.dst_port,
+                false,
+                Some(8443),
+            ),
+            session_id,
+            timeout_secs,
+            SessionOrigin::ForwardFlow,
+        ),
+        crate::afxdp::bpf_map::ConntrackPublishResult::Written
+    );
+    let flow = SessionFlow {
+        src_ip: fwd_key.src_ip,
+        dst_ip: fwd_key.dst_ip,
+        forward_key: fwd_key.clone(),
+    };
+    assert!(app_id_revalidation_hit(
+        &forwarding,
+        &mut sessions,
+        &reverse_key,
+        &reverse_metadata,
+        reverse_decision,
+        &flow,
+        SessionOrigin::ReverseFlow,
+    ));
+    assert_eq!(
+        crate::afxdp::bpf_map::conntrack_row_for_test(&fwd_key)
+            .expect("reverse hit updates the forward row")
+            .app_id,
+        22,
+        "the post-NAT :8443 app must win over the wire :443 app"
+    );
 }

@@ -846,6 +846,8 @@ thread_local! {
         std::cell::RefCell<std::collections::HashMap<SessionKey, ConntrackPublishRecord>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
     static CONNTRACK_RESTORE_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static CONNTRACK_TEST_APP_ID_RESTAMP_WRITES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -880,6 +882,12 @@ pub(crate) fn force_conntrack_restore_failure_for_test() -> ConntrackRestoreFail
 #[cfg(test)]
 pub(crate) fn clear_conntrack_rows_for_test() {
     CONNTRACK_TEST_ROWS.with(|rows| rows.borrow_mut().clear());
+    CONNTRACK_TEST_APP_ID_RESTAMP_WRITES.with(|writes| writes.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn conntrack_app_id_restamp_writes_for_test() -> usize {
+    CONNTRACK_TEST_APP_ID_RESTAMP_WRITES.with(std::cell::Cell::get)
 }
 
 /// #6965/#8105: clear this thread's recorder so a sampling test starts from a
@@ -1597,9 +1605,164 @@ pub(super) fn restamp_bpf_conntrack_policy(
     false
 }
 
+/// Test builds route the sentinel fd to the test syscall model.
+/// Always false outside test builds, so the `fd < 0` early-true in
+/// `restamp_bpf_conntrack_app_id` keeps its exact production meaning.
+fn is_conntrack_test_fd(fd: c_int) -> bool {
+    #[cfg(test)]
+    if fd == CONNTRACK_TEST_MAP_FD {
+        return true;
+    }
+    #[cfg(not(test))]
+    let _ = fd;
+    false
+}
+
+/// #12191 test seam for the AppID restamp lookup.
+///
+/// For `CONNTRACK_TEST_MAP_FD` this models only the lookup syscall: it fills
+/// `value.app_id` from `CONNTRACK_TEST_ROWS` and reports found (0) or missing
+/// (-1, the ENOENT shape). The equal-AppID skip stays production code shared
+/// with non-test builds, so the same-AppID test pins the real decision:
+/// deleting the skip must surface as restamp writes. Other fds run libbpf.
+fn restamp_conntrack_lookup_v4(
+    fd: c_int,
+    session_key: &SessionKey,
+    bpf_key: &BpfSessionKeyV4,
+    value: &mut BpfSessionValueV4,
+) -> c_int {
+    #[cfg(test)]
+    if fd == CONNTRACK_TEST_MAP_FD {
+        return match CONNTRACK_TEST_ROWS.with(|rows| {
+            rows.borrow()
+                .get(&bare_conntrack_test_key(session_key))
+                .map(|row| row.app_id)
+        }) {
+            Some(stored) => {
+                value.app_id = stored;
+                0
+            }
+            None => -1,
+        };
+    }
+    #[cfg(not(test))]
+    let _ = session_key;
+    unsafe {
+        libbpf_sys::bpf_map_lookup_elem(
+            fd,
+            (bpf_key as *const BpfSessionKeyV4).cast::<c_void>(),
+            (value as *mut BpfSessionValueV4).cast::<c_void>(),
+        )
+    }
+}
+
+/// IPv6 counterpart to [`restamp_conntrack_lookup_v4`].
+fn restamp_conntrack_lookup_v6(
+    fd: c_int,
+    session_key: &SessionKey,
+    bpf_key: &BpfSessionKeyV6,
+    value: &mut BpfSessionValueV6,
+) -> c_int {
+    #[cfg(test)]
+    if fd == CONNTRACK_TEST_MAP_FD {
+        return match CONNTRACK_TEST_ROWS.with(|rows| {
+            rows.borrow()
+                .get(&bare_conntrack_test_key(session_key))
+                .map(|row| row.app_id)
+        }) {
+            Some(stored) => {
+                value.app_id = stored;
+                0
+            }
+            None => -1,
+        };
+    }
+    #[cfg(not(test))]
+    let _ = session_key;
+    unsafe {
+        libbpf_sys::bpf_map_lookup_elem(
+            fd,
+            (bpf_key as *const BpfSessionKeyV6).cast::<c_void>(),
+            (value as *mut BpfSessionValueV6).cast::<c_void>(),
+        )
+    }
+}
+
+/// #12191 test seam for the AppID restamp update.
+///
+/// For `CONNTRACK_TEST_MAP_FD` this models only the `BPF_EXIST` update
+/// syscall: it rewrites the stored row's AppID from the value production
+/// just stamped and counts one restamp write. A missing row fails (-1) like
+/// `BPF_EXIST` on an absent key. Other fds run libbpf.
+fn restamp_conntrack_update_v4(
+    fd: c_int,
+    session_key: &SessionKey,
+    bpf_key: &BpfSessionKeyV4,
+    value: &BpfSessionValueV4,
+) -> c_int {
+    #[cfg(test)]
+    if fd == CONNTRACK_TEST_MAP_FD {
+        let found = CONNTRACK_TEST_ROWS.with(|rows| {
+            rows.borrow_mut()
+                .get_mut(&bare_conntrack_test_key(session_key))
+                .map(|row| {
+                    row.app_id = value.app_id;
+                    CONNTRACK_TEST_APP_ID_RESTAMP_WRITES.with(|writes| {
+                        writes.set(writes.get() + 1);
+                    });
+                })
+                .is_some()
+        });
+        return if found { 0 } else { -1 };
+    }
+    #[cfg(not(test))]
+    let _ = session_key;
+    unsafe {
+        libbpf_sys::bpf_map_update_elem(
+            fd,
+            (bpf_key as *const BpfSessionKeyV4).cast::<c_void>(),
+            (value as *const BpfSessionValueV4).cast::<c_void>(),
+            libbpf_sys::BPF_EXIST as u64,
+        )
+    }
+}
+
+/// IPv6 counterpart to [`restamp_conntrack_update_v4`].
+fn restamp_conntrack_update_v6(
+    fd: c_int,
+    session_key: &SessionKey,
+    bpf_key: &BpfSessionKeyV6,
+    value: &BpfSessionValueV6,
+) -> c_int {
+    #[cfg(test)]
+    if fd == CONNTRACK_TEST_MAP_FD {
+        let found = CONNTRACK_TEST_ROWS.with(|rows| {
+            rows.borrow_mut()
+                .get_mut(&bare_conntrack_test_key(session_key))
+                .map(|row| {
+                    row.app_id = value.app_id;
+                    CONNTRACK_TEST_APP_ID_RESTAMP_WRITES.with(|writes| {
+                        writes.set(writes.get() + 1);
+                    });
+                })
+                .is_some()
+        });
+        return if found { 0 } else { -1 };
+    }
+    #[cfg(not(test))]
+    let _ = session_key;
+    unsafe {
+        libbpf_sys::bpf_map_update_elem(
+            fd,
+            (bpf_key as *const BpfSessionKeyV6).cast::<c_void>(),
+            (value as *const BpfSessionValueV6).cast::<c_void>(),
+            libbpf_sys::BPF_EXIST as u64,
+        )
+    }
+}
+
 /// Update only the AppID label in an existing conntrack row. Read/modify/write
 /// preserves the live row's counters, timestamps, NAT state, and session id.
-#[cold]
 pub(super) fn restamp_bpf_conntrack_app_id(
     conntrack_v4_fd: c_int,
     conntrack_v6_fd: c_int,
@@ -1610,18 +1773,7 @@ pub(super) fn restamp_bpf_conntrack_app_id(
         let (IpAddr::V4(src), IpAddr::V4(dst)) = (key.src_ip, key.dst_ip) else {
             return false;
         };
-        #[cfg(test)]
-        if conntrack_v4_fd == CONNTRACK_TEST_MAP_FD {
-            return CONNTRACK_TEST_ROWS.with(|rows| {
-                rows.borrow_mut()
-                    .get_mut(&bare_conntrack_test_key(key))
-                    .is_some_and(|row| {
-                        row.app_id = app_id;
-                        true
-                    })
-            });
-        }
-        if conntrack_v4_fd < 0 {
+        if conntrack_v4_fd < 0 && !is_conntrack_test_fd(conntrack_v4_fd) {
             return true;
         }
         let bpf_key = bpf_session_key_v4(
@@ -1632,43 +1784,20 @@ pub(super) fn restamp_bpf_conntrack_app_id(
             key.protocol,
         );
         let mut value: BpfSessionValueV4 = unsafe { std::mem::zeroed() };
-        let found = unsafe {
-            libbpf_sys::bpf_map_lookup_elem(
-                conntrack_v4_fd,
-                (&bpf_key as *const BpfSessionKeyV4).cast::<c_void>(),
-                (&mut value as *mut BpfSessionValueV4).cast::<c_void>(),
-            )
-        };
-        if found != 0 {
+        if restamp_conntrack_lookup_v4(conntrack_v4_fd, key, &bpf_key, &mut value) != 0 {
             return false;
         }
+        if value.app_id == app_id {
+            return true;
+        }
         value.app_id = app_id;
-        let updated = unsafe {
-            libbpf_sys::bpf_map_update_elem(
-                conntrack_v4_fd,
-                (&bpf_key as *const BpfSessionKeyV4).cast::<c_void>(),
-                (&value as *const BpfSessionValueV4).cast::<c_void>(),
-                libbpf_sys::BPF_EXIST as u64,
-            )
-        };
-        return updated == 0;
+        return restamp_conntrack_update_v4(conntrack_v4_fd, key, &bpf_key, &value) == 0;
     }
     if key.addr_family as i32 == libc::AF_INET6 {
         let (IpAddr::V6(src), IpAddr::V6(dst)) = (key.src_ip, key.dst_ip) else {
             return false;
         };
-        #[cfg(test)]
-        if conntrack_v6_fd == CONNTRACK_TEST_MAP_FD {
-            return CONNTRACK_TEST_ROWS.with(|rows| {
-                rows.borrow_mut()
-                    .get_mut(&bare_conntrack_test_key(key))
-                    .is_some_and(|row| {
-                        row.app_id = app_id;
-                        true
-                    })
-            });
-        }
-        if conntrack_v6_fd < 0 {
+        if conntrack_v6_fd < 0 && !is_conntrack_test_fd(conntrack_v6_fd) {
             return true;
         }
         let bpf_key = bpf_session_key_v6(
@@ -1679,26 +1808,14 @@ pub(super) fn restamp_bpf_conntrack_app_id(
             key.protocol,
         );
         let mut value: BpfSessionValueV6 = unsafe { std::mem::zeroed() };
-        let found = unsafe {
-            libbpf_sys::bpf_map_lookup_elem(
-                conntrack_v6_fd,
-                (&bpf_key as *const BpfSessionKeyV6).cast::<c_void>(),
-                (&mut value as *mut BpfSessionValueV6).cast::<c_void>(),
-            )
-        };
-        if found != 0 {
+        if restamp_conntrack_lookup_v6(conntrack_v6_fd, key, &bpf_key, &mut value) != 0 {
             return false;
         }
+        if value.app_id == app_id {
+            return true;
+        }
         value.app_id = app_id;
-        let updated = unsafe {
-            libbpf_sys::bpf_map_update_elem(
-                conntrack_v6_fd,
-                (&bpf_key as *const BpfSessionKeyV6).cast::<c_void>(),
-                (&value as *const BpfSessionValueV6).cast::<c_void>(),
-                libbpf_sys::BPF_EXIST as u64,
-            )
-        };
-        return updated == 0;
+        return restamp_conntrack_update_v6(conntrack_v6_fd, key, &bpf_key, &value) == 0;
     }
     false
 }

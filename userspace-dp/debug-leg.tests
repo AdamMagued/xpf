@@ -710,6 +710,7 @@ xpf-userspace-dp	afxdp::poll_descriptor::flow_cache_hit::flow_cache_hit_tests::l
 xpf-userspace-dp	afxdp::poll_descriptor::flow_cache_hit::flow_cache_hit_tests::live_flow_cache_callsite_refreshes_only_a_stale_session_6997
 xpf-userspace-dp	afxdp::poll_descriptor::flow_cache_hit::flow_cache_hit_tests::the_two_production_routes_agree_for_one_frame_8262
 xpf-userspace-dp	afxdp::poll_descriptor::flowless_verdict::tests::ipv6_ext_header_drop_tests::normal_frame_helper_neither_drops_nor_counts
+xpf-userspace-dp	afxdp::poll_descriptor::policy_revalidation::tests::reverse_stale_dnat_hit_restamps_post_nat_forward_row_12191
 xpf-userspace-dp	afxdp::poll_descriptor::prerouting_scope::tests::prerouting_scope_tests::prerouting_dnat_scope_uses_logical_vlan_unit_zone_5802
 xpf-userspace-dp	afxdp::poll_descriptor::prerouting_scope::tests::prerouting_scope_tests::prerouting_static_dnat_scope_uses_logical_vlan_unit_interface_5802
 xpf-userspace-dp	afxdp::poll_descriptor::reject_reply::tests::deny_reply_and_emit_plain_deny_silent_logs_deny_no_session_init_4499
@@ -1210,6 +1211,7 @@ xpf-userspace-dp	afxdp::tests_policy_revocation_8356::an_ingress_side_interface_
 xpf-userspace-dp	afxdp::tests_policy_revocation_8356::an_unchanged_dnat_policy_does_not_revoke_the_established_session_9382
 xpf-userspace-dp	afxdp::tests_policy_revocation_8356::an_unchanged_nat64_policy_with_a_mixed_family_destination_set_does_not_revoke_9382
 xpf-userspace-dp	afxdp::tests_policy_revocation_8356::an_unchanged_nptv6_policy_does_not_revoke_the_established_session_9382
+xpf-userspace-dp	afxdp::tests_policy_revocation_8356::descriptor_path_stale_dnat_hit_restamps_conntrack_app_id_12191
 xpf-userspace-dp	afxdp::tests_policy_revocation_8356::dnat_distinct_ports_reverse_triggered_narrowing_revokes_9604
 xpf-userspace-dp	afxdp::tests_policy_revocation_8356::dnat_pair_permit_names_real_server_kept_on_reverse_9604
 xpf-userspace-dp	afxdp::tests_policy_revocation_8356::dnat_pair_reverse_triggered_narrowing_revokes_9604
