@@ -533,16 +533,34 @@ EXPECTED_CENSUS_JOB="$(cat <<'EXPECTED_CENSUS_JOB_EOF'
         run: bash ./test/incus/harness-census-selftest.sh
 EXPECTED_CENSUS_JOB_EOF
 )"
-# Workflow-level keys must be exactly the expected set: a top-level
-# `defaults:` (for example `run: shell: true {0}`) can neuter the census
-# step while leaving the allowlisted job block untouched.
-TOP_LEVEL_KEYS="$(grep -E '^[^[:space:]#][^:]*:' "$CI_WORKFLOW" 2>/dev/null | sed 's/:.*//' | LC_ALL=C sort)"
-EXPECTED_TOP_LEVEL_KEYS="jobs
-name
-on
-permissions"
+# The workflow frame around the census job is pinned too. The ordered
+# column-0 lines must equal the expected four: an explicit `? defaults`
+# key or any extra top-level key changes them while a key-name grep
+# misses colon-less explicit keys. The `on:` block must be exactly
+# `pull_request:`: retargeting the trigger would silently stop the check
+# from running on PRs. And there must be exactly one `census:` job: a
+# copy of the literal inside a block scalar would otherwise satisfy the
+# slice while the real job fails open.
+TOP_LEVEL_LINES="$(grep -vE '^([[:space:]]|#|$)' "$CI_WORKFLOW" 2>/dev/null)"
+EXPECTED_TOP_LEVEL_LINES="$(cat <<'EXPECTED_TOP_LEVEL_LINES_EOF'
+name: CI tests
+on:
+permissions:
+jobs:
+EXPECTED_TOP_LEVEL_LINES_EOF
+)"
+ON_BLOCK="$(awk '/^on:/{p=1; print; next} /^[^[:space:]#]/{p=0} p' "$CI_WORKFLOW" 2>/dev/null)"
+EXPECTED_ON_BLOCK="$(cat <<'EXPECTED_ON_BLOCK_EOF'
+on:
+  pull_request:
+EXPECTED_ON_BLOCK_EOF
+)"
+CENSUS_JOB_COUNT="$(grep -c '^  census:' "$CI_WORKFLOW" 2>/dev/null || true)"
 CENSUS_WIRING_OK=0
-if [[ "$CENSUS_JOB" == "$EXPECTED_CENSUS_JOB" && "$TOP_LEVEL_KEYS" == "$EXPECTED_TOP_LEVEL_KEYS" ]]; then
+if [[ "$CENSUS_JOB" == "$EXPECTED_CENSUS_JOB" &&
+	"$TOP_LEVEL_LINES" == "$EXPECTED_TOP_LEVEL_LINES" &&
+	"$ON_BLOCK" == "$EXPECTED_ON_BLOCK" &&
+	"$CENSUS_JOB_COUNT" -eq 1 ]]; then
 	CENSUS_WIRING_OK=1
 fi
 if [[ $CENSUS_WIRING_OK -eq 1 ]]; then
