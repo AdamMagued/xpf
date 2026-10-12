@@ -12,15 +12,17 @@
 # This lib makes both observations fail-closed.
 
 # Bounded-poll budget for a single RG1 move. Overridable for the hermetic
-# selftest (which stubs `sleep` and advances SECONDS instantly).
+# selftest (which stubs `sleep`; the poller counts attempts, not wall time).
 STRESS_OWNER_TIMEOUT="${STRESS_OWNER_TIMEOUT:-30}"
 STRESS_OWNER_INTERVAL="${STRESS_OWNER_INTERVAL:-2}"
 
 # stress_rg1_owner_verdict <node0|node1> <fw0-status> <fw1-status>
 #
 # Pure: both node queries must independently show the expected RG1 owner as
-# `primary` and the peer as `secondary`. Prints a reason on stdout and
-# returns 1 unless settled; returns 0 with no output when settled.
+# `primary` and the peer as non-owning (`secondary` or `secondary-hold` — an
+# untargeted manual failover parks the old owner in secondary-hold with
+# Manual yes until reset; it has moved, not stuck). Prints a reason on
+# stdout and returns 1 unless settled; returns 0 with no output when settled.
 #
 # Parse contract (pinned by status_layout_contract_8206_test.go): the header
 # is `Redundancy group: N , Failover count: M`; node rows are column-0 with
@@ -42,17 +44,30 @@ stress_parse_rg1_status() {
 		}'
 }
 
+# stress_rg1_view_settled <node0|node1> "<node0-state> <node1-state>"
+#
+# One query's verdict: the expected owner must read exactly `primary`; the
+# other node must read non-owning (`secondary` or `secondary-hold`).
+stress_rg1_view_settled() {
+	local expected="$1" n0 n1
+	read -r n0 n1 <<<"$2"
+	case "$expected" in
+	node0) [[ $n0 == primary && ( $n1 == secondary || $n1 == secondary-hold ) ]] ;;
+	node1) [[ $n1 == primary && ( $n0 == secondary || $n0 == secondary-hold ) ]] ;;
+	*) return 1 ;;
+	esac
+}
+
 stress_rg1_owner_verdict() {
 	local expected="$1" s0="$2" s1="$3"
-	local r0 r1 wanted0 wanted1
+	local r0 r1
 	case "$expected" in
-	node0) wanted0=primary; wanted1=secondary ;;
-	node1) wanted0=secondary; wanted1=primary ;;
+	node0 | node1) ;;
 	*) printf 'invalid expected RG1 owner: %s\n' "$expected"; return 1 ;;
 	esac
 	r0=$(stress_parse_rg1_status "$s0")
 	r1=$(stress_parse_rg1_status "$s1")
-	if [[ "$r0" == "$wanted0 $wanted1" && "$r1" == "$wanted0 $wanted1" ]]; then
+	if stress_rg1_view_settled "$expected" "$r0" && stress_rg1_view_settled "$expected" "$r1"; then
 		return 0
 	fi
 	printf 'expected %s primary for RG1 (fw0 query: %s; fw1 query: %s)\n' "$expected" "$r0" "$r1"
@@ -87,13 +102,15 @@ stress_request() {
 # wait_rg1_owner <node0|node1> <label>
 #
 # Bounded-poll BOTH nodes until both queries agree the expected node owns
-# RG1. pass() on settle; fail() when the deadline expires or every read is
-# blind. Returns 0 on settle, 1 otherwise. Requires FW0/FW1 from the
+# RG1. pass() on settle; fail() when the attempt budget expires or every read
+# is blind. Returns 0 on settle, 1 otherwise. Requires FW0/FW1 from the
 # caller (cluster-env.sh in the gate; fixtures in the selftest).
 wait_rg1_owner() {
 	local expected="$1" label="$2"
-	local start s0 s1 reason=""
-	start=$SECONDS
+	# Attempt counter, not $SECONDS: bash advances SECONDS on whole-second
+	# boundaries, so a wall-clock tick inside a short window ends the poll
+	# early (flaky read counts). Each attempt costs one INTERVAL.
+	local waited=0 s0 s1 reason=""
 	while :; do
 		s0=$(incus exec "$FW0" -- cli -c 'show chassis cluster status' 2>/dev/null || true)
 		s1=$(incus exec "$FW1" -- cli -c 'show chassis cluster status' 2>/dev/null || true)
@@ -101,10 +118,11 @@ wait_rg1_owner() {
 			pass "${label}: RG1 settled on ${expected} (both node queries)"
 			return 0
 		fi
-		if (( SECONDS - start >= STRESS_OWNER_TIMEOUT )); then
+		if (( waited >= STRESS_OWNER_TIMEOUT )); then
 			break
 		fi
 		sleep "$STRESS_OWNER_INTERVAL"
+		waited=$((waited + STRESS_OWNER_INTERVAL))
 	done
 	fail "${label}: RG1 did not move (${reason:-owner poll blind for ${STRESS_OWNER_TIMEOUT}s})"
 	return 1
