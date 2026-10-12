@@ -475,7 +475,8 @@ func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) 
 	// #3075: stable-zone-id collision gate. Like the tunnel gate above it runs
 	// on the PRE-expansion tree and unions zone names across all groups (Views
 	// 1/2/3, see zoneid.go) so both cluster nodes accept/reject identically.
-	// Strict hard-rejects a colliding pair; lenient warns.
+	// Strict hard-rejects a colliding pair; lenient warns. It also returns the
+	// main/node0/node1 zone names runtime quarantine decides over (#12247).
 	zoneIDWarnings, zoneQuarantineNames, zoneIDErr := validateZoneIDCollisionAST(
 		tree, opts.lenientZoneIDCollision)
 	if zoneIDErr != nil {
@@ -841,7 +842,8 @@ func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts
 
 	// #3075: stable-zone-id collision gate — see compileConfigWithOpts.
 	// Pre-expansion union across all groups so the verdict is identical on both
-	// cluster nodes; read-only, safe on the soon-to-be-expanded copy.
+	// cluster nodes; read-only, safe on the soon-to-be-expanded copy. The
+	// returned runtime name set is the same on both nodes (#12247).
 	zoneIDWarnings, zoneQuarantineNames, zoneIDErr := validateZoneIDCollisionAST(
 		tree, opts.lenientZoneIDCollision)
 	if zoneIDErr != nil {

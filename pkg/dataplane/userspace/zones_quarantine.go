@@ -57,10 +57,12 @@ func (c ZoneIDCollision) String() string {
 // interfaces, and policies.
 //
 // The quarantine set is config.ZoneQuarantineExclusions over the compiler's
-// three-view name union carried in snap.Config. This keeps node-scoped peer-only
-// colliders from surviving on one node; hand-built snapshots without compiled
-// metadata fall back to their own zone names. Collision records remain sorted
-// for deterministic operator output (nil in the common no-collision case).
+// runtime zone-name set carried in snap.Config (config.ZoneQuarantineNamesForConfig:
+// the main, node0 and node1 views merged with the config's own zones). This
+// keeps node-scoped peer-only colliders from surviving on one node; hand-built
+// snapshots without compiled metadata fall back to their own zone names.
+// Collision records remain sorted for deterministic operator output (nil in
+// the common no-collision case).
 func quarantineCollidingZones(snap *ConfigSnapshot) []ZoneIDCollision {
 	if snap == nil || len(snap.Zones) == 0 {
 		return nil
@@ -238,9 +240,10 @@ func scrubPoliciesForQuarantinedZones(policies []PolicyRuleSnapshot, quarantined
 }
 
 // quarantinedZoneNamesForConfig computes the StableZoneID quarantine set from
-// the same three-view name union used by the full snapshot build. Partial-
-// republish paths use it to re-scrub policies against collisions contributed by
-// peer-only group views as well as the effective config's local zones.
+// the same runtime zone-name set the full snapshot build uses
+// (config.ZoneQuarantineNamesForConfig). Partial-republish paths use it to
+// re-scrub policies against collisions contributed by peer-only node views as
+// well as the effective config's local zones.
 func quarantinedZoneNamesForConfig(cfg *config.Config) map[string]struct{} {
 	return config.QuarantinedZoneNames(config.ZoneQuarantineNamesForConfig(cfg))
 }

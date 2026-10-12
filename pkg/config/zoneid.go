@@ -96,6 +96,42 @@ func emitNodeExpandedZoneNames(tree *ConfigTree, nodeID int, out map[string]stru
 	}
 }
 
+// zoneRuntimeNameUnionAST is the security-zone name set tolerant compiles
+// record as Config.ZoneQuarantineNames (#12247): the main, node0 and node1
+// views — every top-level `security` root (#5691) plus the node0/node1
+// expansions (Views 2/3), i.e. every name a cluster node installs. Both nodes
+// compute it from the same candidate, so both quarantine the same survivor even
+// when a collider exists only in the peer's view; a node view whose expansion
+// fails contributes nothing. The generic compile, and a node compile for any
+// other ID, add their own zones where the set is consumed
+// (ZoneQuarantineNamesForConfig merges cfg.Security.Zones), so a name only
+// such a compile lands — a group literally named "${node}" — never quarantines
+// a zone on the cluster nodes.
+//
+// View 1's raw `groups` scan is deliberately absent. A name only a groups block
+// declares — a `<*>` wildcard template, a group nothing applies, or a group
+// applied under another stanza — is installed by no node. Letting it quarantine
+// a live zone would unzone that zone's interfaces and deny its traffic in
+// favour of a zone that exists nowhere (the zone analogue of #9657).
+func zoneRuntimeNameUnionAST(tree *ConfigTree) map[string]struct{} {
+	names := make(map[string]struct{})
+	for _, sec := range tree.FindChildren("security") {
+		collectZoneNamesAST(sec, names)
+	}
+	emitNodeExpandedZoneNames(tree, 0, names)
+	emitNodeExpandedZoneNames(tree, 1, names)
+	return names
+}
+
+func sortedZoneNameSet(set map[string]struct{}) []string {
+	out := make([]string, 0, len(set))
+	for name := range set {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // validateZoneIDCollisionAST checks the UNION of security-zone names across
 // three views of the candidate config for StableZoneID collisions (#3075),
 // mirroring validateTunnelEndpointIDCollisionAST (#1873/#1914):
@@ -123,17 +159,22 @@ func emitNodeExpandedZoneNames(tree *ConfigTree, nodeID int, out map[string]stru
 // the fold guarantees no reserved-sentinel id and the dataplane independently
 // fails closed on an unresolvable zone, so a leniently-loaded colliding config
 // is inert on the later-folding zone rather than mis-attributed.
-// It also returns the sorted three-view union so tolerant compiles can carry
-// the same names into runtime quarantine after node-specific group expansion.
+// It also returns the sorted runtime name set (zoneRuntimeNameUnionAST) that
+// tolerant compiles record as Config.ZoneQuarantineNames (#12247). The gate set
+// is that runtime set plus View 1's groups scan, so a collision inside the
+// runtime set is always one strict commit rejects. The converse does not hold:
+// a collider only a groups block declares still fails strict commit and draws
+// the lenient warning below, yet no node installs it, so runtime quarantines
+// nothing for it.
 func validateZoneIDCollisionAST(tree *ConfigTree, lenient bool) ([]string, []string, error) {
-	names := make(map[string]struct{})
-	// View 1 — pre-expansion presence union (main + every groups block). Union
-	// across EVERY top-level `security` root (#5691): a split config can declare
-	// zones in a second `security { }` stanza, and compileSections compiles them
-	// all, so a first-root-only scan would miss a collision spanning the roots.
-	for _, sec := range tree.FindChildren("security") {
-		collectZoneNamesAST(sec, names)
+	runtimeNames := zoneRuntimeNameUnionAST(tree)
+	names := make(map[string]struct{}, len(runtimeNames))
+	for name := range runtimeNames {
+		names[name] = struct{}{}
 	}
+	// View 1 — pre-expansion presence union. Its main `security` roots (every
+	// root, #5691) are already in runtimeNames; add every groups block so a
+	// collision with a group-scoped zone fails commit on both nodes.
 	for _, child := range tree.Children {
 		if child.Name() != "groups" {
 			continue
@@ -153,18 +194,10 @@ func validateZoneIDCollisionAST(tree *ConfigTree, lenient bool) ([]string, []str
 			}
 		}
 	}
-	// Views 2/3 — post-expansion zone names for node0 and node1. Both computed
-	// on both nodes from the shared candidate, so the union stays HA-symmetric;
-	// per-node expansion errors contribute the empty set (non-fatal).
-	emitNodeExpandedZoneNames(tree, 0, names)
-	emitNodeExpandedZoneNames(tree, 1, names)
-	sorted := make([]string, 0, len(names))
-	for name := range names {
-		sorted = append(sorted, name)
-	}
-	sort.Strings(sorted)
+	runtime := sortedZoneNameSet(runtimeNames)
+	sorted := sortedZoneNameSet(names)
 	if len(sorted) < 2 {
-		return nil, sorted, nil
+		return nil, runtime, nil
 	}
 	byID := make(map[uint16]string, len(sorted))
 	var warnings []string
@@ -179,7 +212,7 @@ func validateZoneIDCollisionAST(tree *ConfigTree, lenient bool) ([]string, []str
 			"zone id collision between %q and %q (both fold to %d) — rename one zone (#3075)",
 			owner, name, id)
 		if !lenient {
-			return nil, sorted, fmt.Errorf("security zones: %s", msg)
+			return nil, nil, fmt.Errorf("security zones: %s", msg)
 		}
 		// #3719: the lenient path keeps booting but QUARANTINES the
 		// later-sorting zone (QuarantinedZoneNames) so the dataplane never
@@ -191,12 +224,13 @@ func validateZoneIDCollisionAST(tree *ConfigTree, lenient bool) ([]string, []str
 			" (dropped from the dataplane, its interfaces unzoned and its traffic denied) —"+
 			" zone isolation is DEGRADED until one zone is renamed", msg, name))
 	}
-	return warnings, sorted, nil
+	return warnings, runtime, nil
 }
 
-// ZoneQuarantineNamesForConfig returns the sorted three-view zone-name union
-// recorded by the compiler, including any effective zone keys added later.
-// Manually constructed Config values fall back to their effective zone keys.
+// ZoneQuarantineNamesForConfig returns the sorted runtime zone-name set the
+// compiler recorded (Config.ZoneQuarantineNames, see zoneRuntimeNameUnionAST)
+// merged with cfg's effective zone keys. Manually constructed Config values
+// carry no recorded set and fall back to their effective zone keys alone.
 func ZoneQuarantineNamesForConfig(cfg *Config) []string {
 	if cfg == nil {
 		return nil
@@ -228,7 +262,7 @@ func ZoneQuarantineNamesForConfig(cfg *Config) []string {
 }
 
 // ZoneQuarantineExclusionsForConfig returns the collision losers and reserved
-// names excluded for the compiler's full HA name union.
+// names excluded from cfg's runtime zone-name set (ZoneQuarantineNamesForConfig).
 func ZoneQuarantineExclusionsForConfig(cfg *Config) map[string]struct{} {
 	return ZoneQuarantineExclusions(ZoneQuarantineNamesForConfig(cfg))
 }
@@ -322,7 +356,8 @@ func HasDefinedAnyZoneName(names []string) bool {
 
 // ZoneQuarantineExcludedReason returns the operator-facing reason for a
 // quarantined zone in cfg. It returns an empty string for an ordinary or
-// survivor zone, and uses the same three-view name union as snapshot builders.
+// survivor zone, and uses the same runtime name set as the snapshot builders
+// (ZoneQuarantineNamesForConfig).
 func ZoneQuarantineExcludedReason(name string, cfg *Config) string {
 	if cfg == nil || name == "" {
 		return ""
@@ -389,8 +424,10 @@ func StableZoneIDOwner(names []string, id uint16) string {
 // deterministic sorted-first name for each id (rather than reintroducing map
 // iteration nondeterminism); callers that always have a config never hit that
 // arm.
-// Names absent from cfg (a rename/delete the apply result predates, #3075) are
-// kept: ExcludedReason only fires for names quarantined within cfg's own set.
+// Names outside cfg's runtime zone-name set (a rename/delete the apply result
+// predates, #3075) are kept: ExcludedReason only fires for names that set
+// quarantines, which can include a collider that exists only in a peer node's
+// view (#12247).
 func SurvivorZoneNames(zoneIDs map[string]uint16, cfg *Config) map[uint16]string {
 	names := make([]string, 0, len(zoneIDs))
 	for name := range zoneIDs {

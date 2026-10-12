@@ -139,7 +139,7 @@ func authoredZoneRefs(cfg *config.Config) map[string]string {
 }
 
 // quarantinedZoneNames returns the zone names excluded from dataplane install.
-// It uses the compiler's full three-view name union.
+// It uses the compiler's runtime zone-name set (config.ZoneQuarantineNamesForConfig).
 func quarantinedZoneNames(cfg *config.Config) map[string]struct{} {
 	return config.ZoneQuarantineExclusionsForConfig(cfg)
 }

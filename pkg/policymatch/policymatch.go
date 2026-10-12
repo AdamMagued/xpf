@@ -1985,7 +1985,7 @@ func zoneKnown(cfg *config.Config, zone string) bool {
 }
 
 // quarantinedZoneNames returns the runtime-exclusion set for the compiler's
-// full three-view zone-name union, including peer-only node groups.
+// runtime zone-name set, including colliders from peer-only node groups.
 func quarantinedZoneNames(cfg *config.Config) map[string]struct{} {
 	return config.ZoneQuarantineExclusionsForConfig(cfg)
 }

@@ -567,10 +567,12 @@ type Config struct {
 	// claims are consumed by the same kernel/userspace membership helpers but
 	// never re-expand through the original bare-member string.
 	QuarantinedRIMemberPrimaryClaims []RoutingInstanceMemberPrimaryClaim `json:"-"`
-	// ZoneQuarantineNames is the sorted union of the main, node0, and node1
-	// security-zone views collected before group expansion. Runtime quarantine
-	// consumes it so a node cannot retain a peer-only colliding zone. It is
-	// compile-time metadata only and is never sent over the dataplane wire.
+	// ZoneQuarantineNames is the sorted main/node0/node1 security-zone name set
+	// (zoneRuntimeNameUnionAST): every top-level security root plus the node0
+	// and node1 group expansions. Runtime quarantine consumes it so a node
+	// cannot retain a peer-only colliding zone, while a name only a groups block
+	// declares never quarantines a live zone. It is compile-time metadata only
+	// and is never sent over the dataplane wire.
 	ZoneQuarantineNames []string `json:"-"`
 	Firewall            FirewallConfig
 	ClassOfService      *ClassOfServiceConfig
