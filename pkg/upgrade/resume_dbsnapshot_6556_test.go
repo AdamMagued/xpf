@@ -141,7 +141,7 @@ func TestRun_ResumedCutPastStoppedKeepsOriginalSnapshot6556(t *testing.T) {
 	if string(got) == postFlipContent {
 		t.Fatalf("a resume at FLIPPED re-snapshotted POST-upgrade DB content and then "+
 			"restored it as the rollback target — the old binary would boot against a "+
-			"too-new envelope. The re-snapshot must be floored at STOPPED (#6556).\n"+
+			"too-new envelope. A resume past STOPPED must retain the original snapshot (#6556).\n"+
 			" got=%q\nwant=%q", got, preContent)
 	}
 	if string(got) != preContent {

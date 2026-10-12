@@ -584,9 +584,12 @@ func (r *Runner) Run(opts Options) (err error) {
 		// This preflight-resume snapshot is intentionally limited to
 		// PREFLIGHT/COPY/VERIFY: STOPPED is the cut boundary, and once FLIP
 		// repoints versions/current the new daemon may already have migrated
-		// the DB. The STOPPED-resume path below separately verifies whether
-		// FLIP began; it re-stops and re-snapshots only while current still
-		// names PreviousVersion.
+		// the DB. The STOPPED-resume path below resolves current plus systemd's
+		// loaded ExecStart and running MainPID executable: in non-contradictory
+		// combinations it keeps the unit stopped, refreshes the snapshot when
+		// current still names PreviousVersion or either execution signal names
+		// PreviousVersion (even when current already names the target), and
+		// preserves the original snapshot otherwise.
 		if err := r.snapshotConfigDB(j); err != nil {
 			return fmt.Errorf("resume: re-snapshot config DB: %w", err)
 		}
@@ -817,7 +820,7 @@ func (r *Runner) Run(opts Options) (err error) {
 				return restartOldAfterSnapshotFailure(
 					fmt.Errorf("resume STOPPED: persist fresh cut-boundary snapshot: %w", err))
 			}
-			r.logf("upgrade: refreshed the cut-boundary config-DB snapshot after re-stopping the unit")
+			r.logf("upgrade: refreshed the cut-boundary config-DB snapshot after ensuring the unit is stopped")
 			return nil
 		}
 

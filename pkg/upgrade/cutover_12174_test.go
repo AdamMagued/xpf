@@ -147,6 +147,38 @@ func TestRun_StoppedResumeLiveOldUnitPreservesCommits12174(t *testing.T) {
 		t.Fatalf("STOP must happen before FLIP on the STOPPED resume; calls=%v", resumeCalls)
 	}
 }
+
+// TestRun_StoppedResumeUnitStillDownProceeds12174 is the stopped-unit control:
+// the same interrupted-STOPPED same-version resume with the unit still down
+// must complete the cut exactly as before (the fix must not refuse or disturb
+// the already-correct path).
+func TestRun_StoppedResumeUnitStillDownProceeds12174(t *testing.T) {
+	fs := newFakeSystem(t, "1.0.0")
+	const boundaryContent = "#xpf-config-envelope v=1\n{\"gen\":\"cut-boundary-unit-down\"}"
+	r, cfg, dbFile := seedStoppedSameVersionCut(t, fs, boundaryContent)
+
+	// Control: the unit stays stopped across the interruption. No commit can
+	// land while the daemon is down.
+	if fs.unitRunning {
+		t.Fatal("seed left the unit running; the stopped-unit control requires it down")
+	}
+
+	if err := r.Run(Options{}); err != nil {
+		t.Fatalf("resumed STOPPED cut with the unit still down must complete: %v", err)
+	}
+	cur, _ := os.Readlink(filepath.Join(cfg.VersionsDir, currentLink))
+	if filepath.Base(cur) != "2.0.0" {
+		t.Fatalf("current = %q after the stopped-unit resume, want 2.0.0", cur)
+	}
+	got, err := os.ReadFile(dbFile)
+	if err != nil {
+		t.Fatalf("read config DB after resume: %v", err)
+	}
+	if string(got) != boundaryContent {
+		t.Fatalf("stopped-unit resume changed the config DB: got %q want %q", got, boundaryContent)
+	}
+}
+
 func TestRun_Stopped6aOnlyResumePreservesCommits12174(t *testing.T) {
 	fs := newFakeSystem(t, "1.0.0")
 	const boundary = "#xpf-config-envelope v=1\n{\"gen\":\"boundary\"}"
@@ -177,10 +209,23 @@ func TestRun_Stopped6cWrittenBeforeReloadUsesLoadedExecStart12174(t *testing.T) 
 	const boundary = "#xpf-config-envelope v=1\n{\"gen\":\"boundary\"}"
 	r, cfg, dbFile := seedStoppedSameVersionCut(t, fs, boundary)
 	must(t, r.repointSymlink(r.currentPath(), "2.0.0"))
+	oldExe := filepath.Join(r.versionDir("1.0.0"), "xpfd")
+	if fs.loadedExecStart != fakeSystemdExecStart(oldExe) {
+		t.Fatalf("loaded ExecStart = %q, want old executable %q",
+			fs.loadedExecStart, oldExe)
+	}
 	must(t, r.writeUnitDropin("2.0.0")) // 6c persisted; crash before daemon-reload
 	must(t, fs.StartUnit(cfg.Unit))     // systemd still has the old loaded ExecStart
+	if fs.runningUnitExe != oldExe {
+		t.Fatalf("old daemon executable = %q, want %q", fs.runningUnitExe, oldExe)
+	}
 	const committed = "#xpf-config-envelope v=1\n{\"gen\":\"old-unit-commit-before-reload\"}"
 	mkfile(t, dbFile, committed)
+	must(t, fs.StopUnit(cfg.Unit)) // old daemon stopped before resume
+	if fs.unitRunning || fs.runningUnitExe != "" {
+		t.Fatalf("old daemon did not stop before resume: running=%v exe=%q",
+			fs.unitRunning, fs.runningUnitExe)
+	}
 	fs.healthFailVersions["2.0.0"] = true
 
 	err := r.Run(Options{})
@@ -192,7 +237,7 @@ func TestRun_Stopped6cWrittenBeforeReloadUsesLoadedExecStart12174(t *testing.T) 
 		t.Fatalf("resume must reach target-health rollback, got %v", err)
 	}
 	if string(got) != committed {
-		t.Fatalf("resume trusted the on-disk drop-in instead of systemd's loaded ExecStart: got %q want %q",
+		t.Fatalf("resume ignored loaded ExecStart after the old daemon stopped: got %q want %q",
 			got, committed)
 	}
 }
@@ -296,17 +341,28 @@ func TestRun_StoppedFullFlipKeepsOriginalSnapshot12174(t *testing.T) {
 func TestRun_StoppedNeitherVersionRefusesWithRecoveryHint12174(t *testing.T) {
 	fs := newFakeSystem(t, "1.0.0")
 	const boundary = "#xpf-config-envelope v=1\n{\"gen\":\"boundary\"}"
-	r, _, _ := seedStoppedSameVersionCut(t, fs, boundary)
+	r, _, dbFile := seedStoppedSameVersionCut(t, fs, boundary)
+	wantSnapshotPath, wantSnapshot := captureStoppedJournalSnapshot12174(t, r)
+	dbBefore, err := os.ReadFile(dbFile)
+	if err != nil {
+		t.Fatalf("read live config DB before refusal: %v", err)
+	}
 	if _, err := copyTree(r.versionDir("1.0.0"), r.versionDir("1.5.0")); err != nil {
 		t.Fatalf("seed alternate version: %v", err)
 	}
 	must(t, r.repointSymlink(r.currentPath(), "1.5.0"))
 
 	resumeOffset := len(fs.calls)
-	err := r.Run(Options{})
+	err = r.Run(Options{})
 	if err == nil || !strings.Contains(err.Error(), "inspect versions/current") ||
 		!strings.Contains(err.Error(), "without deleting the journal or snapshot") {
 		t.Fatalf("neither-version refusal lacks recovery guidance: %v", err)
+	}
+	assertStoppedJournalSnapshot12174(t, r, wantSnapshotPath, wantSnapshot)
+	dbAfter, readErr := os.ReadFile(dbFile)
+	if readErr != nil || string(dbAfter) != string(dbBefore) {
+		t.Fatalf("neither-version refusal changed live config DB: got %q want %q, err=%v",
+			dbAfter, dbBefore, readErr)
 	}
 	if fs.unitRunning {
 		t.Fatal("neither-version refusal unexpectedly started the unit")
@@ -314,6 +370,176 @@ func TestRun_StoppedNeitherVersionRefusesWithRecoveryHint12174(t *testing.T) {
 	for _, call := range fs.calls[resumeOffset:] {
 		if call == "stop" || call == "dropin" || call == "start" {
 			t.Fatalf("live mutation %q happened on refusal: calls=%v", call, fs.calls[resumeOffset:])
+		}
+	}
+}
+
+func TestRun_StoppedRefusesCurrentPreviousWithTargetExecStart12174(t *testing.T) {
+	fs := newFakeSystem(t, "1.0.0")
+	const boundary = "#xpf-config-envelope v=1\n{\"gen\":\"boundary\"}"
+	r, _, dbFile := seedStoppedSameVersionCut(t, fs, boundary)
+	wantSnapshotPath, wantSnapshot := captureStoppedJournalSnapshot12174(t, r)
+	const migrated = "#xpf-config-envelope v=1 min-reader=99\n{}"
+	mkfile(t, dbFile, migrated)
+	fs.healthFailVersions["2.0.0"] = true
+	must(t, r.writeUnitDropin("2.0.0"))
+	must(t, fs.DaemonReload())
+
+	resumeOffset := len(fs.calls)
+	err := r.Run(Options{})
+	if err == nil || !strings.Contains(err.Error(), "versions/current names previous version") ||
+		!strings.Contains(err.Error(), "unit execution names target") {
+		t.Fatalf("current-previous/target-execution contradiction was not refused: %v", err)
+	}
+	assertStoppedJournalSnapshot12174(t, r, wantSnapshotPath, wantSnapshot)
+	dbAfter, readErr := os.ReadFile(dbFile)
+	if readErr != nil || string(dbAfter) != migrated {
+		t.Fatalf("contradictory execution refusal changed live config DB: got %q want %q, err=%v",
+			dbAfter, migrated, readErr)
+	}
+	assertNoStoppedResumeMutation12174(t, fs.calls[resumeOffset:])
+}
+
+func TestRun_StoppedRefusesCurrentTargetWithTargetMainPIDAndPreviousExecStart12174(t *testing.T) {
+	fs := newFakeSystem(t, "1.0.0")
+	const boundary = "#xpf-config-envelope v=1\n{\"gen\":\"boundary\"}"
+	r, _, dbFile := seedStoppedSameVersionCut(t, fs, boundary)
+	wantSnapshotPath, wantSnapshot := captureStoppedJournalSnapshot12174(t, r)
+	must(t, r.repointSymlink(r.currentPath(), "2.0.0"))
+	const migrated = "#xpf-config-envelope v=1 min-reader=99\n{}"
+	mkfile(t, dbFile, migrated)
+	fs.healthFailVersions["2.0.0"] = true
+	previousExe := filepath.Join(r.versionDir("1.0.0"), "xpfd")
+	targetExe := filepath.Join(r.versionDir("2.0.0"), "xpfd")
+	fs.loadedExecStart = fakeSystemdExecStart(previousExe)
+	fs.unitRunning = true
+	fs.runningUnitExe = targetExe
+
+	resumeOffset := len(fs.calls)
+	err := r.Run(Options{})
+	if err == nil || !strings.Contains(err.Error(), "loaded ExecStart still pins previous") {
+		t.Fatalf("current-target/target-MainPID/previous-ExecStart contradiction was not refused: %v", err)
+	}
+	assertStoppedJournalSnapshot12174(t, r, wantSnapshotPath, wantSnapshot)
+	dbAfter, readErr := os.ReadFile(dbFile)
+	if readErr != nil || string(dbAfter) != migrated {
+		t.Fatalf("contradictory execution refusal changed live config DB: got %q want %q, err=%v",
+			dbAfter, migrated, readErr)
+	}
+	assertNoStoppedResumeMutation12174(t, fs.calls[resumeOffset:])
+}
+
+func TestRun_StoppedRefusesUnknownLoadedExecStart12174(t *testing.T) {
+	fs := newFakeSystem(t, "1.0.0")
+	const boundary = "#xpf-config-envelope v=1\n{\"gen\":\"boundary\"}"
+	r, _, dbFile := seedStoppedSameVersionCut(t, fs, boundary)
+	wantSnapshotPath, wantSnapshot := captureStoppedJournalSnapshot12174(t, r)
+	dbBefore, err := os.ReadFile(dbFile)
+	if err != nil {
+		t.Fatalf("read live config DB before refusal: %v", err)
+	}
+	fs.loadedExecStart = fakeSystemdExecStart("/unrecognized/xpfd")
+
+	resumeOffset := len(fs.calls)
+	err = r.Run(Options{})
+	if err == nil || !strings.Contains(err.Error(), "loaded unit ExecStart") ||
+		!strings.Contains(err.Error(), "matches neither recorded") {
+		t.Fatalf("unknown loaded ExecStart was not refused: %v", err)
+	}
+	assertStoppedJournalSnapshot12174(t, r, wantSnapshotPath, wantSnapshot)
+	dbAfter, readErr := os.ReadFile(dbFile)
+	if readErr != nil || string(dbAfter) != string(dbBefore) {
+		t.Fatalf("unknown loaded ExecStart refusal changed live config DB: got %q want %q, err=%v",
+			dbAfter, dbBefore, readErr)
+	}
+	assertNoStoppedResumeMutation12174(t, fs.calls[resumeOffset:])
+}
+
+func TestRun_StoppedRefusesUnknownRunningExecutable12174(t *testing.T) {
+	fs := newFakeSystem(t, "1.0.0")
+	const boundary = "#xpf-config-envelope v=1\n{\"gen\":\"boundary\"}"
+	r, _, dbFile := seedStoppedSameVersionCut(t, fs, boundary)
+	wantSnapshotPath, wantSnapshot := captureStoppedJournalSnapshot12174(t, r)
+	dbBefore, err := os.ReadFile(dbFile)
+	if err != nil {
+		t.Fatalf("read live config DB before refusal: %v", err)
+	}
+	fs.unitRunning = true
+	fs.runningUnitExe = "/unrecognized/xpfd"
+
+	resumeOffset := len(fs.calls)
+	err = r.Run(Options{})
+	if err == nil || !strings.Contains(err.Error(), "running unit executable") ||
+		!strings.Contains(err.Error(), "matches neither recorded") {
+		t.Fatalf("unknown running executable was not refused: %v", err)
+	}
+	assertStoppedJournalSnapshot12174(t, r, wantSnapshotPath, wantSnapshot)
+	dbAfter, readErr := os.ReadFile(dbFile)
+	if readErr != nil || string(dbAfter) != string(dbBefore) {
+		t.Fatalf("unknown running executable refusal changed live config DB: got %q want %q, err=%v",
+			dbAfter, dbBefore, readErr)
+	}
+	assertNoStoppedResumeMutation12174(t, fs.calls[resumeOffset:])
+}
+
+func TestRun_StoppedResumeAlreadyStoppedRefusesLiveMainPID12174(t *testing.T) {
+	fs := newFakeSystem(t, "1.0.0")
+	const boundary = "#xpf-config-envelope v=1\n{\"gen\":\"boundary\"}"
+	r, cfg, _ := seedStoppedSameVersionCut(t, fs, boundary)
+	wantSnapshotPath, wantSnapshot := captureStoppedJournalSnapshot12174(t, r)
+	must(t, fs.StartUnit(cfg.Unit))
+
+	resumeOffset := len(fs.calls)
+	err := r.Run(Options{UnitAlreadyStopped: true})
+	if err == nil || !strings.Contains(err.Error(), "caller marked unit already stopped") {
+		t.Fatalf("caller-owned stopped resume did not refuse a live MainPID: %v", err)
+	}
+	assertStoppedJournalSnapshot12174(t, r, wantSnapshotPath, wantSnapshot)
+	assertNoStoppedResumeMutation12174(t, fs.calls[resumeOffset:])
+}
+
+func TestRun_StoppedResumeRejectsEmptyLoadedExecStart12174(t *testing.T) {
+	fs := newFakeSystem(t, "1.0.0")
+	const boundary = "#xpf-config-envelope v=1\n{\"gen\":\"boundary\"}"
+	r, _, _ := seedStoppedSameVersionCut(t, fs, boundary)
+	wantSnapshotPath, wantSnapshot := captureStoppedJournalSnapshot12174(t, r)
+	fs.loadedExecStart = ""
+
+	resumeOffset := len(fs.calls)
+	err := r.Run(Options{})
+	if err == nil || !strings.Contains(err.Error(), "loaded unit ExecStart") ||
+		!strings.Contains(err.Error(), "empty or ambiguous") {
+		t.Fatalf("empty loaded ExecStart was not refused: %v", err)
+	}
+	assertStoppedJournalSnapshot12174(t, r, wantSnapshotPath, wantSnapshot)
+	assertNoStoppedResumeMutation12174(t, fs.calls[resumeOffset:])
+}
+
+func TestRun_StoppedResumeRejectsAmbiguousLoadedExecStart12174(t *testing.T) {
+	fs := newFakeSystem(t, "1.0.0")
+	const boundary = "#xpf-config-envelope v=1\n{\"gen\":\"boundary\"}"
+	r, _, _ := seedStoppedSameVersionCut(t, fs, boundary)
+	wantSnapshotPath, wantSnapshot := captureStoppedJournalSnapshot12174(t, r)
+	previousExe := filepath.Join(r.versionDir("1.0.0"), "xpfd")
+	targetExe := filepath.Join(r.versionDir("2.0.0"), "xpfd")
+	fs.loadedExecStart = fakeSystemdExecStart(previousExe) + "\n" +
+		fakeSystemdExecStart(targetExe)
+
+	resumeOffset := len(fs.calls)
+	err := r.Run(Options{})
+	if err == nil || !strings.Contains(err.Error(), "loaded unit ExecStart") ||
+		!strings.Contains(err.Error(), "empty or ambiguous") {
+		t.Fatalf("multi-entry loaded ExecStart was not refused: %v", err)
+	}
+	assertStoppedJournalSnapshot12174(t, r, wantSnapshotPath, wantSnapshot)
+	assertNoStoppedResumeMutation12174(t, fs.calls[resumeOffset:])
+}
+
+func assertNoStoppedResumeMutation12174(t *testing.T, calls []string) {
+	t.Helper()
+	for _, call := range calls {
+		if call == "stop" || call == "dropin" || call == "start" {
+			t.Fatalf("live mutation %q happened on refusal: calls=%v", call, calls)
 		}
 	}
 }
@@ -396,6 +622,37 @@ func TestRun_StoppedResumeCallerOwnedStoppedUnitRemainsDown12174(t *testing.T) {
 		if call == "stop" || call == "start" {
 			t.Fatalf("caller-owned unit lifecycle was changed by Run: calls=%v", fs.calls[resumeOffset:])
 		}
+	}
+}
+
+func captureStoppedJournalSnapshot12174(t *testing.T, r *Runner) (string, string) {
+	t.Helper()
+	j, err := r.loadJournal()
+	if err != nil {
+		t.Fatalf("load STOPPED journal: %v", err)
+	}
+	if j.State != StateStopped {
+		t.Fatalf("journal State = %s before refusal, want STOPPED", j.State)
+	}
+	if j.DBSnapshotPath == "" {
+		t.Fatal("STOPPED journal has empty DBSnapshotPath")
+	}
+	snapshot, err := os.ReadFile(filepath.Join(j.DBSnapshotPath, "active.json"))
+	if err != nil {
+		t.Fatalf("read journaled DB snapshot: %v", err)
+	}
+	return j.DBSnapshotPath, string(snapshot)
+}
+
+func assertStoppedJournalSnapshot12174(t *testing.T, r *Runner, wantPath, wantSnapshot string) {
+	t.Helper()
+	gotPath, gotSnapshot := captureStoppedJournalSnapshot12174(t, r)
+	if gotPath != wantPath {
+		t.Fatalf("STOPPED journal DBSnapshotPath = %q, want unchanged path %q",
+			gotPath, wantPath)
+	}
+	if gotSnapshot != wantSnapshot {
+		t.Fatalf("STOPPED DB snapshot changed: got %q want %q", gotSnapshot, wantSnapshot)
 	}
 }
 

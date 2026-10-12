@@ -223,3 +223,62 @@ func TestRunningUnitExeAcceptsInactiveUnit(t *testing.T) {
 		t.Fatalf("RunningUnitExe = %q, want empty for MainPID 0", got)
 	}
 }
+
+func TestRunningUnitExeResolvesNonzeroMainPID12174(t *testing.T) {
+	dir := t.TempDir()
+	script := "#!/bin/sh\n" +
+		"[ \"$#\" -eq 4 ] && [ \"$1\" = \"show\" ] && " +
+		"[ \"$2\" = \"--property=MainPID\" ] && [ \"$3\" = \"--value\" ] && " +
+		"[ \"$4\" = \"xpfd.service\" ] || exit 64\n" +
+		"printf '%s\\n' \"$XPFD_TEST_PID\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "systemctl"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+	t.Setenv("XPFD_TEST_PID", itoa(os.Getpid()))
+
+	s := &realSystem{unit: "xpfd"}
+	got, err := s.RunningUnitExe("xpfd")
+	if err != nil {
+		t.Fatalf("RunningUnitExe: %v", err)
+	}
+	want, err := os.Readlink("/proc/self/exe")
+	if err != nil {
+		t.Fatalf("read /proc/self/exe: %v", err)
+	}
+	if got != want {
+		t.Fatalf("RunningUnitExe = %q, want /proc/self/exe %q", got, want)
+	}
+}
+
+func TestRealSystemUnitQueriesUseExactSystemctlArgs12174(t *testing.T) {
+	dir := t.TempDir()
+	script := "#!/bin/sh\n" +
+		"case \"$1|$2|$3|$4\" in\n" +
+		"  'show|--property=ExecStart|--value|xpfd.service') printf '%s\\n' \"$XPFD_TEST_EXEC_START\" ;;\n" +
+		"  'show|--property=MainPID|--value|xpfd.service') printf '0\\n' ;;\n" +
+		"  *) printf 'unexpected systemctl arguments: %s\\n' \"$*\" >&2; exit 64 ;;\n" +
+		"esac\n"
+	if err := os.WriteFile(filepath.Join(dir, "systemctl"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+	const execStart = "{ path=/var/lib/xpf/versions/2.0.0/xpfd ; argv[]=/var/lib/xpf/versions/2.0.0/xpfd ; ignore_errors=no }"
+	t.Setenv("XPFD_TEST_EXEC_START", execStart)
+
+	s := &realSystem{unit: "xpfd"}
+	got, err := s.UnitExecStart("xpfd")
+	if err != nil {
+		t.Fatalf("UnitExecStart with exact systemctl arguments: %v", err)
+	}
+	if got != execStart {
+		t.Fatalf("UnitExecStart = %q, want %q", got, execStart)
+	}
+	gotExe, err := s.RunningUnitExe("xpfd")
+	if err != nil {
+		t.Fatalf("RunningUnitExe with exact systemctl arguments: %v", err)
+	}
+	if gotExe != "" {
+		t.Fatalf("RunningUnitExe = %q, want empty for MainPID 0", gotExe)
+	}
+}
