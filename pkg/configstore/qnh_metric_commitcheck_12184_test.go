@@ -6,8 +6,8 @@ import (
 )
 
 // #12184: the actual operator CommitCheck path must reject bad qualified-next-
-// hop metrics in every accepted AST spelling, while preserving zero and u32
-// controls. The QNH flat-run cases are consumed by the compiler's #9235 hoist.
+// hop metrics in every accepted AST spelling. Zero and u32 boundaries remain
+// valid; the added modifier-chain spellings are new acceptance, not base controls.
 func TestCommitCheckQualifiedNextHopMetric12184(t *testing.T) {
 	spellings := []struct {
 		name  string
@@ -32,6 +32,18 @@ func TestCommitCheckQualifiedNextHopMetric12184(t *testing.T) {
 			},
 		},
 		{
+			name: "F05 flat metric-first interface chain",
+			input: func(v string) string {
+				return "set routing-options static route 0.0.0.0/0 qualified-next-hop 192.168.1.1 metric " + v + " interface ge-0/0/1.0"
+			},
+		},
+		{
+			name: "F06 flat metric-first preference chain",
+			input: func(v string) string {
+				return "set routing-options static route 0.0.0.0/0 qualified-next-hop 192.168.1.1 metric " + v + " preference 5"
+			},
+		},
+		{
 			name: "hierarchical braced",
 			input: func(v string) string {
 				return "routing-options { static { route 0.0.0.0/0 { qualified-next-hop 192.168.1.1 { interface ge-0/0/1.0; metric " + v + "; } } } }"
@@ -41,6 +53,18 @@ func TestCommitCheckQualifiedNextHopMetric12184(t *testing.T) {
 			name: "hierarchical packed",
 			input: func(v string) string {
 				return "routing-options { static { route 0.0.0.0/0 { qualified-next-hop 192.168.1.1 metric " + v + "; } } }"
+			},
+		},
+		{
+			name: "hierarchical braced fused child",
+			input: func(v string) string {
+				return "routing-options { static { route 0.0.0.0/0 { qualified-next-hop 192.168.1.1 { interface ge-0/0/1.0 metric " + v + "; } } } }"
+			},
+		},
+		{
+			name: "hierarchical packed multi-modifier",
+			input: func(v string) string {
+				return "routing-options { static { route 0.0.0.0/0 { qualified-next-hop 192.168.1.1 interface ge-0/0/1.0 preference 5 metric " + v + "; } } }"
 			},
 		},
 	}

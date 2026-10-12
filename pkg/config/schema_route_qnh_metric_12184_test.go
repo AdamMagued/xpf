@@ -26,6 +26,17 @@ func TestStaticRouteQualifiedNextHopMetric_SchemaGate12184(t *testing.T) {
 		return flatTreeFromSets(t,
 			"set routing-options static route 0.0.0.0/0 qualified-next-hop 192.168.1.1 interface ge-0/0/1.0 metric "+val)
 	}
+
+	flatMetricInterface := func(val string) *ConfigTree {
+		return flatTreeFromSets(t,
+			"set routing-options static route 0.0.0.0/0 qualified-next-hop 192.168.1.1 metric "+val+
+				" interface ge-0/0/1.0")
+	}
+	flatMetricPreference := func(val string) *ConfigTree {
+		return flatTreeFromSets(t,
+			"set routing-options static route 0.0.0.0/0 qualified-next-hop 192.168.1.1 metric "+val+
+				" preference 5")
+	}
 	braced := func(val string) *ConfigTree {
 		return hierTree(t, `routing-options {
 	static {
@@ -49,14 +60,41 @@ func TestStaticRouteQualifiedNextHopMetric_SchemaGate12184(t *testing.T) {
 	}
 }`)
 	}
+
+	// The parser keeps these same-statement modifier runs packed. The compiler
+	// reads the metric, so commit validation must read it too.
+	bracedFused := func(val string) *ConfigTree {
+		return hierTree(t, `routing-options {
+	static {
+		route 0.0.0.0/0 {
+			qualified-next-hop 192.168.1.1 {
+				interface ge-0/0/1.0 metric `+val+`;
+			}
+		}
+	}
+}`)
+	}
+	packedMulti := func(val string) *ConfigTree {
+		return hierTree(t, `routing-options {
+	static {
+		route 0.0.0.0/0 {
+			qualified-next-hop 192.168.1.1 interface ge-0/0/1.0 preference 5 metric `+val+`;
+		}
+	}
+}`)
+	}
 	spellings := []struct {
 		name string
 		tree func(string) *ConfigTree
 	}{
 		{"flat", flat},
 		{"flat-interface-chain", flatChain},
+		{"F05-flat-metric-first-interface", flatMetricInterface},
+		{"F06-flat-metric-first-preference", flatMetricPreference},
 		{"braced", braced},
 		{"packed", packed},
+		{"braced-fused-child", bracedFused},
+		{"packed-multi-modifier", packedMulti},
 	}
 	// Negative, out-of-u32, and non-numeric reject on EVERY spelling.
 	for _, val := range []string{"-1", "4294967296", "abc"} {
@@ -68,7 +106,7 @@ func TestStaticRouteQualifiedNextHopMetric_SchemaGate12184(t *testing.T) {
 			})
 		}
 	}
-	// 0 is the primary tier and u32max the ceiling; both commit on every spelling.
+	// Zero, an interior value, and u32max are valid on every spelling.
 	for _, val := range []string{"0", "100", "4294967295"} {
 		for _, sp := range spellings {
 			t.Run("accept/"+sp.name+"/"+val, func(t *testing.T) {
@@ -77,6 +115,33 @@ func TestStaticRouteQualifiedNextHopMetric_SchemaGate12184(t *testing.T) {
 				}
 			})
 		}
+	}
+	for _, sp := range []struct {
+		name string
+		tree func(string) *ConfigTree
+	}{
+		{"braced-fused-child", bracedFused},
+		{"packed-multi-modifier", packedMulti},
+	} {
+		t.Run("compile/"+sp.name, func(t *testing.T) {
+			cfg := assertCommitAccepts(t, sp.tree("100"))
+			found := false
+			for _, route := range cfg.RoutingOptions.StaticRoutes {
+				for _, nh := range route.NextHops {
+					if nh.HasMetric && nh.Metric == 100 && nh.Interface == "ge-0/0/1.0" {
+						found = true
+						if sp.name == "packed-multi-modifier" &&
+							(!nh.HasPreference || nh.Preference != 5) {
+							t.Errorf("packed spelling lost preference: %+v", nh)
+						}
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("accepted %s but compiler did not preserve its metric/interface: %+v",
+					sp.name, cfg.RoutingOptions.StaticRoutes)
+			}
+		})
 	}
 }
 

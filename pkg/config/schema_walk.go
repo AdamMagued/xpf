@@ -813,6 +813,9 @@ func walkSchemaNode(node *Node, parent *schemaNode, path []string, vc *walkConte
 	// #12184: the compiler expands this SetPath flat-run chain before
 	// reading per-next-hop modifiers. Validate the same view so a metric
 	// nested under `interface` or `preference` cannot bypass its leaf gate.
+	// Keep this keyword-specific: if QNH ever opts into `packedFlatRun`, fold
+	// this expansion into that branch below, which otherwise rebuilds from
+	// node.Children and would silently discard the #9235 view.
 	if keyword == "qualified-next-hop" {
 		walkChildren = expandRunChildren9235(walkChildren, childSchema)
 	}
