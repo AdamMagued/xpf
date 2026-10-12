@@ -630,6 +630,28 @@ deploy_node_role_every_rg_ok() {
 	'
 }
 
+# deploy_node_rg_role reads `show chassis cluster status` on stdin and prints
+# the exact role ($3) of <node> for redundancy group <rg>. It succeeds ONLY IF
+# exactly one <node> row exists inside the `Redundancy group: <rg>` block.
+#
+# The header match is exact ($3 == rg), never a substring: `grep -A2
+# "Redundancy group: 1"` also matches `Redundancy group: 10`, so clusters with
+# 10+ RGs miscounted RG1 (#12203 row 21). A grep cannot express "the role of
+# THIS node in THIS group", so the dual-active checks in test-chained-crash.sh
+# and test-ha-crash.sh read every (node, RG) through this helper and treat a
+# missing row as VOID -> FAIL. Empty, whitespace-only, unconfigured
+# ("Cluster not configured"), zero-block, missing-block, and duplicate-row
+# statuses all fail here instead of passing vacuously.
+deploy_node_rg_role() {
+	local node="${1:?deploy_node_rg_role: node required}"
+	local want="${2:?deploy_node_rg_role: rg required}"
+	awk -v node="$node" -v want="$want" '
+		/^Redundancy group:[[:space:]]/ { rg = $3; next }
+		rg != "" && ("x" rg) == ("x" want) && $1 == node { role = $3; n++ }
+		END { if (n != 1 || role == "") exit 1; print role }
+	'
+}
+
 # failover_ownership_verdict cross-references the two independent checks
 # test-failover.sh already performs, and is the #7368 half of the #6591 fix.
 #

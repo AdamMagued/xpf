@@ -38,6 +38,9 @@ xpf_enter_destructive_cluster_cell "test-chained-crash $*" "$0" "$@"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=test/incus/cluster-env.sh
 source "${SCRIPT_DIR}/cluster-env.sh"
+# #12203: shared scoped per-(node, RG) role reader for dual-active checks.
+# shellcheck source=test/incus/deploy-lib.sh
+source "${SCRIPT_DIR}/deploy-lib.sh"
 # shellcheck source=test/incus/iperf-throughput-lib.sh
 source "${SCRIPT_DIR}/iperf-throughput-lib.sh"
 
@@ -133,43 +136,53 @@ test_new_tcp() {
 
 # Verify no dual-active: exactly one node should be primary per RG
 check_no_dual_active() {
-	local label="$1"
-	local fw0_status fw1_status
+	local label="$1" fw0_status="" fw1_status=""
+	local fw0_bad=false fw1_bad=false fw0_problem fw1_problem
 	if ! fw0_status=$(incus exec "$FW0" -- cli -c 'show chassis cluster status' 2>/dev/null); then
-		fail "$label: fw0 cluster status unreadable"
-		return
-	fi
-	if [[ -z "$fw0_status" ]]; then
-		fail "$label: fw0 cluster status empty"
-		return
+		fw0_bad=true
+		fw0_problem=unreadable
+	elif [[ -z "$fw0_status" ]]; then
+		fw0_bad=true
+		fw0_problem=empty
 	fi
 	if ! fw1_status=$(incus exec "$FW1" -- cli -c 'show chassis cluster status' 2>/dev/null); then
-		fail "$label: fw1 cluster status unreadable"
-		return
+		fw1_bad=true
+		fw1_problem=unreadable
+	elif [[ -z "$fw1_status" ]]; then
+		fw1_bad=true
+		fw1_problem=empty
 	fi
-	if [[ -z "$fw1_status" ]]; then
-		fail "$label: fw1 cluster status empty"
-		return
+	if [[ "$fw0_bad" == true ]]; then
+		fail "$label: fw0 cluster status $fw0_problem"
 	fi
-
-	local invalid_state=false
+	if [[ "$fw1_bad" == true ]]; then
+		fail "$label: fw1 cluster status $fw1_problem"
+	fi
+	if [[ "$fw0_bad" == true || "$fw1_bad" == true ]]; then
+		return 0
+	fi
+	local invalid_state=false rg
 	for rg in 0 1 2; do
-		local fw0_pri fw1_pri
-		fw0_pri=$(echo "$fw0_status" | grep -A2 "Redundancy group: $rg" | grep "node0" | grep -c "primary" || true)
-		fw1_pri=$(echo "$fw1_status" | grep -A2 "Redundancy group: $rg" | grep "node1" | grep -c "primary" || true)
-		case "$fw0_pri/$fw1_pri" in
-		1/1)
+		local r0="" r1="" r0_bad=false r1_bad=false
+		if ! r0=$(printf '%s\n' "$fw0_status" | deploy_node_rg_role node0 "$rg"); then
+			r0_bad=true
+		fi
+		if ! r1=$(printf '%s\n' "$fw1_status" | deploy_node_rg_role node1 "$rg"); then
+			r1_bad=true
+		fi
+		if [[ "$r0_bad" == true || "$r1_bad" == true ]]; then
+			fail "$label: RG$rg role unreadable (fw0='${r0:-unreadable}' fw1='${r1:-unreadable}')"
+			invalid_state=true
+			continue
+		fi
+		case "$r0/$r1" in
+		primary/primary)
 			fail "$label: dual-active detected on RG$rg"
 			invalid_state=true
 			;;
-		0/0)
-			fail "$label: no primary detected on RG$rg"
-			invalid_state=true
-			;;
-		1/0|0/1)
-			;;
+		primary/* | */primary) ;;
 		*)
-			fail "$label: primary status unclear on RG$rg (fw0=$fw0_pri fw1=$fw1_pri)"
+			fail "$label: no primary detected on RG$rg (fw0=$r0 fw1=$r1)"
 			invalid_state=true
 			;;
 		esac
