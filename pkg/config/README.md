@@ -630,8 +630,12 @@ validation applies the same path-local maximum-five-edge and cycle traversal as
 `ExpandAddressSet` to every book set, including unreferenced sets. This prevents
 a green commit from reaching `compileAddressBook`'s apply-time expansion error.
 Five nested edges remain valid; a 6+ edge chain or mutual cycle is rejected with
-the set named. Tolerant loading retains its warning downgrade; applying an
-older persisted invalid book still reaches the shared prepass.
+the set named. The expansion pass also rejects an `address-set` leaf that names a
+defined address or policy wildcard instead of another set, because the shared
+compiler expands those leaves as sets. Zone-local inner names are rendered as
+`name (security-zone zone)`, not the synthetic `zone-local/<zone>/<name>` key.
+Tolerant loading retains its warning downgrade; applying an older persisted
+invalid book still reaches the shared prepass.
 
 **IPv4-mapped IPv6 address-book prefixes are rejected before commit (#10688):**
 Go's `net.IP.To4()` files `::ffff:a.b.c.d/nn` into `prefixes_v4`, but the

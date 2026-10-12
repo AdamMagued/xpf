@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 )
@@ -14,10 +15,12 @@ import (
 //
 // It runs on the compiled global book, after resolveZoneLocalAddressBooks has
 // folded zone-local books in and qualified the members they define locally.
-// A name is checked against the same maps the runtime resolver reads. A member
-// is accepted if it is EITHER an address or an address-set, matching that
-// resolver, so this refuses only a name that resolves to nothing. The policy
-// wildcards stay admissible.
+// This definedness pass accepts a member if it is either an address or an
+// address-set, matching the runtime resolver; policy wildcards are also
+// admissible here. #12214's following expansion pass mirrors ExpandAddressSet
+// instead: each `address-set`-leaf member must be an address-set, not merely an
+// address or wildcard. It also refuses cycles and nesting beyond five edges,
+// matching the apply-time expansion failures for cycles and 6+ edges.
 func validateAddressSetMembersDefinedStrict(cfg *Config) error {
 	if cfg == nil || cfg.Security.AddressBook == nil {
 		return nil
@@ -74,7 +77,12 @@ func validateAddressSetMembersDefinedStrict(cfg *Config) error {
 	// commit instead of allowing a green commit to abort every apply.
 	for _, name := range names {
 		if err := validateAddressSetDepthAndCycles(name, ab); err != nil {
-			return fmt.Errorf("address-set %s cannot be expanded: %w", show(name), err)
+			detail := err.Error()
+			var expansionErr *addressSetExpansionError
+			if errors.As(err, &expansionErr) {
+				detail = expansionErr.displayName(show)
+			}
+			return fmt.Errorf("address-set %s cannot be expanded: %s", show(name), detail)
 		}
 	}
 

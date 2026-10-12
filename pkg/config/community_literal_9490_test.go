@@ -88,6 +88,7 @@ func TestAddressSetDepthAndCycleRejectedAtCommit12214(t *testing.T) {
 		sets       []string
 		wantSet    string
 		wantDetail string
+		wantAbsent string
 	}{
 		{
 			name: "six-deep chain",
@@ -128,6 +129,65 @@ func TestAddressSetDepthAndCycleRejectedAtCommit12214(t *testing.T) {
 				"set security address-book global address-set s5 address-set s4",
 			},
 		},
+		{
+			name: "shared-subset diamond",
+			sets: []string{
+				"set security address-book global address a0 10.0.0.0/24",
+				"set security address-book global address-set base address a0",
+				"set security address-book global address-set left address-set base",
+				"set security address-book global address-set right address-set base",
+				"set security address-book global address-set top address-set left",
+				"set security address-book global address-set top address-set right",
+			},
+		},
+		{
+			name: "boundary diamond",
+			sets: []string{
+				"set security address-book global address a0 10.0.0.0/24",
+				"set security address-book global address-set s0 address a0",
+				"set security address-book global address-set s1 address-set s0",
+				"set security address-book global address-set s2 address-set s1",
+				"set security address-book global address-set s3 address-set s2",
+				"set security address-book global address-set s4 address-set s3",
+				"set security address-book global address-set d address-set s4",
+				"set security address-book global address-set d address-set s3",
+			},
+		},
+		{
+			name: "address-set leaf names an address",
+			sets: []string{
+				"set security address-book global address a0 10.0.0.0/24",
+				"set security address-book global address-set S address-set a0",
+			},
+			wantSet:    "S",
+			wantDetail: "names an address, not an address-set",
+		},
+		{
+			name: "address-set leaf names a wildcard",
+			sets: []string{
+				"set security address-book global address a0 10.0.0.0/24",
+				"set security address-book global address-set S address a0",
+				"set security address-book global address-set S address-set any",
+			},
+			wantSet:    "S",
+			wantDetail: "is a policy wildcard, not an address-set",
+		},
+		{
+			name: "zone-local six-deep chain",
+			sets: []string{
+				"set security zones security-zone trust address-book address za0 10.1.0.0/24",
+				"set security zones security-zone trust address-book address-set z0 address za0",
+				"set security zones security-zone trust address-book address-set z1 address-set z0",
+				"set security zones security-zone trust address-book address-set z2 address-set z1",
+				"set security zones security-zone trust address-book address-set z3 address-set z2",
+				"set security zones security-zone trust address-book address-set z4 address-set z3",
+				"set security zones security-zone trust address-book address-set z5 address-set z4",
+				"set security zones security-zone trust address-book address-set z6 address-set z5",
+			},
+			wantSet:    "z6 (security-zone trust)",
+			wantDetail: "nesting too deep",
+			wantAbsent: "zone-local/",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -144,7 +204,7 @@ func TestAddressSetDepthAndCycleRejectedAtCommit12214(t *testing.T) {
 			_, err := CompileConfig(tree)
 			if tc.wantSet == "" {
 				if err != nil {
-					t.Fatalf("CompileConfig: valid five-edge chain rejected: %v", err)
+					t.Fatalf("CompileConfig: valid %q rejected: %v", tc.name, err)
 				}
 				return
 			}
@@ -153,6 +213,10 @@ func TestAddressSetDepthAndCycleRejectedAtCommit12214(t *testing.T) {
 				!strings.Contains(err.Error(), tc.wantDetail) {
 				t.Fatalf("CompileConfig error = %v, want rejection naming set %q for %q",
 					err, tc.wantSet, tc.wantDetail)
+			}
+			if tc.wantAbsent != "" && strings.Contains(err.Error(), tc.wantAbsent) {
+				t.Fatalf("CompileConfig error = %v, must not contain %q",
+					err, tc.wantAbsent)
 			}
 		})
 	}

@@ -1,6 +1,9 @@
 package config
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // u8p returns a pointer to a uint8 literal, used for optional ICMP type/code
 // constraints on predefined applications (for example, junos-icmp-ping).
@@ -424,6 +427,26 @@ func memberIsNestedSet(memberName string, apps *ApplicationsConfig) bool {
 
 const maxAddressSetDepth = 5
 
+type addressSetExpansionError struct {
+	name    string
+	message string
+}
+
+func (e *addressSetExpansionError) Error() string {
+	return e.message
+}
+
+func (e *addressSetExpansionError) displayName(show func(string) string) string {
+	return strings.Replace(e.message, e.name, show(e.name), 1)
+}
+
+func addressSetExpansionErrorf(name, format string, args ...any) error {
+	return &addressSetExpansionError{
+		name:    name,
+		message: fmt.Sprintf(format, args...),
+	}
+}
+
 // ExpandAddressSet recursively expands an address-set to individual
 // address names. Handles nested address-sets with cycle detection. A set carrying
 // an unknown member statement is rejected rather than expanded to its surviving
@@ -439,24 +462,41 @@ func addressSetForExpansion(
 	depth int,
 ) (*AddressSet, error) {
 	if depth > maxAddressSetDepth {
-		return nil, fmt.Errorf(
+		return nil, addressSetExpansionErrorf(
+			name,
 			"address-set nesting too deep (max %d): %s",
 			maxAddressSetDepth, name)
 	}
 	if visited[name] {
-		return nil, fmt.Errorf("cycle detected in address-set %q", name)
+		return nil, addressSetExpansionErrorf(name, "cycle detected in address-set %q", name)
 	}
 
 	as, ok := ab.AddressSets[name]
 	if !ok {
-		return nil, fmt.Errorf("address-set %q not found", name)
+		if _, isAddress := ab.Addresses[name]; isAddress {
+			return nil, addressSetExpansionErrorf(
+				name,
+				"address-set %q names an address, not an address-set; the shared "+
+					"compiler expands each address-set member as a set and would abort apply",
+				name)
+		}
+		if IsPolicyAddressWildcardKeyword(name) {
+			return nil, addressSetExpansionErrorf(
+				name,
+				"address-set %q is a policy wildcard, not an address-set; the shared "+
+					"compiler expands each address-set member as a set and would abort apply",
+				name)
+		}
+		return nil, addressSetExpansionErrorf(name, "address-set %q not found", name)
 	}
 	if as == nil {
-		return nil, fmt.Errorf("address-set %q is nil", name)
+		return nil, addressSetExpansionErrorf(name, "address-set %q is nil", name)
 	}
 	if len(as.UnknownMembers) > 0 {
-		return nil, fmt.Errorf("address-set %q has unknown member statement %q; "+
-			"the member was silently dropped and the set is under-populated",
+		return nil, addressSetExpansionErrorf(
+			name,
+			"address-set %q has unknown member statement %q; "+
+				"the member was silently dropped and the set is under-populated",
 			name, as.UnknownMembers[0])
 	}
 	return as, nil
