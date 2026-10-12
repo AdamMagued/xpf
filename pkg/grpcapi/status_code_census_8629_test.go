@@ -89,6 +89,10 @@ func returnsStatusTyped(fn *ast.FuncDecl, fset *token.FileSet, converters map[st
 			return true
 		}
 		last := ret.Results[len(ret.Results)-1]
+		if isFromContextStatusError(last) {
+			return true
+		}
+
 		switch e := last.(type) {
 		case *ast.Ident:
 			if e.Name == "nil" {
@@ -112,6 +116,19 @@ func returnsStatusTyped(fn *ast.FuncDecl, fset *token.FileSet, converters map[st
 		return true
 	})
 	return bad
+}
+
+func isFromContextStatusError(e ast.Expr) bool {
+	errCall, ok := e.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	errSelector, ok := errCall.Fun.(*ast.SelectorExpr)
+	if !ok || errSelector.Sel.Name != "Err" {
+		return false
+	}
+	constructor, ok := errSelector.X.(*ast.CallExpr)
+	return ok && exprText(constructor.Fun) == "status.FromContextError"
 }
 
 func exprText(e ast.Expr) string {

@@ -290,7 +290,7 @@ func (s *Server) showSessionsTop(ctx context.Context, cfg *config.Config, topic 
 	}
 	defer release()
 	if err := ctx.Err(); err != nil {
-		return sessionWalkContextStatusError(err)
+		return status.FromContextError(err).Err()
 	}
 
 	sortByBytes := topic == "sessions-top:bytes"
@@ -358,12 +358,12 @@ func (s *Server) showSessionsTop(ctx context.Context, cfg *config.Config, topic 
 		return true
 	}); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return sessionWalkContextStatusError(ctxErr)
+			return status.FromContextError(ctxErr).Err()
 		}
 		return status.Errorf(codes.Internal, "v4 session iteration: %v", err)
 	}
 	if err := ctx.Err(); err != nil {
-		return sessionWalkContextStatusError(err)
+		return status.FromContextError(err).Err()
 	}
 
 	if err := s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
@@ -395,12 +395,12 @@ func (s *Server) showSessionsTop(ctx context.Context, cfg *config.Config, topic 
 		return true
 	}); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return sessionWalkContextStatusError(ctxErr)
+			return status.FromContextError(ctxErr).Err()
 		}
 		return status.Errorf(codes.Internal, "v6 session iteration: %v", err)
 	}
 	if err := ctx.Err(); err != nil {
-		return sessionWalkContextStatusError(err)
+		return status.FromContextError(err).Err()
 	}
 
 	// Order the <=K survivors with the SAME descending comparator the
