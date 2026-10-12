@@ -267,8 +267,10 @@ chassis {
     cluster {
         cluster-id 1;
         reth-count 2;
-        heartbeat-interval 1000;
-        heartbeat-threshold 3;
+        heartbeat-interval 200;
+        heartbeat-threshold 5;
+        # No no-private-rg-election: compiler default is private-RG mode.
+        # Runtime threshold is 200ms × 5 = 1s; sync-recency may defer loss.
         control-interface em0;
         fab0 {
             fabric-options {
@@ -552,22 +554,30 @@ printf 'show security flow session\nexit\n' | incus exec xpf-fw0 -- cli
 # 1. Start continuous ping from cluster-lan-host
 incus exec cluster-lan-host -- ping 8.8.8.8 &
 
-# 2. Stop primary
+# 2. Stop primary. Default private-RG shutdown sends no resign/transfer frame;
+# the peer promotes through heartbeat-loss detection.
 incus exec xpf-fw0 -- systemctl stop xpfd
 
-# 3. Wait for failover (30ms VRRP → ~97ms masterDown; planned stop near-instant)
-sleep 1
+# This config uses default private-RG election, not RETH VRRP. Heartbeat
+# staleness is 200ms × 5 = 1s; recent sync traffic can suppress timeout while
+# connected (≤2s peer-traffic age; at most 5s continuous suppression).
+# Allow suppression cap + heartbeat threshold + a tick before checking status.
+# Sources: daemon_ha_sync.go:170-205; heartbeat.go:61-65,1916-1960.
+sleep 8
 
 # 4. Check cluster status on fw1
 printf 'show chassis cluster status\nexit\n' | incus exec xpf-fw1 -- cli
 
-# 5. Verify ping continues (expect ~6 lost at 10ms interval = ~60ms)
+# 5. Measure ping loss and confirm traffic resumes; report observed elapsed time.
 ```
 
 **Pass criteria:**
-- fw1 becomes primary within ~100ms (measured ~60ms)
-- Async GARP burst sent for reth0, reth1 VIPs (first pair immediate, rest in background)
-- cluster-lan-host traffic resumes after ~60ms interruption
+- fw1 becomes primary after fw0 relinquishes ownership; record elapsed time and
+  packet loss. The configured 1s heartbeat threshold is a detection floor, not
+  an end-to-end restoration SLA; session-sync recency may extend peer-loss
+  declaration.
+- Verify the new owner announces/neighbors converge for this ownership mode;
+  do not assume a VRRP priority-0 burst in default private-RG mode.
 - Sessions synced from fw0 survive on fw1
 
 ### TC-4: Failover — Recovery and Preemption
@@ -578,8 +588,9 @@ printf 'show chassis cluster status\nexit\n' | incus exec xpf-fw1 -- cli
 # 1. Restart fw0
 incus exec xpf-fw0 -- systemctl start xpfd
 
-# 2. Wait for preemption (election + hold timer)
-sleep 10
+# Allow the 30s no-RETH startup sync hold to complete or release on bulk sync
+# (`pkg/daemon/daemon_ha_noreth_hold.go:42-53`).
+sleep 35
 
 # 3. Verify fw0 is primary again
 printf 'show chassis cluster status\nexit\n' | incus exec xpf-fw0 -- cli
@@ -911,8 +922,8 @@ This tests two legacy `META_FLAG_KERNEL_ROUTE` BPF fallback paths:
   cache (`fib_gen` mismatch). `bpf_fib_lookup` returns LOCAL/NOT_FWDED because
   FRR routes haven't converged. The packet routes through conntrack for NAT
   reversal and XDP_PASSes for kernel routing.
-- **NO_NEIGH:** After VRRP failover, the new MASTER has no ARP/NDP entry for
-  the next hop or the LAN client. `bpf_fib_lookup` returns NO_NEIGH. Same
+- **NO_NEIGH:** After ownership failover, the new owner may have no ARP/NDP
+  entry for the next hop or LAN client. `bpf_fib_lookup` returns NO_NEIGH. Same
   path: conntrack for NAT reversal, then kernel resolves ARP/NDP inline.
 
 #### Ping-based tests
@@ -930,21 +941,24 @@ sleep 5
 incus exec xpf-fw0 -- systemctl restart xpfd
 # Expected: similar 1-2 packet loss
 
-# Full failover test (stop primary, secondary takes over):
-incus exec cluster-lan-host -- ping -i 0.01 -c 500 -W 1 10.0.60.1 &
+# 15s rapid probe spans guard window and remains active through return start.
+incus exec cluster-lan-host -- ping -i 0.01 -c 1500 -W 1 10.0.60.1 &
 sleep 1
 incus exec xpf-fw0 -- systemctl stop xpfd
-# Expected: ~6 packets lost at 10ms interval = ~60ms failover
-# (3× priority-0 burst on shutdown → peer immediate takeover)
-sleep 5
+# Default private-RG shutdown has no VRRP resign frame. Sync-recency may
+# suppress the 1s threshold for up to 5s; measure loss/restoration, not a fixed
+# count. Sources: daemon_run_shutdown.go:418-428; manager.go:1026-1077;
+# daemon_ha_sync.go:170-205; heartbeat.go:61-65,1916-1960.
+sleep 8
 incus exec xpf-fw0 -- systemctl start xpfd
-# Expected: ~13 packets lost = ~130ms failback (daemon startup + sync hold)
+# Record observed recovery/preemption loss; startup sync may hold for up to 30s
+# (daemon_ha_noreth_hold.go:42-53).
 ```
 
 #### iperf3 failover tests (throughput under failover)
 
-These verify that bulk TCP transfers survive VRRP failover without permanent
-connection death. The TCP cwnd should recover after a brief dip, not collapse.
+These verify that bulk TCP transfers survive cluster ownership failover without
+permanent connection death. The TCP cwnd should recover after a brief dip, not collapse.
 
 ```bash
 # Requires an iperf3 server reachable from WAN (e.g. casper at 172.16.100.200
@@ -954,19 +968,18 @@ connection death. The TCP cwnd should recover after a brief dip, not collapse.
 # 1. Start iperf3 on LAN host (60s, BBR for fast recovery)
 incus exec cluster-lan-host -- iperf3 -c 172.16.100.200 -t 60 -C bbr &
 
-# 2. After 15s of steady state, stop primary (full VRRP failover)
+# 2. After 15s of steady state, stop primary (default private-RG failover)
 sleep 15
 incus exec xpf-fw0 -- systemctl stop xpfd
 
-# 3. Wait for secondary to take over, verify throughput resumes
+# 3. Allow peer promotion, then verify throughput resumes.
 sleep 20
 
-# 4. Bring primary back (VRRP preemption)
+# 4. Bring primary back; observe ownership recovery after startup/sync.
 incus exec xpf-fw0 -- systemctl start xpfd
 
 # 5. Wait for iperf3 to finish, check results
-# Expected: throughput dips to ~0 for ~2s during each transition,
-# then recovers to multi-Gbps. Connection survives both transitions.
+# Record the observed throughput dip; no fixed per-transition duration is implied.
 
 # --- IPv6 iperf3 failover ---
 # 1. Start IPv6 iperf3 (routed, no SNAT)
@@ -978,19 +991,22 @@ incus exec xpf-fw0 -- systemctl stop xpfd
 sleep 20
 incus exec xpf-fw0 -- systemctl start xpfd
 
-# Expected: same behavior — brief throughput dip, full recovery,
-# connection survives. No cwnd collapse to 0.
+# Expected: traffic recovers without permanent connection death or cwnd collapse.
 ```
 
 **Pass criteria:**
-- Hitless restart (systemctl restart): <= 2 packets lost (ping)
-- Full failover (stop primary): <= 5 packets lost (ping)
+- Full failover (stop primary): verify fw1 takes ownership and traffic resumes;
+  record loss/elapsed restoration without a fixed packet-count or timing bound.
 - iperf3 IPv4: TCP connection survives failover + preemption, throughput recovers
 - iperf3 IPv6: TCP connection survives failover + preemption, throughput recovers
 - No permanent traffic blackhole or cwnd collapse
 - Traffic auto-recovers after all transitions
 
 **Verified results (2026-02-23):**
+
+These are historical measurements from 2026-02-23, before commit `db6dc8ab0`
+made private-RG election the compiler default (2026-03-06). They describe the
+legacy VRRP-backed test path and are not current-default timing guarantees.
 
 | Test | Steady | Failover dip | Recovery | Preemption dip | Result |
 |------|--------|-------------|----------|----------------|--------|
@@ -1001,9 +1017,10 @@ incus exec xpf-fw0 -- systemctl start xpfd
   cwnd briefly dipped to ~5.6 KB during the exact transition moment then immediately
   recovered. Throughput never dropped below 3.6 Gbps. Session sync + dnat_table
   replication ensured hitless SNAT continuation on the new primary.
-- **IPv6 routed:** Connection survived with ~6s disruption during failover (longer than
-  IPv4 because IPv6 has no dnat_table pre-population — relies entirely on session sync +
-  VRRP MASTER transition + neighbor discovery). Preemption back to fw0 was seamless.
+- **IPv6 routed:** Connection survived with ~6s disruption during this
+  historical VRRP-backed failover (longer than IPv4 because IPv6 has no
+  dnat_table pre-population — it relies on session sync, the ownership
+  transition, and neighbor discovery). Preemption back to fw0 was seamless.
 
 **How it works:**
 1. Legacy BPF programs pinned at `/sys/fs/bpf/xpf/` survive daemon restart
@@ -1255,15 +1272,22 @@ incus exec cluster-lan-host -- pkill -9 iperf3
 
 ## Performance Expectations
 
+
+The 2026-02-23 results below predate private-RG becoming the compiler default
+(commit `db6dc8ab0`, 2026-03-06); treat those measurements as historical
+legacy VRRP test data, not current-default expectations. Current detection
+timers are mode-specific and are not end-to-end restoration SLAs.
+
 | Metric | Expected | Verified | Notes |
 |--------|----------|----------|-------|
 | WAN throughput (per VF) | ~6-8 Gbps | — | iavf generic XDP, single direction |
 | LAN throughput (virtio) | ~12-15 Gbps | — | virtio_net native XDP |
 | HA throughput (IPv4 SNAT) | ~4-5 Gbps | 4.75 Gbps | LAN→WAN through SNAT |
 | HA throughput (IPv6 routed) | ~4-5 Gbps | 4.80 Gbps | LAN→WAN, no NAT |
-| IPv4 failover disruption | < 5 seconds | ~2 seconds | cwnd dip, no collapse |
-| IPv6 failover disruption | < 10 seconds | ~6 seconds | session sync + ND |
-| Failover time | ~3.5 seconds | ~3-4 seconds | Master-down timer (3×advert + skew) |
+| IPv4 failover disruption (historical) | Measure; no current end-to-end bound | ~2 seconds | 2026-02-23 legacy VRRP run |
+| IPv6 failover disruption (historical) | Measure; no current end-to-end bound | ~6 seconds | 2026-02-23 legacy VRRP run |
+| Private-RG heartbeat threshold | 500ms runtime defaults / 1s lab config | — | 100ms × 5 / 200ms × 5; connected-sync recency ≤2s, suppression capped at 5s (`pkg/cluster/heartbeat.go:61-65,1916-1960`; `pkg/daemon/daemon_ha_sync.go:170-205`) |
+| Legacy VRRP master-down timer | >90ms and <120ms at 30ms advert | — | `3 × advertised interval + priority skew`; priorities 1–255 (`pkg/vrrp/instance_timing.go:112-128`) |
 | Session sync latency | < 2 seconds | < 1 second | Ring buffer real-time + 1s sweep |
 | Config sync latency | < 1 second | — | TCP immediate push on commit |
 | IPv4 VIP recovery | < 1 second | — | Dual GARP + gateway ARP probe |

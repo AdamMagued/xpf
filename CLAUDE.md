@@ -356,7 +356,7 @@ in git history; `git log -- bpf/xdp/ bpf/tc/` walks the deleted source.
 | `proto/xpf/v1/` | Protobuf service definition |
 | `cmd/xpfd/` | Daemon main binary |
 | `cmd/cli/` | Remote CLI client binary |
-| `pkg/vrrp/` | Native VRRPv3 state machine (30ms RETH advertisements, AF_PACKET, IPv6 NODAD) |
+| `pkg/vrrp/` | Native VRRPv3 state machine (legacy VRRP-backed RETH mode uses 30ms default advertisements, AF_PACKET, IPv6 NODAD) |
 | `pkg/ra/` | Embedded RA sender (replaces radvd) |
 | `docs/` | Protocol docs, feature gaps, phase notes, test plans, memory backups |
 | `test/incus/` | Test environment (setup.sh, config, systemd unit) |
@@ -467,18 +467,88 @@ in git history; `git log -- bpf/xdp/ bpf/tc/` walks the deleted source.
 - **Gotcha: PF passthrough claims the whole NIC** — no VFs can be used by other VMs when the PF is passed through. For multi-VM setups, VF passthrough with generic XDP + `redirect_capable` fallback is the only option (at a performance cost)
 
 ### Chassis Cluster (HA)
-- **Failover timing**: ~60ms with 30ms VRRP intervals (masterDownInterval ~97ms); configurable via `set chassis cluster reth-advertise-interval <ms>`
-- **Planned shutdown**: burst of 3× priority-0 adverts; peer takes over in ~1ms (immediate takeover on priority-0)
-- **Failback timing**: ~130ms (daemon startup + dataplane load + sync hold release)
-- **VRRP advertisement**: RETH instances default 30ms; `AdvertiseInterval` is milliseconds internally, centiseconds on wire per RFC 5798
+- **Unplanned peer loss — default private-RG election (#12173)**: the compiler
+  default uses control-link private-RG election and suppresses RETH VRRP
+  (`pkg/config/compiler_system.go:3132-3137`; `pkg/vrrp/README.md:950-964`).
+  The heartbeat staleness threshold is interval × threshold — 100ms × 5 = 500ms
+  at runtime defaults or 200ms × 5 ≈ 1s in the deployed lab config
+  (`pkg/cluster/heartbeat.go:61-65,1916-1960`;
+  `docs/ha-cluster-userspace.conf:71-72`). This is not necessarily the
+  peer-loss declaration time: while session sync stays connected and inbound
+  peer traffic is no more than 2s old, `shouldSuppressPeerHeartbeatTimeout`
+  defers the heartbeat timeout; its continuous-suppression cap is 5s
+  (`pkg/daemon/daemon_ha_sync.go:170-206`). With an ESTABLISHED sync stream,
+  the guard can defer declaration until peer traffic is 2s old. Detection is
+  max(threshold, remaining sync-recency window) plus up to one heartbeat tick:
+  roughly 0.5–2.1s from peer death at defaults, or 1.0–2.2s with the lab
+  heartbeat interval. Process crash (FIN disconnects sync) or sync already idle
+  for >2s lets the heartbeat staleness check declare peer loss at its
+  500ms/1s threshold (subject to startup/restart grace). These are detection
+  times, not end-to-end traffic-restoration latency
+  (`pkg/cluster/heartbeat_manager.go:790-832`;
+  `pkg/cluster/sync_conn_read.go:47-82,124-126`).
+  Separately, interface/IP monitors poll each second and require 3 consecutive
+  failed polls, followed by a 5s hold-down before another transition; IP sweeps
+  use at most 16 concurrent 800ms probes, so more than 16 targets add probe
+  waves (`pkg/cluster/monitor.go:28-32,44-57,260-276,386-397,585-600`)
+- **Unplanned peer loss — legacy VRRP-backed mode** (`no-private-rg-election`,
+  unless `no-reth-vrrp` is also set): RETH VRRP advertisements default to 30ms
+  only in this mode, configurable via
+  `set chassis cluster reth-advertise-interval <ms>`
+  (`pkg/config/compiler_system.go:3119-3122`; `pkg/vrrp/vrrp.go:153-166`).
+  With a 30ms learned/current advertisement, the master-down timer is
+  3×advertisement + priority skew (>90ms and <120ms for priorities 1–255);
+  this is a timer value, not measured end-to-end failover latency
+  (`pkg/vrrp/instance_timing.go:112-128`). A non-preempting BACKUP that has
+  heard no peer advertisement arms the 3s deafness shield at process start and
+  when sync hold releases (`pkg/vrrp/instance.go:71-93`;
+  `pkg/vrrp/instance_timing.go:11-41`)
+- **Planned failover**: legacy VRRP shutdown sends three priority-0
+  advertisements; the backup arms a 1ms master-down timer, and the run-loop
+  test requires its MASTER advertisement within 50ms (test constraint, not an
+  SLA) (`pkg/vrrp/instance.go:770-807`; `pkg/vrrp/instance_rx.go:155-173`;
+  `pkg/vrrp/instance_prio0_run_test.go:143-149`). Private-RG operator failover
+  uses an explicit peer-transfer/resignation path, not peer-loss heartbeat
+  detection (`pkg/cluster/failover.go:447-450`;
+  `pkg/cluster/election.go:1021-1042`). Private-RG planned shutdown without an
+  explicit transfer sends no resign frame: `Manager.Stop` is the single
+  cluster-stop call and stops the heartbeat sender/receiver. After `rg_active`
+  clears, the peer promotes through heartbeat-loss detection no sooner than its
+  500ms/1s heartbeat threshold, and potentially later under the sync-recency
+  guard. This is not an end-to-end restoration bound
+  (`pkg/cluster/manager.go:1026-1077`;
+  `pkg/daemon/daemon_run_shutdown.go:418-428`;
+  `pkg/cluster/heartbeat.go:61-65,1916-1960`;
+  `pkg/daemon/daemon_ha_sync.go:170-206`)
+- **VRRP advertisement**: VRRP-backed RETH instances (legacy `no-private-rg-election`, unless `no-reth-vrrp` is set) default to 30ms; `AdvertiseInterval` is milliseconds internally, centiseconds on wire per RFC 5798
 - **Async GARP**: `becomeMaster()` runs GARP in a goroutine — first pair <1ms, remaining at 50ms intervals in background. Critical path: addVIPs → sendAdvert → emitEvent (sync), then go sendGARP(false) (async). `sendGARP` has two suppression gates: a per-epoch dedup (`garpEpoch`/`lastGARPEpoch`) and a 500ms time dampener (`lastGARPTime`/`garpDampened`). `sendGARP(force)` — `force=true` bypasses ONLY the time dampener (keeps the epoch dedup); the routine `becomeMaster`/periodic path passes `force=false` so storm-control survives (#2081)
 - **Fabric forwarding**: the userspace dataplane redirects packets for peer-owned synced sessions over the fabric link — `resolve_fabric_redirect()` / `ingress_is_fabric()` in `userspace-dp/src/afxdp/forwarding/fabric.rs` (re-exported through the `forwarding` module; see `docs/fabric-cross-chassis-fwd.md`) — prevents TCP death on VRRP failback. The pre-#1476 eBPF mechanism (`try_fabric_redirect()` in xdp_zone) is historical
 - **RETH virtual MAC**: per node and per RETH `02:bf:72:CC:RR:(2*reth-index+node-id)`; `programRethMAC()` does link DOWN→set MAC→link UP
 - **VIP reconciliation**: `ReconcileVIPs()` re-adds VRRP VIPs after `programRethMAC` link DOWN/UP (which removes all kernel addresses). It bumps `garpEpoch` AND calls `sendGARP(true)` (forced) — the MAC just changed, so the post-MAC-change GARP must defeat BOTH gates: the epoch bump clears the dedup, `force=true` clears the time dampener. Before #2081 the dampener still swallowed this burst if any routine GARP fired in the prior 500ms → peers held a stale ARP entry → blackhole until it aged out
-- **Sync hold**: VRRP starts with `preempt=false`; released after bulk session sync (or 10s timeout); `preemptNowCh` triggers instant preemption. Sync-hold release preempt is now peer-priority gated (#2082): the non-force `preemptNowCh` shortcut becomes MASTER only on a STRICTLY higher effective priority than the last-observed master (RFC 5798 §6.4.2); `ForceRGMaster` (force=true) and priority-0 takeover (ungated `masterDownTimer` path) bypass the gate — no ~60ms failover regression
-- **Heartbeat**: 200ms interval, threshold 5 (1s detection); bind retry loop for simultaneous boot
-- **Session sync connect**: immediate first attempt, 1s retry (was 5s)
-- **Event debounce**: 500ms for cluster state → VRRP priority updates
+- **Sync hold**: VRRP starts with `preempt=false`; both VRRP and the no-RETH/private-RG
+  startup paths use a 30s safety timeout (released early when bulk sync
+  completes); `preemptNowCh` triggers instant VRRP preemption
+  (`pkg/daemon/daemon_run_bringup.go:260-273`;
+  `pkg/daemon/daemon_ha_noreth_hold.go:42-53`;
+  `pkg/vrrp/manager.go:355-379`). Sync-hold release preempt is now peer-priority
+  gated (#2082): the non-force `preemptNowCh` shortcut becomes MASTER only on a
+  STRICTLY higher effective priority than the last-observed master (RFC 5798
+  §6.4.2); `ForceRGMaster` (force=true) and priority-0 takeover (ungated
+  `masterDownTimer` path) bypass the gate
+- **Heartbeat**: runtime defaults are 100ms interval × threshold 5 (500ms
+  staleness threshold); the deployed lab config uses 200ms × 5 (1s). The knobs
+  are `set chassis cluster heartbeat-interval <ms>` and
+  `set chassis cluster heartbeat-threshold <n>`; timeout is subject to
+  startup/restart grace and the sync-recency guard above. The bind retry loop
+  also handles simultaneous boot
+  (`pkg/cluster/heartbeat.go:61-98,1916-1960`;
+  `pkg/daemon/daemon_ha_sync.go:1514-1570`;
+  `pkg/daemon/daemon_ha_sync.go:170-206`;
+  `docs/ha-cluster-userspace.conf:71-72`)
+- **Session sync connect**: immediate first dial, 1s retry (`pkg/cluster/sync_conn.go:1379-1414`)
+- **Event debounce**: 500ms for cluster state → VRRP priority updates in
+  legacy VRRP-backed mode only; skipped when RETH VRRP is suppressed
+  (`pkg/daemon/daemon_ha.go:782-824`)
 
 ### Shutdown
 - FRR reloads run `frr-reload.py` DIRECTLY (15s context per leg) — NEVER `systemctl reload frr`: FRR 10.6's ExecReload bounces watchfrr (the unit MainPID), which parks frr.service in a 2-min stop-sigterm and ends in systemd SIGKILLing FRR (#1880)
@@ -494,7 +564,21 @@ in git history; `git log -- bpf/xdp/ bpf/tc/` walks the deleted source.
 - **IPsec**: strongSwan config generation, IKE proposals, gateway compilation, XFRM interfaces
 - **Observability**: Syslog (facility/severity/category filtering, structured RT_FLOW format, TCP/TLS transport, event mode local file), NetFlow v9 (1-in-N sampling), Prometheus, RPM probes, dynamic feeds, SNMP (ifTable MIB), dataplane buffer utilization (`show system buffers`), session aggregation reporting
 - **Flow**: TCP MSS clamping (ingress XDP + egress TC on the legacy path, plus userspace handling where admitted), ALG control, allow-dns-reply, allow-embedded-icmp, configurable timeouts (per-application inactivity), configurable SYN-first TCP session-miss guard (SYN-first by default; `no-syn-check` admits non-closing mid-stream transit misses and `strict-syn-check` overrides, while bare RST/FIN always drop, #10703/#4400; host-inbound LocalDelivery still caches only SYN-first sessions and delivers declined packets to the local stack, #4539), firewall filters (port ranges, hit counters, logging, forwarding-class DSCP rewrite, DSCP action)
-- **HA**: Chassis cluster state machine (weight-based failover, manual failover/reset, Junos-style show/request commands), native VRRPv3 (Go state machine, AF_PACKET receiver, per-instance sockets, IPv6 NODAD, 30ms RETH advertisements, async GARP burst, ~60ms failover, single-interface tracking — nested `track-interface <if> priority-cost <n>`, effective-priority demotion clamped [1,254] on link-down, owner-255 exempt), bondless RETH (VRRP on physical member interfaces, RethToPhysical resolution, per-node virtual MAC), incremental session sync (1s sweep + ring buffer + GC delete callbacks), config sync (RG0 primary → secondary, ${node} variable quoting, authority enforced on reconnect #78), IPsec SA sync, fabric cross-chassis forwarding, ISSU
+- **HA**: Chassis cluster state machine (weight-based failover, manual
+  failover/reset, Junos-style show/request commands), native VRRPv3 (Go state
+  machine, AF_PACKET receiver, per-instance sockets, IPv6 NODAD), async GARP
+  burst, and single-interface tracking (`track-interface <if> priority-cost
+  <n>`, effective-priority demotion clamped [1,254] on link-down, owner-255
+  exempt). Only legacy VRRP-backed RETH mode (`no-private-rg-election`,
+  unless `no-reth-vrrp`) runs VRRP on physical bondless-RETH members, with
+  30ms default advertisement; compiler-default private-RG election suppresses
+  RETH VRRP. Bondless RETH uses `RethToPhysical` resolution and per-node
+  virtual MACs. Private-RG election is the default, with incremental session
+  sync (1s sweep + ring buffer + GC delete callbacks), config sync (RG0
+  primary → secondary, `${node}` variable quoting, authority enforced on
+  reconnect #78), IPsec SA sync, fabric cross-chassis forwarding, and ISSU
+  (`pkg/config/compiler_system.go:3132-3137`;
+  `pkg/vrrp/vrrp.go:153-166`).
 - **DHCP**: Relay (Option 82), server (Kea integration with lease display)
 - **CLI**: Junos-style prefix matching, "Possible completions:" headers, zone/interface descriptions, session idle time, session brief tabular view, flow statistics, policy descriptions, config validation warnings
 

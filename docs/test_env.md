@@ -407,25 +407,40 @@ sg incus-admin -c 'incus exec xpf-fw1 -- ip addr show ge-7-0-1.50' | grep '172.1
 # Expected: VIP only on fw0
 ```
 
-### VRRP Failover Test (`d951626`, `7bcaee9`, updated `ff7821c`, `ae1a717`)
-Verify failover completes within ~100ms with 30ms VRRP intervals.
-```bash
-# Rapid ping from cluster-lan-host to LAN RETH VIP (10ms interval)
-sg incus-admin -c 'incus exec cluster-lan-host -- ping -i 0.01 -c 500 -W 1 10.0.60.1' &
+### Cluster Failover Test
 
-# Stop fw0 to trigger failover (sends 3× priority-0 burst)
+The checked-in cluster config uses the compiler-default private-RG mode (no
+`no-private-rg-election`), so RETH VRRP is suppressed. Its heartbeat staleness
+is 200ms × 5 = 1s. While connected sync has peer traffic ≤2s old, the guard
+suppresses heartbeat timeout, capped at 5s; silent node death can take roughly
+1.0–2.2s from phase timing, while a process crash that closes sync falls
+through at the raw threshold. The old ~60ms/30ms-VRRP failover text describes a
+legacy test path, not this default. The prior ~150ms recovery expectation is
+removed; no source-backed end-to-end recovery bound exists
+(`pkg/config/compiler_system.go:3132-3137`;
+`pkg/cluster/heartbeat.go:61-65,1916-1960`;
+`pkg/cluster/heartbeat_manager.go:790-832`;
+`pkg/daemon/daemon_ha_sync.go:170-206`;
+`docs/ha-cluster.conf:70-72`).
+
+```bash
+# 15s rapid ping probe spans the failover guard window and restart recovery.
+sg incus-admin -c 'incus exec cluster-lan-host -- ping -i 0.01 -c 1500 -W 1 10.0.60.1' &
+
+# Stop fw0. Default private-RG shutdown sends no VRRP priority-0 resign;
+# the peer promotes through heartbeat-loss detection.
 sleep 1
 sg incus-admin -c 'incus exec xpf-fw0 -- systemctl stop xpfd'
 
-# Expected: ~6 lost pings at 10ms interval = ~60ms failover
-# (masterDown ~97ms with 30ms intervals; planned stop near-instant via priority-0)
-# Check fw1 became MASTER:
-sg incus-admin -c 'incus exec xpf-fw1 -- cli -c "show security vrrp"'
+# Allow the 5s sync-suppression cap + 1s threshold + a heartbeat tick.
+sleep 8
+# Check cluster ownership and record measured ping loss / elapsed restoration:
+sg incus-admin -c 'incus exec xpf-fw1 -- cli -c "show chassis cluster status"'
 
-# Restart fw0 — preemption should reclaim primary within ~150ms
+# Restart fw0 and observe when it becomes eligible/primary after startup sync.
 sg incus-admin -c 'incus exec xpf-fw0 -- systemctl start xpfd'
-sleep 3  # wait for daemon startup + legacy BPF load + sync hold
-sg incus-admin -c 'incus exec xpf-fw0 -- cli -c "show security vrrp"'
+sleep 35  # allow the 30s startup sync hold to release (or complete early)
+sg incus-admin -c 'incus exec xpf-fw0 -- cli -c "show chassis cluster status"'
 ```
 
 ### IPv6 VIP Reachability Test (`d03b29e`)
@@ -535,11 +550,11 @@ sg incus-admin -c 'incus exec cluster-lan-host -- ping -6 -c 3 2001:559:8585:cf0
 
 # 5. Failover + recovery
 sg incus-admin -c 'incus exec xpf-fw0 -- systemctl stop xpfd'
-sleep 1  # 30ms VRRP → ~97ms failover (planned stop near-instant via priority-0)
-sg incus-admin -c 'incus exec cluster-lan-host -- ping -c 3 10.0.60.1'  # should reach fw1
+sleep 8  # 5s sync-suppression cap + 1s heartbeat threshold + tick
+sg incus-admin -c 'incus exec cluster-lan-host -- ping -c 3 10.0.60.1'  # verify fw1 owns the VIP
 sg incus-admin -c 'incus exec xpf-fw0 -- systemctl start xpfd'
-sleep 5  # daemon startup + legacy BPF load + sync hold
-sg incus-admin -c 'incus exec cluster-lan-host -- ping -c 3 10.0.60.1'  # should reach fw0 again
+sleep 35  # allow the 30s startup sync hold to release (or complete early)
+sg incus-admin -c 'incus exec cluster-lan-host -- ping -c 3 10.0.60.1'  # verify current owner
 
 # 6. Manual failover + reset
 echo 'request chassis cluster failover redundancy-group 1 node 1' | \

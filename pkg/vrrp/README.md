@@ -1,11 +1,13 @@
 # pkg/vrrp
 
-Native VRRPv3 (RFC 5798) state machine. ~60 ms failover with 30 ms RETH
-advertisements, IPv6 support, AF_PACKET RX fallback for VLAN
-sub-interfaces, async GARP burst on `becomeMaster`, and sync-hold
-preemption control for HA bulk session sync.
+Native VRRPv3 (RFC 5798) state machine, including the **legacy VRRP-backed
+RETH mode** (the compiler default is private-RG election with direct VIP
+ownership and no RETH VRRP instances). RETH's 30ms default advertisement and
+the timer values below apply only to the VRRP-backed mode
+(`pkg/config/compiler_system.go:3132-3137`; `vrrp.go:153-166`).
 
-This is the package that drives chassis-cluster failover.
+This package drives VRRP-backed RETH and standalone VRRP; it is not the
+default RETH ownership/failover path.
 
 ## Entry points
 
@@ -271,7 +273,13 @@ the baseline with an ordinary advert.
 
 ## Failover timing (CLAUDE.md authoritative)
 
-- ~60 ms with 30 ms RETH advertisements (masterDownInterval ~97 ms).
+- Only legacy VRRP-backed RETH mode uses the 30ms default advertisement
+  (`no-private-rg-election`, unless `no-reth-vrrp` is also set). Its
+  steady-state master-down timer is `3×Master_Adver_Interval + Skew_Time`;
+  for a 30ms learned/current advertisement and priorities 1–255, the timer
+  is >90ms and <120ms. This is a detection timer, not an end-to-end
+  restoration measurement (`vrrp.go:153-166`;
+  `instance_timing.go:112-128`; `pkg/config/compiler_system.go:3132-3137`).
 - Master_Adver_Interval adoption (#4061, RFC 5798 §6.1/§6.4.2): a BACKUP
   computes `Master_Down_Interval = 3×Master_Adver_Interval + Skew_Time`
   from the interval the **current master advertises**, learned from the
@@ -282,8 +290,9 @@ the baseline with an ordinary advert.
   `shouldPreemptObservedMaster`/`preemptingLiveLowerMaster`) use it, with
   the local interval as the pre-first-advert fallback. Skew_Time still uses
   the **local** priority (§6.1). When master and backup are configured with
-  the SAME interval (the common case — RETH 30 ms both sides) the learned
-  value equals the local one, so the ~60 ms failover is unchanged; a
+  the SAME interval (RETH 30 ms by default in legacy VRRP-backed mode) the
+  learned value equals the local one, so the 90–120 ms master-down timer is
+  unchanged; a
   mismatch (a rolling `reth-advertise-interval` change, or a misconfig) no
   longer times the master out on the wrong cadence (a shorter local interval
   → premature failover/flapping; a longer one → delayed detection/loss).
@@ -301,8 +310,31 @@ the baseline with an ordinary advert.
   fast-failover default is preserved exactly. Because the floor is the node's
   OWN interval, a legitimately-configured low-interval cluster (e.g.
   `reth-advertise-interval 10` on both nodes) is not over-clamped.
-- Planned shutdown: 3× priority-0 advert burst → peer takeover ~1 ms.
-- Heartbeat 200 ms, threshold 5 (1 s detection).
+- Planned **legacy VRRP shutdown**: the resigning instance sends three
+  priority-0 advertisements; the backup arms a 1ms master-down timer, and the
+  run-loop test requires its MASTER advertisement within 50ms (test
+  constraint, not SLA). Private-RG operator failover is explicit peer transfer;
+  ordinary private-RG shutdown sends no resign/transfer frame, so after
+  `rg_active` clears the peer promotes through heartbeat-loss detection, no
+  sooner than the heartbeat threshold and potentially later under the
+  sync-recency guard (`instance.go:770-807`;
+  `instance_rx.go:155-173`; `instance_prio0_run_test.go:143-149`;
+  `pkg/cluster/failover.go:447-450`;
+  `pkg/daemon/daemon_run_shutdown.go:418-428`;
+  `pkg/cluster/manager.go:1026-1077`).
+- Heartbeat staleness threshold: runtime defaults 100ms × 5 = 500ms; deployed
+  lab config 200ms × 5 = 1s. Name the knobs
+  `set chassis cluster heartbeat-interval <ms>` and
+  `set chassis cluster heartbeat-threshold <n>`. These are not always peer-loss
+  declaration times: connected session sync with peer traffic within 2s
+  suppresses the timeout (5s continuous-suppression cap), so silent node death
+  with an established sync socket can take roughly 0.5–2.1s at defaults or
+  1.0–2.2s with the lab interval; a process exit that closes sync or an already
+  idle sync path falls through at the heartbeat threshold, subject to startup
+  and restart grace (`pkg/cluster/heartbeat.go:61-98,1916-1960`;
+  `pkg/daemon/daemon_ha_sync.go:170-206`;
+  `pkg/cluster/heartbeat_manager.go:790-832`;
+  `docs/ha-cluster-userspace.conf:71-72`).
 - Async GARP: first pair <1 ms; remaining sent at 50 ms intervals in a
   background goroutine. Critical path stays addVIPs → sendAdvert →
   emitEvent (sync), then `go sendGARP(false)` (async).
@@ -323,8 +355,8 @@ the baseline with an ordinary advert.
   schedules a bounded async reconcile — so a swallowed removal no longer
   silently leaves this BACKUP still answering ARP for a VIP it lost
   (duplicate-address hazard vs the new master). Neither path adds latency
-  on the clean case (the `vipMu` lock is uncontended), so the ~60 ms
-  failover timing is unchanged.
+  on the clean case (the `vipMu` lock is uncontended); this does not establish
+  any end-to-end failover timing.
   - **Already-absent AddrDel is NOT a divergence.** `removeVIPsLocked`
     treats ENODEV/ENOENT ("not found"/"no such") **and EADDRNOTAVAIL**
     ("cannot assign requested address", the common already-absent errno)
@@ -417,10 +449,20 @@ the baseline with an ordinary advert.
   GARP exists to prevent. The epoch/owner check also protects the synchronous
   first frame from an already-stale snapshot; a nil predicate (direct-mode
   re-announce, tests) keeps the original run-to-completion behavior.
-- Event debounce 500 ms before priority updates.
+- Event debounce is 500ms before priority updates in legacy VRRP-backed mode;
+  `watchClusterEvents` skips it when RETH VRRP is suppressed
+  (`pkg/daemon/daemon_ha.go:782-824`).
 - Sync hold: VRRP starts with `preempt=false`; released after bulk
-  session sync (or 10 s timeout). `preemptNowCh` triggers instant
+  session sync (or 30s timeout), not 10s
+  (`pkg/daemon/daemon_run_bringup.go:260-261`;
+  `pkg/vrrp/manager.go:355-379`). `preemptNowCh` triggers instant
   preemption when sync completes early.
+- A non-preempting BACKUP that has heard no peer advertisement arms the 3s
+  deafness shield at process start and at sync-hold release; it is reset to the
+  normal master-down timer on the first received advert
+  (`pkg/vrrp/instance.go:71-93`;
+  `pkg/vrrp/instance_timing.go:11-41`;
+  `pkg/vrrp/instance_rx.go:151-173`).
 - Sync-hold preempt gate (#2082): the non-force `preemptNowCh` shortcut
   is peer-priority gated. `becomeMaster()` runs on the kick only when the
   node's **effective** priority is **strictly greater** than the last
@@ -437,9 +479,8 @@ the baseline with an ordinary advert.
   than `masterDownInterval` — is treated as "no live master", allowing
   cold-start / silent-master-death takeover. `ForceRGMaster` (force=true,
   cluster-authoritative Secondary→Primary promotion) bypasses the gate
-  unchanged, so the ~60 ms failover path is untouched. The gate only
-  governs the shortcut: a denied gate never stops `masterDownTimer`, so the
-  normal RFC election still promotes the node when the real master dies.
+  unchanged; the gate governs only the shortcut and never prevents the normal
+  master-down timer from promoting this legacy VRRP instance.
 
 ## Preempt hold-time (#2850)
 

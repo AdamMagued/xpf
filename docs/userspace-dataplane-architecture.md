@@ -2753,7 +2753,21 @@ The userspace dataplane participates in the chassis cluster HA:
 
 **Failover handling:**
 
-- VRRP detects primary failure (~60ms with 30ms intervals)
+- The compiler-default private-RG mode detects peer loss using heartbeat
+  staleness (100ms × 5 = 500ms at runtime defaults, 200ms × 5 = 1s in the
+  deployed lab config). With connected sync and peer traffic ≤2s old, detection
+  is max(threshold, remaining sync-recency window) plus up to one heartbeat
+  tick: about 0.5–2.1s / 1.0–2.2s respectively, phase-dependent. These are
+  detection times, not end-to-end restoration SLAs
+  (`pkg/config/compiler_system.go:3132-3137`;
+  `pkg/cluster/heartbeat.go:61-65,1916-1960`;
+  `pkg/daemon/daemon_ha_sync.go:170-206`;
+  `docs/ha-cluster-userspace.conf:71-72`).
+- Only legacy VRRP-backed RETH mode (`no-private-rg-election`, unless
+  `no-reth-vrrp`) uses the 30ms advertisement default; its steady-state
+  master-down timer is >90ms and <120ms for priorities 1–255, not a measured
+  end-to-end latency (`pkg/vrrp/vrrp.go:153-166`;
+  `pkg/vrrp/instance_timing.go:112-128`).
 - New primary activates RGs → `UpdateRGActive(rg, true)`
 - Workers start forwarding for activated RGs
 - Synced sessions from peer are promoted on first packet match

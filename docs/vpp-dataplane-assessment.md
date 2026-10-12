@@ -900,8 +900,11 @@ xpf config (cluster/reth) → pkg/vrrp/vrrp.go → keepalived.conf → keepalive
 ```
 
 **Key design choices:**
-- **Bondless RETH:** No bond devices. VRRP runs directly on physical member interfaces
-  via `RethToPhysical()` resolution (reth0 → trust0, reth1 → wan0, etc.)
+- **Bondless RETH:** No bond devices. Only legacy VRRP-backed mode
+  (`no-private-rg-election`, unless `no-reth-vrrp`) runs VRRP directly on
+  physical member interfaces; compiler-default private-RG election suppresses
+  RETH VRRP (`pkg/config/compiler_system.go:3132-3137`;
+  `pkg/vrrp/vrrp.go:153-166`).
 - **VRID = 100 + rgID:** Deterministic VRID assignment per redundancy group.
 - **Priority 200 (primary) / 100 (secondary):** Mapped from cluster election state.
 - **169.254.RG.NODE/32 base address:** Link-local base on physical members for VRRP.
