@@ -28,9 +28,11 @@ import (
 //   - POST-mutation (blocking mutations only — `chpasswd`, sshd reload): the
 //     process may have been spawned pre-promotion and resumed
 //     post-promotion. Re-read live and synchronously converge before dropping
-//     markers or returning. Login deprovision and root-password repairs
-//     reacquire applySem and revalidate intent before they finish, relocking
-//     a removed account before its provenance can be discarded.
+//     markers or returning. Every live-password repair in login deprovision
+//     reacquires applySem and revalidates before provenance cleanup, relocking
+//     a removed account. Root repairs via repairStalePasswordLock12169 also
+//     settle under applySem; the direct pre-lock root repair retains markers
+//     for a later apply rather than providing that settlement guarantee.
 //
 // Under applySem the passed config IS the live config, so every check below
 // is a no-op on the healthy path (one RLock + slice scan); the fence only
