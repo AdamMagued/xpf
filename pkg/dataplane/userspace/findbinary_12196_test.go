@@ -163,6 +163,29 @@ func TestFindBinaryReportsSkippedCwdCandidate12196(t *testing.T) {
 	}
 }
 
+func TestFindBinaryDeduplicatesBareArgv0CwdCandidate12196(t *testing.T) {
+	oldArg0 := os.Args[0]
+	os.Args[0] = "xpfd"
+	t.Cleanup(func() { os.Args[0] = oldArg0 })
+
+	cwd := t.TempDir()
+	candidate := filepath.Join(cwd, findBinaryName12196)
+	if err := os.WriteFile(candidate, []byte("# stale artifact\n"), 0o644); err != nil {
+		t.Fatalf("write non-executable candidate: %v", err)
+	}
+	t.Chdir(cwd)
+	t.Setenv("PATH", "")
+
+	_, err := findBinary("")
+	if err == nil {
+		t.Fatal("findBinary(\"\") succeeded without an executable helper")
+	}
+	count := strings.Count(err.Error(), findBinaryName12196+": ")
+	if count != 1 {
+		t.Fatalf("findBinary(\"\") error %q names skipped candidate %d times, want exactly once", err, count)
+	}
+}
+
 func TestFindBinarySkipsNoexecCwdCandidate12196(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("noexec tmpfs regression requires Linux")
@@ -182,15 +205,24 @@ func TestFindBinarySkipsNoexecCwdCandidate12196(t *testing.T) {
 	if err := os.Mkdir(mountpoint, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	script := `mount -t tmpfs -o noexec,size=4m tmpfs "$1" || { echo NOEXEC_TMPFS_UNAVAILABLE; exit 77; }; FIND_BINARY_NOEXEC_DIR="$1" exec "$2" -test.run=^TestFindBinaryNoexecNamespaceHelper12196$`
+	// The sentinel is echoed inside the namespace after the mount succeeds and
+	// before exec. A missing sentinel means the namespace never came up —
+	// unshare, uid_map/setgroups, or mount denial (e.g. AppArmor-restricted
+	// CI runners) — so skip; fail only when the sentinel is present.
+	script := `mount -t tmpfs -o noexec,size=4m tmpfs "$1" || exit 77; echo NOEXEC_NS_READY; FIND_BINARY_NOEXEC_DIR="$1" exec "$2" -test.run=^TestFindBinaryNoexecNamespaceHelper12196$ -test.v`
 	cmd := exec.Command(unshare, "-rm", "sh", "-c", script, "sh", mountpoint, binary)
 	output, err := cmd.CombinedOutput()
+	text := string(output)
+	if !strings.Contains(text, "NOEXEC_NS_READY") {
+		t.Skipf("noexec tmpfs namespace unavailable: err=%v output: %s", err, text)
+	}
 	if err != nil {
-		text := string(output)
-		if strings.Contains(text, "NOEXEC_TMPFS_UNAVAILABLE") || strings.Contains(text, "unshare failed") {
-			t.Skipf("noexec tmpfs namespace unavailable: %s", text)
-		}
 		t.Fatalf("noexec tmpfs child failed: %v\n%s", err, text)
+	}
+	// A renamed helper exits 0 with "no tests to run"; require the verbose
+	// PASS line so a no-op child cannot silently pass this regression.
+	if !strings.Contains(text, "--- PASS: TestFindBinaryNoexecNamespaceHelper12196") {
+		t.Fatalf("noexec tmpfs child ran without the namespace helper passing:\n%s", text)
 	}
 }
 
