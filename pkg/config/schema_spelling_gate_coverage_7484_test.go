@@ -586,7 +586,14 @@ var gateBlindCeiling = map[gateBlindClass]int{
 	// group-level probe has no independently materialized output. #10078's
 	// security declarations also remove four unreachable ALG kind roots, so
 	// tighten this ceiling 137 -> 133 from the measured member registry.
-	gateBlindUnreachable: 133,
+	// #12239 adds `schedulers scheduler <*> description`. SchedulerConfig
+	// has no Description field, so this accepted display-only Junos leaf is
+	// intentionally inert and adds exactly one `unreachable` member, named
+	// in the #7484 member registry: raise 133 -> 134 for it and nothing
+	// else. The base already measured 134 against 133 (net +1 from leaves
+	// other changes moved, which TestSpellingGateMembersAreRecorded7484
+	// names); that drift is not absorbed here and still reds this ratchet.
+	gateBlindUnreachable: 134,
 	// #8830: read, value deliberately ignored, advisory says so. Measured at
 	// this head: vrrp-group track-interface priority-cost (inet and inet6),
 	// security log stream transport tls-profile, system dataplane

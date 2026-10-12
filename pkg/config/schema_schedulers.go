@@ -1,5 +1,7 @@
 package config
 
+import "fmt"
+
 // schemaSchedulers models the top-level `[edit schedulers]` policy
 // time-range stanza (F-013 — previously absent from setSchema, so flat-set
 // `set schedulers scheduler X daily start-time ...` packed the whole line
@@ -12,6 +14,11 @@ package config
 // malformed window is rejected at commit — the fail-closed half of #3849.
 var schemaSchedulerDay = &schemaNode{
 	desc: "Time window for this day (start-time/stop-time, all-day, or exclude)",
+	// #12239: use the same SetPath flat-run expansion as the compiler's
+	// schedulerWindowFromNode. Without it, the inherited closed-world arm
+	// rejects supported #8939 chains such as `monday all-day exclude`.
+	packedFlatRun: true,
+	nodeValidator: validateSchedulerDayPackedTail12239,
 	children: map[string]*schemaNode{
 		"start-time": {
 			desc:          "Window start time (24-hour HH:MM or HH:MM:SS)",
@@ -46,7 +53,17 @@ var schemaSchedulers = &schemaNode{
 			args:        1,
 			multi:       true,
 			placeholder: "<scheduler-name>",
+			closedWorld: true,
 			children: map[string]*schemaNode{
+				// Junos `scheduler (Security Policies)` syntax includes
+				// `description text;` directly under `scheduler <name>`.
+				// Modeled (unwired, like the address-set description at
+				// schema_security.go) so the closed-world arm keeps its
+				// LEAF-COMPLETE precondition and does not reject valid
+				// Junos. SchedulerConfig has no Description field and
+				// compileSchedulers reads no description child, so the
+				// value is accepted and inert by construction.
+				"description": {desc: "Scheduler description", args: 1, placeholder: "<text>", children: nil},
 				// Legacy simplified shape: start-time/stop-time as direct
 				// children of the scheduler (the daily window).
 				"start-time": {
@@ -103,4 +120,33 @@ var schemaSchedulers = &schemaNode{
 			},
 		},
 	},
+}
+
+// validateSchedulerDayPackedTail12239 gates the packed day-leaf tail
+// (#12239 F3): hierarchical `daily all-day;` parses to Keys=[daily,
+// all-day], and schedulerWindowFromNode reads exactly Keys[1] ==
+// all-day|exclude there (compiler_system.go). A misspelled tail never
+// becomes a child node, so the closed-world child walk cannot see it;
+// without this gate `daily all-dya;` commits clean and the scheduled
+// policy silently loses its window. Tokens after Keys[1] are never read
+// either (`monday all-day exclude;` compiled as all-day alone), so the
+// error names the first token the compiler would drop. A packed
+// `<day> start-time X stop-time Y;` never reaches this check: the #8662
+// compact normalizer moves it into the day's braces first. Runs only on
+// exact schema-key match, so it fires for day containers under
+// `scheduler <name>` and nowhere else. Lenient load/boot is untouched:
+// SchemaValidate is the strict gate, and Store.Load/SyncApply downgrade
+// it to a warning.
+func validateSchedulerDayPackedTail12239(node *Node, _ *schemaNode) error {
+	if node == nil || len(node.Keys) <= 1 {
+		return nil
+	}
+	day, tail := node.Keys[0], node.Keys[1]
+	if tail != "all-day" && tail != "exclude" {
+		return fmt.Errorf("unexpected %q after %q: a day window takes all-day, exclude, or start-time/stop-time", tail, day)
+	}
+	if len(node.Keys) > 2 {
+		return fmt.Errorf("unexpected %q after %q %q: a packed day line carries one statement; put the others inside the day's braces", node.Keys[2], day, tail)
+	}
+	return nil
 }
