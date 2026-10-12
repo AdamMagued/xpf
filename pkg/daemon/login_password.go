@@ -2,6 +2,7 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -631,6 +632,40 @@ func (d *Daemon) reconcileAbsentLoginUsers(cfg *config.Config) (retErr error) {
 // commit result too, so a failed revocation fails the commit.
 func (d *Daemon) deprovisionLoginUser(name string) (retErr error) {
 	fail := func(e error) { retErr = errors.Join(retErr, e) }
+	var releaseApply func()
+	defer func() {
+		if releaseApply != nil {
+			releaseApply()
+		}
+	}()
+	acquireApply := func() error {
+		if releaseApply != nil || d == nil || d.applySem == nil {
+			return nil
+		}
+		// A normal applier already holds applySem and never deprovisions a
+		// user its active config desires. Only a stale owner can reach this
+		// restore branch, so this acquisition cannot re-enter the semaphore.
+		if err := d.applySem.Acquire(context.Background(), 1); err != nil {
+			return err
+		}
+		releaseApply = func() { d.applySem.Release(1) }
+		return nil
+	}
+	restoreLiveLogin := func() error {
+		if err := acquireApply(); err != nil {
+			return err
+		}
+		live := d.liveConfig12169()
+		if live == nil || live.System.Login == nil {
+			return nil
+		}
+		for _, user := range live.System.Login.Users {
+			if user != nil && user.Name == name {
+				return d.applySystemLogin(live)
+			}
+		}
+		return nil
+	}
 	curUID, found, err := lookupUIDErr(name)
 	if err != nil {
 		// /etc/passwd could not be READ (transient mount/permission/I/O
@@ -652,12 +687,24 @@ func (d *Daemon) deprovisionLoginUser(name string) (retErr error) {
 		return // keep markers; retry next apply
 	}
 	if !found {
-		// passwd READ OK and name genuinely ABSENT — a real out-of-band
-		// userdel. There is nothing to revoke; drop the stale markers so we
-		// stop revisiting the account every apply. Genuine absence is a clean
-		// success, so the best-effort marker cleanup error is not accumulated.
+		// passwd READ OK and name genuinely ABSENT — there is nothing to
+		// revoke. A concurrent commit may be creating this same live account,
+		// so fence marker cleanup too and converge the re-presented account.
+		if _, stillDesired := d.liveDesiredLoginUser12169(name); stillDesired {
+			if err := restoreLiveLogin(); err != nil {
+				fail(err)
+			}
+			return retErr
+		}
 		_ = forgetProvenance(name)
-		return nil
+		if _, stillDesired := d.liveDesiredLoginUser12169(name); stillDesired {
+			staleRevocationSuperseded12169("restore-user-after-marker-cleanup", name)
+			if err := restoreLiveLogin(); err != nil {
+				fail(err)
+			}
+			return retErr
+		}
+		return retErr
 	}
 
 	// Resolve per-resource ownership for the account CURRENTLY at curUID. Each
@@ -687,10 +734,12 @@ func (d *Daemon) deprovisionLoginUser(name string) (retErr error) {
 		return nil
 	}
 
-	// Lock the password ONLY if xpf set it (password marker). Fail-CLOSED on a
-	// shadow read error: never forget the account (drop markers) while a live
-	// credential may still be active — retry next apply. Mirrors the #1944
-	// pwLock discipline (never lock on a read error).
+	// The timed-out first-commit closeout owner can resume after a later
+	// commit has promoted the same account. Re-read live intent before
+	// revoking. Live-login restores acquire applySem before applying and keep
+	// it through owner return; password repairs already in flight settle under
+	// applySem afterward, retaining the permit through provenance cleanup.
+	liveUser, liveDesired := d.liveDesiredLoginUser12169(name)
 	if ownsPassword {
 		cur, ok := currentShadowHash(name)
 		if !ok {
@@ -699,40 +748,211 @@ func (d *Daemon) deprovisionLoginUser(name string) (retErr error) {
 			fail(fmt.Errorf("read shadow for removed user %s", name))
 			return // keep markers; retry next apply
 		}
-		if !isLockedShadow(cur) {
-			stdin := strings.NewReader(name + ":!\n")
-			if out, err := runCommandStdinTimeout(stdin, "chpasswd", "-e"); err != nil {
-				slog.Warn("failed to lock password for removed login user",
-					"user", name, "err", err, "output", strings.TrimSpace(string(out)))
-				fail(fmt.Errorf("lock password for removed user %s: %w", name, err))
-				return // keep markers; retry
+		if liveDesired && liveUser.EncryptedPassword.Reveal() != "" {
+			staleRevocationSuperseded12169("lock-password", name)
+			repairedHash := liveUser.EncryptedPassword.Reveal()
+			preRepair, preOK := currentShadowHash(name)
+			var preReadErr error
+			if !preOK {
+				preReadErr = fmt.Errorf("read shadow before stale repair for %s", name)
+				slog.Warn("stale repair cannot verify pre-repair shadow; settlement will not reclaim provenance",
+					"user", name)
 			}
-			slog.Info("locked password for removed login user", "user", name)
+			repairErr := errors.Join(preReadErr, d.reconcileUserPassword(&liveUser))
+			latest, liveNow, release, fenceErr := d.settleStaleLoginPassword12169(name, curUID, repairedHash, preRepair, preOK)
+			if release != nil {
+				releaseApply = release
+			}
+			fail(repairErr)
+			fail(fenceErr)
+			liveUser, liveDesired = latest, liveNow
+			if repairErr != nil || fenceErr != nil {
+				return // keep every marker until live password converges
+			}
+		} else if !isLockedShadow(cur) {
+			// Re-read directly at the mutation boundary: promotion may have
+			// happened while ownership and shadow state were being checked.
+			if current, stillDesired := d.liveDesiredLoginUser12169(name); stillDesired &&
+				current.EncryptedPassword.Reveal() != "" {
+				staleRevocationSuperseded12169("lock-password", name)
+				repairedHash := current.EncryptedPassword.Reveal()
+				preRepair, preOK := currentShadowHash(name)
+				var preReadErr error
+				if !preOK {
+					preReadErr = fmt.Errorf("read shadow before stale repair for %s", name)
+					slog.Warn("stale repair cannot verify pre-repair shadow; settlement will not reclaim provenance",
+						"user", name)
+				}
+				repairErr := errors.Join(preReadErr, d.reconcileUserPassword(&current))
+				latest, liveNow, release, fenceErr := d.settleStaleLoginPassword12169(name, curUID, repairedHash, preRepair, preOK)
+				if release != nil {
+					releaseApply = release
+				}
+				fail(repairErr)
+				fail(fenceErr)
+				liveUser, liveDesired = latest, liveNow
+				if repairErr != nil || fenceErr != nil {
+					return
+				}
+			} else {
+				stdin := strings.NewReader(name + ":!\n")
+				out, lockErr := runCommandStdinTimeout(stdin, "chpasswd", "-e")
+				if lockErr != nil {
+					slog.Warn("failed to lock password for removed login user",
+						"user", name, "err", lockErr, "output", strings.TrimSpace(string(out)))
+					fail(fmt.Errorf("lock password for removed user %s: %w", name, lockErr))
+				} else {
+					slog.Info("locked password for removed login user", "user", name)
+				}
+
+				// chpasswd may have changed shadow before returning an error,
+				// or may have been blocked across a later promotion. Repair the
+				// live password, then re-acquire applySem and converge again
+				// against the latest active config before marker cleanup.
+				if current, stillDesired := d.liveDesiredLoginUser12169(name); stillDesired &&
+					current.EncryptedPassword.Reveal() != "" {
+					staleRevocationSuperseded12169("repair-password", name)
+					repairedHash := current.EncryptedPassword.Reveal()
+					preRepair, preOK := currentShadowHash(name)
+					var preReadErr error
+					if !preOK {
+						preReadErr = fmt.Errorf("read shadow before stale repair for %s", name)
+						slog.Warn("stale repair cannot verify pre-repair shadow; settlement will not reclaim provenance",
+							"user", name)
+					}
+					repairErr := errors.Join(preReadErr, d.reconcileUserPassword(&current))
+					latest, liveNow, release, fenceErr := d.settleStaleLoginPassword12169(name, curUID, repairedHash, preRepair, preOK)
+					if release != nil {
+						releaseApply = release
+					}
+					fail(repairErr)
+					fail(fenceErr)
+					liveUser, liveDesired = latest, liveNow
+					if repairErr != nil || fenceErr != nil {
+						return
+					}
+				}
+				if lockErr != nil {
+					return // retain markers; the attempted revocation failed
+				}
+			}
 		}
 	}
 
-	// Remove the xpf-managed authorized_keys ONLY if xpf wrote it (key marker).
-	// The whole file is xpf-owned when the marker matches (applySystemLogin
-	// writes it wholesale). An operator's own key file (no key marker) is never
-	// touched — the #5841 overclaim this closes.
+	// Remove the xpf-managed authorized_keys ONLY if xpf wrote it. A later
+	// commit may have re-presented the user and its keys while this owner was
+	// blocked in chpasswd; skip those keys, or restore them before completion
+	// if the promotion raced the unlink.
 	if ownsKey {
 		keysFile := managedAuthorizedKeysPath(name)
-		if err := os.Remove(keysFile); err != nil && !os.IsNotExist(err) {
+		// Refresh immediately before unlinking; a password operation above
+		// may have blocked while a commit re-presented this account.
+		liveUser, liveDesired = d.liveDesiredLoginUser12169(name)
+		if liveDesired && len(liveUser.SSHKeys) > 0 {
+			staleRevocationSuperseded12169("remove-user-keys", name)
+		} else if err := os.Remove(keysFile); err != nil && !os.IsNotExist(err) {
 			slog.Warn("failed to remove authorized_keys for removed login user",
 				"user", name, "file", keysFile, "err", err)
 			fail(fmt.Errorf("remove authorized_keys for removed user %s: %w", name, err))
 			return // keep markers; retry
+		} else {
+			// The promotion can land between the intent check and unlink.
+			// Re-run the live login reconciler on that rare stale path before
+			// allowing this owner to complete.
+			if current, stillDesired := d.liveDesiredLoginUser12169(name); stillDesired &&
+				len(current.SSHKeys) > 0 {
+				if err := restoreLiveLogin(); err != nil {
+					fail(err)
+					return
+				}
+				liveUser, liveDesired = d.liveDesiredLoginUser12169(name)
+			} else if err := removeProvenanceMarker(provisionedKeysDir(), name); err != nil {
+				fail(err)
+				return
+			}
 		}
 	}
 
-	// Fully revoked — drop every provenance marker so xpf no longer manages this
-	// account. If the same user is later re-added to config, applySystemLogin
-	// recreates it and re-records the markers. A marker-cleanup failure is
-	// accumulated (fail-visible for the #5874 closeout) even though the
-	// credential is already revoked — the surviving marker only means the next
-	// apply re-enumerates and idempotently re-runs deprovision.
+	// A re-presented login remains xpf-owned. Keep account/password markers
+	// so later removals still have the provenance needed to revoke it; only a
+	// now-empty key list drops the independent key marker.
+	if _, stillDesired := d.liveDesiredLoginUser12169(name); stillDesired {
+		// A promotion can race marker cleanup after the credential checks.
+		// Re-apply the live login under applySem before this owner returns.
+		if err := restoreLiveLogin(); err != nil {
+			fail(err)
+		}
+		return retErr
+	}
+
+	// Fully revoked — drop every provenance marker so xpf no longer manages
+	// this account. If the same user is later re-added, applySystemLogin
+	// recreates it and re-records the markers.
 	fail(forgetProvenance(name))
+	if _, stillDesired := d.liveDesiredLoginUser12169(name); stillDesired {
+		staleRevocationSuperseded12169("restore-user-after-marker-cleanup", name)
+		if err := restoreLiveLogin(); err != nil {
+			fail(err)
+		}
+		return retErr
+	}
 	slog.Info("deprovisioned removed login user",
 		"user", name, "password_locked", ownsPassword, "keys_removed", ownsKey)
 	return retErr
+}
+
+// settleStaleLoginPassword12169 revalidates a stale owner's password repair.
+// repairedHash identifies the hash this owner may have written; preRepair is
+// the shadow hash observed immediately before the repair (preOK false when
+// that read failed). A same-password or password-less re-add lands while the
+// repair is blocked, sees shadow == desired, and claims nothing — so whenever
+// this owner's chpasswd actually ran (preRepair != repairedHash) and shadow
+// still holds the repaired hash, settlement reclaims provenance whatever live
+// desires. An identical operator-set hash (preRepair == repairedHash, owner
+// pwNoop) is never claimed. Only an abandoned owner can reach it; normal
+// appliers holding applySem cannot deprovision a user their active config
+// desires. The caller retains the returned permit through provenance cleanup.
+func (d *Daemon) settleStaleLoginPassword12169(name string, uid int, repairedHash string, preRepair string, preOK bool) (config.LoginUser, bool, func(), error) {
+	var release func()
+	if d != nil && d.applySem != nil {
+		if err := d.applySem.Acquire(context.Background(), 1); err != nil {
+			return config.LoginUser{}, false, nil, err
+		}
+		release = func() { d.applySem.Release(1) }
+	}
+
+	live, desired := d.liveDesiredLoginUser12169(name)
+	if desired {
+		if hash, ok := currentShadowHash(name); ok && preOK &&
+			preRepair != repairedHash && hash == repairedHash {
+			if err := errors.Join(markProvisioned(name, uid), markPasswordProvisioned(name, uid)); err != nil {
+				return live, true, release, fmt.Errorf(
+					"restore password provenance for stale repair of %s: %w", name, err)
+			}
+		}
+		return live, true, release, d.reconcileUserPassword(&live)
+	}
+
+	hash, ok := currentShadowHash(name)
+	if !ok {
+		markerErr := errors.Join(markProvisioned(name, uid), markPasswordProvisioned(name, uid))
+		return live, false, release, errors.Join(
+			fmt.Errorf("read shadow for removed user %s after stale password repair", name),
+			markerErr)
+	}
+	if isLockedShadow(hash) {
+		return live, false, release, nil
+	}
+
+	out, err := runCommandStdinTimeout(strings.NewReader(name+":!\n"), "chpasswd", "-e")
+	if err != nil {
+		markerErr := errors.Join(markProvisioned(name, uid), markPasswordProvisioned(name, uid))
+		slog.Warn("failed to re-lock removed login user after stale password repair",
+			"user", name, "err", err, "output", strings.TrimSpace(string(out)))
+		return live, false, release, errors.Join(
+			fmt.Errorf("re-lock password for removed user %s after stale repair: %w", name, err),
+			markerErr)
+	}
+	slog.Info("re-locked removed login user after stale password repair", "user", name)
+	return live, false, release, nil
 }
