@@ -1122,6 +1122,30 @@ reconcile above (extend it only for maps whose loss is truly safe).
   gap with a single ~60ms VRRP failover per node.
 - Kernel/OS upgrades are #1930; a signed/hosted apt repo is #1924.
 
+### APT package-selection boundary (#10848)
+
+APT package selection is not a monotonic floor on the running xpf binaries
+or kernel. A bounded Debian APT 3.3.3 amd64 probe of a private signed
+lower-only `xpf*` package repository, using the managed 990/-1 preferences
+(`install.sh:407–416`), found:
+
+- **P2:** ordinary unversioned `apt-get upgrade` did not downgrade the
+  newer installed package (rc 0, no change).
+- **P3:** ordinary unversioned `apt-get install` exited 100 because those
+  wildcard denies left the installed-but-unindexed version with no
+  candidate. That is an availability failure, not a downgrade.
+- **P5:** an explicit older-version install with `--allow-downgrades`
+  did install the older package in the private root.
+- **P7:** an expired signed Release was rejected by `apt-get update` with
+  an empty, fresh lists cache (rc 100).
+
+These results are limited to that fixture, APT version and commands; they
+do not establish warm-cache, deployed-fleet, or all-release-history
+behavior. They do not test production package scripts or identify the
+active binaries/kernel. See [distribution.md](distribution.md#bounded-apt-selection-evidence-10848)
+for evidence bounds and the 365-day signing-horizon context. This capture
+does not choose or enforce the open Q1–Q4 floor-policy decisions.
+
 ## LANE-1 HA kernel roll (#1930 INC-2)
 
 A kernel bump can't be cut over in place (the running kernel can't be
