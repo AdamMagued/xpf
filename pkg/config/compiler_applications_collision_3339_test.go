@@ -132,8 +132,8 @@ func TestDuplicateTermGeneratedNameRejected(t *testing.T) {
 
 // Valid distinct names commit cleanly: an application, a same-config
 // application-set with a DIFFERENT name, a multi-term application whose implicit
-// set name is not reused, and a user application shadowing a predefined junos-*
-// application (the legitimate shadow case must NOT be rejected).
+// set name is not reused, and a SIMPLE (non-term) user application shadowing a
+// predefined junos-* application (the legitimate shadow case must NOT be rejected).
 func TestDistinctApplicationNamesCommit(t *testing.T) {
 	tree := buildTreeFromSet(t, []string{
 		"set applications application web protocol tcp destination-port 80",
@@ -141,8 +141,8 @@ func TestDistinctApplicationNamesCommit(t *testing.T) {
 		"set applications application-set webset application junos-https",
 		"set applications application multi term t1 protocol tcp destination-port 80",
 		"set applications application multi term t2 protocol udp destination-port 53",
-		// A user application shadowing a predefined name is legitimate, not a
-		// collision: there is no application-set with this name.
+		// A SIMPLE (non-term) user application shadowing a predefined name is
+		// legitimate: there is no application-set with this name.
 		"set applications application junos-ssh protocol tcp destination-port 22",
 	})
 
@@ -154,6 +154,213 @@ func TestDistinctApplicationNamesCommit(t *testing.T) {
 		if strings.Contains(w, "#3339") {
 			t.Fatalf("unexpected #3339 collision warning on a valid config: %q", w)
 		}
+	}
+}
+
+// A user application-set name also shadows a predefined application. Direct
+// references resolve application-first, while nested application-set members
+// resolve user-set-first; reject this cross-kind ambiguity at commit.
+func applicationSetPredefinedApplicationShadowTree(t *testing.T) *ConfigTree {
+	return buildTreeFromSet(t, []string{
+		"set security zones security-zone trust",
+		"set security zones security-zone untrust",
+		"set applications application custom8443 protocol tcp destination-port 8443",
+		"set applications application-set junos-http application custom8443",
+		"set applications application-set parent application-set junos-http",
+		"set security policies from-zone trust to-zone untrust policy direct match source-address any",
+		"set security policies from-zone trust to-zone untrust policy direct match destination-address any",
+		"set security policies from-zone trust to-zone untrust policy direct match application junos-http",
+		"set security policies from-zone trust to-zone untrust policy direct then deny",
+		"set security policies from-zone trust to-zone untrust policy nested match source-address any",
+		"set security policies from-zone trust to-zone untrust policy nested match destination-address any",
+		"set security policies from-zone trust to-zone untrust policy nested match application parent",
+		"set security policies from-zone trust to-zone untrust policy nested then deny",
+	})
+}
+
+func TestApplicationSetShadowsPredefinedApplicationRejected(t *testing.T) {
+	_, err := CompileConfig(applicationSetPredefinedApplicationShadowTree(t))
+	if err == nil {
+		t.Fatal("CompileConfig: expected rejection of application-set shadowing predefined application")
+	}
+	if !strings.Contains(err.Error(), `application-set "junos-http"`) ||
+		!strings.Contains(err.Error(), `predefined application "junos-http"`) ||
+		!strings.Contains(err.Error(), "#12220") {
+		t.Fatalf("unexpected error text: %v", err)
+	}
+}
+
+func TestApplicationSetShadowsPredefinedApplicationLenientWarns(t *testing.T) {
+	cfg, err := CompileConfigLenient(applicationSetPredefinedApplicationShadowTree(t))
+	if err != nil {
+		t.Fatalf("CompileConfigLenient: expected warning instead of rejection, got %v", err)
+	}
+	found := false
+	for _, warning := range cfg.Warnings {
+		if strings.Contains(warning, `application-set "junos-http"`) &&
+			strings.Contains(warning, `predefined application "junos-http"`) &&
+			strings.Contains(warning, "#12220") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected #12220 warning for predefined application shadow, got %v", cfg.Warnings)
+	}
+	if _, collision := cfg.Applications.CollidingNames["junos-http"]; !collision {
+		t.Fatal("lenient compile did not quarantine the ambiguous application-set name")
+	}
+
+	directPolicy := findZonePairPolicy(t, cfg, "trust", "untrust", "direct")
+	if len(directPolicy.Match.Applications) != 1 || directPolicy.Match.Applications[0] != "junos-http" {
+		t.Fatalf("direct policy application = %v; want [junos-http]", directPolicy.Match.Applications)
+	}
+	nestedPolicy := findZonePairPolicy(t, cfg, "trust", "untrust", "nested")
+	if len(nestedPolicy.Match.Applications) != 1 || nestedPolicy.Match.Applications[0] != "parent" {
+		t.Fatalf("nested policy application = %v; want [parent]", nestedPolicy.Match.Applications)
+	}
+
+	// Preserve the base behavior in this regression cell: the direct name is
+	// the predefined tcp/80 application, but the nested policy expands through
+	// the user-defined junos-http set to custom8443. The diagnostic prevents
+	// these meanings from silently reaching a commit.
+	direct, ok := ResolveApplication("junos-http", cfg.Applications.Applications)
+	if !ok || direct.Protocol != "tcp" || direct.DestinationPort != "80" {
+		t.Fatalf("direct junos-http = %#v, %t; want predefined tcp/80", direct, ok)
+	}
+	nested, err := ExpandApplicationSet("parent", &cfg.Applications)
+	if err != nil {
+		t.Fatalf("ExpandApplicationSet(parent): %v", err)
+	}
+	if len(nested) != 1 || nested[0] != "custom8443" {
+		t.Fatalf("nested parent expansion = %v; want [custom8443]", nested)
+	}
+	custom, ok := ResolveApplication(nested[0], cfg.Applications.Applications)
+	if !ok || custom.Protocol != "tcp" || custom.DestinationPort != "8443" {
+		t.Fatalf("nested application = %#v, %t; want custom tcp/8443", custom, ok)
+	}
+	if drops := ApplicationReferenceMatchDrops("junos-http", &cfg.Applications); len(drops) == 0 {
+		t.Fatal("direct reference to ambiguous junos-http was not quarantined")
+	}
+	if drops := ApplicationReferenceMatchDrops("parent", &cfg.Applications); len(drops) == 0 {
+		t.Fatal("nested reference to parent containing ambiguous junos-http was not quarantined")
+	}
+}
+func termBasedApplicationPredefinedShadowTree(t *testing.T) *ConfigTree {
+	return buildTreeFromSet(t, []string{
+		"set security zones security-zone trust",
+		"set security zones security-zone untrust",
+		"set applications application junos-http term t1 protocol tcp destination-port 8443",
+		"set applications application-set parent application junos-http",
+		"set security policies from-zone trust to-zone untrust policy direct match source-address any",
+		"set security policies from-zone trust to-zone untrust policy direct match destination-address any",
+		"set security policies from-zone trust to-zone untrust policy direct match application junos-http",
+		"set security policies from-zone trust to-zone untrust policy direct then deny",
+		"set security policies from-zone trust to-zone untrust policy nested match source-address any",
+		"set security policies from-zone trust to-zone untrust policy nested match destination-address any",
+		"set security policies from-zone trust to-zone untrust policy nested match application parent",
+		"set security policies from-zone trust to-zone untrust policy nested then deny",
+	})
+}
+
+func TestTermBasedApplicationShadowsPredefinedApplicationRejected(t *testing.T) {
+	_, err := CompileConfig(termBasedApplicationPredefinedShadowTree(t))
+	if err == nil {
+		t.Fatal("CompileConfig: expected rejection of term-based application shadowing predefined application")
+	}
+	if !strings.Contains(err.Error(), `term-based application "junos-http"`) ||
+		!strings.Contains(err.Error(), `predefined application "junos-http"`) ||
+		!strings.Contains(err.Error(), "#12220") {
+		t.Fatalf("unexpected error text: %v", err)
+	}
+}
+
+func TestTermBasedApplicationShadowsPredefinedApplicationLenientWarns(t *testing.T) {
+	cfg, err := CompileConfigLenient(termBasedApplicationPredefinedShadowTree(t))
+	if err != nil {
+		t.Fatalf("CompileConfigLenient: expected warning instead of rejection, got %v", err)
+	}
+	found := false
+	for _, warning := range cfg.Warnings {
+		if strings.Contains(warning, `term-based application "junos-http"`) &&
+			strings.Contains(warning, `predefined application "junos-http"`) &&
+			strings.Contains(warning, "#12220") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected #12220 warning for term-based predefined application shadow, got %v", cfg.Warnings)
+	}
+	if _, collision := cfg.Applications.CollidingNames["junos-http"]; !collision {
+		t.Fatal("lenient compile did not quarantine the ambiguous implicit application-set")
+	}
+
+	direct, ok := ResolveApplication("junos-http", cfg.Applications.Applications)
+	if !ok || direct.Protocol != "tcp" || direct.DestinationPort != "80" {
+		t.Fatalf("direct junos-http = %#v, %t; want predefined tcp/80", direct, ok)
+	}
+	nested, err := ExpandApplicationSet("parent", &cfg.Applications)
+	if err != nil {
+		t.Fatalf("ExpandApplicationSet(parent): %v", err)
+	}
+	if len(nested) != 1 || nested[0] != "junos-http-t1" {
+		t.Fatalf("nested parent expansion = %v; want [junos-http-t1]", nested)
+	}
+	term, ok := ResolveApplication(nested[0], cfg.Applications.Applications)
+	if !ok || term.Protocol != "tcp" || term.DestinationPort != "8443" {
+		t.Fatalf("nested application = %#v, %t; want term tcp/8443", term, ok)
+	}
+	if drops := ApplicationReferenceMatchDrops("junos-http", &cfg.Applications); len(drops) == 0 {
+		t.Fatal("direct reference to ambiguous junos-http was not quarantined")
+	}
+	if drops := ApplicationReferenceMatchDrops("parent", &cfg.Applications); len(drops) == 0 {
+		t.Fatal("nested reference to parent containing ambiguous junos-http was not quarantined")
+	}
+}
+
+func TestApplicationSetShadowDoesNotDuplicatePredefinedCollisionWarning(t *testing.T) {
+	cases := []struct {
+		name string
+		apps []string
+	}{
+		{
+			name: "simple application and set",
+			apps: []string{
+				"set applications application custom8443 protocol tcp destination-port 8443",
+				"set applications application junos-http protocol tcp destination-port 8080",
+				"set applications application-set junos-http application custom8443",
+			},
+		},
+		{
+			name: "term application and set",
+			apps: []string{
+				"set applications application custom8443 protocol tcp destination-port 8443",
+				"set applications application junos-http term t1 protocol tcp destination-port 8080",
+				"set applications application-set junos-http application custom8443",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := CompileConfigLenient(buildTreeFromSet(t, tc.apps))
+			if err != nil {
+				t.Fatalf("CompileConfigLenient: %v", err)
+			}
+			if _, collision := cfg.Applications.CollidingNames["junos-http"]; !collision {
+				t.Fatal("lenient compile did not record junos-http collision")
+			}
+			count := 0
+			for _, warning := range cfg.Warnings {
+				if strings.Contains(warning, "junos-http") &&
+					(strings.Contains(warning, "#3339") || strings.Contains(warning, "#12220")) {
+					count++
+				}
+			}
+			if count != 1 {
+				t.Fatalf("got %d junos-http collision warnings, want exactly 1: %v", count, cfg.Warnings)
+			}
+		})
 	}
 }
 

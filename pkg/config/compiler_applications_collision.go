@@ -13,7 +13,7 @@ import (
 // multi-term application additionally MINTS an implicit application-set under the
 // application's own name (apps.ApplicationSets[appName] = implicitSet). Every one
 // of these writes is last-write-wins: a second definition silently OVERWRITES
-// the first, with no commit error. The observable failures (#3339):
+// the first, with no commit error. The observable failures (#3339 and #12220):
 //
 //   - M07: an explicit `applications application-set <X>` silently replaces the
 //     implicit set minted for a multi-term `applications application <X>` (or,
@@ -29,15 +29,22 @@ import (
 //     when a single term carries multiple protocols) — the later
 //     apps.Applications[name] = t silently overwrites the earlier while the
 //     implicit set still lists the duplicated member. Ambiguous and silent.
+//   - #12220: an authored `application-set <X>` — or a term-based authored
+//     `application <X>`, which mints an implicit application-set <X> — can
+//     shadow a predefined application `<X>` without overwriting either user
+//     map. Direct references resolve application-first, while nested set
+//     members resolve user-set-first, so the same token can have different
+//     enforced meanings by reference path.
 //
 // Junos treats applications and application-sets as a SINGLE flat namespace and
 // rejects a duplicate definition / a name used for both; this gate restores that
 // parity. It is an AST pre-walk (run on the group-expanded, inactive-pruned tree
-// in compileExpanded) rather than a post-compile check on the typed *Config,
-// because by the time the maps are built the colliding definitions have ALREADY
-// been merged away by last-write-wins — only the raw AST still carries every
-// definition. This mirrors validateUnsupportedInterfaceStanzasAST and the other
-// AST reject-at-commit gates.
+// in compileExpanded) rather than a post-compile check: duplicate definitions
+// and authored app/set collisions can be merged away by last-write-wins, while
+// #12220 must compare authored and implicit application-set names with predefined
+// applications before the differing resolution paths are used. The raw AST
+// preserves every authored stanza so one gate can handle both cases. This mirrors
+// validateUnsupportedInterfaceStanzasAST and the other AST reject-at-commit gates.
 //
 // Strict path (commit / commit-check, lenient=false): the first collision is a
 // hard compile error naming the offending name. Lenient path (load / peer-sync,
@@ -49,16 +56,20 @@ import (
 // rather than publishing the arbitrary map winner.
 //
 // Scope notes:
-//   - Only USER-authored AST stanzas are examined. The predefined junos-* table
-//     lives outside the AST, so a user `application junos-http` that shadows a
-//     predefined application is NOT a collision (one AST stanza, no peer) and is
-//     left untouched — the legitimate shadow/extend case the #3339 issue calls
-//     out.
-//   - A multi-term application <X> minting an implicit set <X> is NOT a
-//     self-collision: the application stanza and its synthesized set share a name
-//     by design. The collision is only between two OPERATOR-authored stanzas,
-//     i.e. an `application <X>` AND an `application-set <X>`, which is exactly the
-//     M07 implicit-set-overwrite case.
+//   - A SIMPLE (non-term) user `application junos-http` that shadows a predefined
+//     application remains allowed — that is the legitimate shadow/extend case
+//     from #3339. A term-based application of the same name mints an implicit
+//     application-set, which takes the nested-reference path and is diagnosed by
+//     section 5.
+//   - A user `application-set` shadowing a predefined application is also
+//     diagnosed in section 5: direct references resolve application-first, while
+//     nested members resolve user-set-first.
+//   - A multi-term application <X> minting an implicit set <X> is not itself a
+//     collision: the application stanza and its synthesized set share a name
+//     by design. If <X> is a predefined application, section 5 diagnoses the
+//     differing direct and nested resolution paths. An explicit
+//     `application-set <X>` is a separate operator-authored stanza and remains
+//     the M07 implicit-set-overwrite case.
 //   - Duplicate application or application-set definitions (the same name authored
 //     twice in the same namespace) are also rejected; these survive as distinct
 //     AST siblings only on a hierarchical file parse (the set-command config tree
@@ -75,7 +86,7 @@ import (
 // (H02), or collides with another parent's generated name (H03) is rejected
 // under strict commit (warned on the tolerant load / peer-sync path), and a
 // generated name that shadows a predefined junos-* application (M03) is always
-// surfaced as a warning. See section 5 below.
+// surfaced as a warning. See section 6 below.
 func validateApplicationNameCollisionsAST(nodes []*Node, lenient bool) ([]string, map[string]struct{}, error) {
 	// The compiler compiles EVERY top-level `applications` node (compiler.go's
 	// `for _, node := range tree.Children` switch hits `case "applications"`
@@ -212,7 +223,7 @@ func validateApplicationNameCollisionsAST(nodes []*Node, lenient bool) ([]string
 	// #3339's gate only counted AUTHORED names, so a generated name was invisible to
 	// it and silently last-write-wins into the map. Build a global table of every
 	// generated name -> the distinct parent applications that produce it (in
-	// first-seen order) so the post-loop pass (section 5) can reject a generated
+	// first-seen order) so the post-loop pass (section 6) can reject a generated
 	// name that overwrites an authored application (H01), collides cross-namespace
 	// with an authored application-set (H02), or collides with another parent's
 	// generated name (H03), and warn on one that shadows a predefined junos-* app
@@ -284,8 +295,56 @@ func validateApplicationNameCollisionsAST(nodes []*Node, lenient bool) ([]string
 			}
 		}
 	}
+	// 5. A user application-set shadowing a predefined application makes the
+	//    same member token resolve differently by reference path: direct
+	//    application resolution finds the predefined application, while nested
+	//    set expansion selects the user-defined application-set first. A
+	//    term-based application under that name also mints an implicit set, so
+	//    nested references resolve differently from direct references. The
+	//    simple, non-term application shadow remains allowed.
+	for _, name := range setNames {
+		if appCounts[name] > 0 || len(genParents[name]) > 0 {
+			continue
+		}
+		if _, isPredefinedApplication := PredefinedApplications[name]; !isPredefinedApplication {
+			continue
+		}
+		markCollision(name)
+		if err := emit(
+			"application-set %q shadows predefined application %q — direct application "+
+				"references resolve to the predefined application, but nested "+
+				"application-set members resolve the user-defined set; a policy can "+
+				"therefore enforce different applications by reference path (rename "+
+				"the application-set) (#12220)",
+			name, name); err != nil {
+			return nil, nil, err
+		}
+	}
 
-	// 5. Generated per-term application names vs the rest of the flat Junos
+	// A term-based application <X> mints an implicit application-set named <X>
+	// and writes no apps.Applications[<X>] entry. This shadows the predefined
+	// application for nested members while direct references still resolve to the
+	// predefined service. Do not diagnose an explicit set of the same name twice;
+	// the authored-set check above owns that diagnostic.
+	for _, name := range appOrder {
+		if len(termSeen[name]) == 0 || setCounts[name] > 0 {
+			continue
+		}
+		if _, isPredefinedApplication := PredefinedApplications[name]; !isPredefinedApplication {
+			continue
+		}
+		markCollision(name)
+		if err := emit(
+			"term-based application %q mints an implicit application-set that shadows "+
+				"predefined application %q — direct references resolve to the predefined "+
+				"application, but nested application-set members expand the implicit set; "+
+				"rename the application (#12220)",
+			name, name); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	// 6. Generated per-term application names vs the rest of the flat Junos
 	//    namespace (#3472). compileApplications writes every generated
 	//    `<parent>-<term>` into apps.Applications and mints each term-based
 	//    parent's implicit set, but #3339's appCounts/setCounts only enumerated
@@ -315,7 +374,7 @@ func validateApplicationNameCollisionsAST(nodes []*Node, lenient bool) ([]string
 		}
 		sort.Strings(parents)
 
-		// 5a. H03 — cross-parent generated-name collision.
+		// 6a. H03 — cross-parent generated-name collision.
 		if len(parents) > 1 {
 			markCollision(g)
 			if err := emit(
@@ -329,7 +388,7 @@ func validateApplicationNameCollisionsAST(nodes []*Node, lenient bool) ([]string
 			}
 		}
 
-		// 5b. H01 — generated name overwrites an authored application.
+		// 6b. H01 — generated name overwrites an authored application.
 		//     Mechanism-agnostic phrasing: a SIMPLE authored application named %q
 		//     writes apps.Applications[%q] (a direct overwrite of the generated
 		//     term), but a TERM-BASED authored application named %q writes its
@@ -352,7 +411,7 @@ func validateApplicationNameCollisionsAST(nodes []*Node, lenient bool) ([]string
 			}
 		}
 
-		// 5c. H02 — generated name collides with an authored application-set.
+		// 6c. H02 — generated name collides with an authored application-set.
 		if setCounts[g] > 0 {
 			markCollision(g)
 			if err := emit(
@@ -367,17 +426,19 @@ func validateApplicationNameCollisionsAST(nodes []*Node, lenient bool) ([]string
 			}
 		}
 
-		// 5d. M03 — generated name shadows a predefined junos-* application.
+		// 6d. M03 — generated name shadows a predefined junos-* application.
 		//     Always a WARNING on both paths (never a hard reject): a generated
 		//     name is a user-defined application, and ResolveApplication prefers
 		//     user-defined over predefined (pkg/config/predefined.go), so the
 		//     generated term silently shadows the predefined service. Unlike
 		//     H01-H03 this does not overwrite another OPERATOR-authored definition,
-		//     and an authored shadow of a junos-* name is already a documented-
-		//     legitimate case (the #3339 scope note), so reserving the junos-*
-		//     namespace would be inconsistent and could brick a config an older
-		//     binary accepted. Surface it so an accidental shadow (e.g.
-		//     `application junos term ssh` minting junos-ssh) is operator-visible.
+		//     and a SIMPLE (non-term) authored application shadow of a junos-* name
+		//     remains a documented legitimate case. A term-based application or an
+		//     application-set under that name is diagnosed by section 5; reserving
+		//     the whole junos-* namespace would still be inconsistent and could
+		//     brick a config an older binary accepted. Surface it so an accidental
+		//     generated shadow (e.g. `application junos term ssh` minting junos-ssh)
+		//     is operator-visible.
 		if _, isPredef := PredefinedApplications[g]; isPredef {
 			warnings = append(warnings, fmt.Sprintf(
 				"generated per-term application name %q (from %v) shadows the predefined "+
