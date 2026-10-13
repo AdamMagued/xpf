@@ -140,6 +140,9 @@ func TestQualifiedNextHopMetricPolicyAttachesForStaticProtocolSpellings12312(t *
 			t.Fatalf("non-static policy must not attach a QNH policy map: %q", line)
 		}
 	}
+	if strings.Contains(rendered, "xpf-qnh-policy-") {
+		t.Fatalf("non-static policy must not emit a QNH policy map:\n%s", rendered)
+	}
 }
 
 func TestQualifiedNextHopMetricDoesNotSetBGPMetric11447(t *testing.T) {
