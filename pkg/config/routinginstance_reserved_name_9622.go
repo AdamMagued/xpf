@@ -39,6 +39,17 @@ const ManagementVRFDeviceName = "vrf-" + ManagementVRFInstanceName
 // ManagementVRFTableID is the kernel routing table behind the management VRF.
 const ManagementVRFTableID = 999
 
+// ManagementVRFMultipathStaticProtocol is the rtm_protocol the daemon stamps on
+// the multipath (ECMP) management statics it installs in ManagementVRFTableID.
+// A single-path management static is RTPROT_STATIC plus the xpf realm; a
+// multipath route cannot carry that realm (pkg/daemon mgmtStaticRouteRealm), so
+// this protocol is its ownership marker. It survives the kernel round-trip in
+// both families and scopes the kernel's own delete match, so the reconcile can
+// reap a stale ECMP static without touching an operator RTPROT_STATIC route
+// (#12539). 0x58 ('X') is unassigned in the kernel, iproute2 and FRR protocol
+// tables.
+const ManagementVRFMultipathStaticProtocol = 0x58
+
 // reservedRoutingInstanceNames is the set of routing-instance names the daemon
 // uses for its own VRFs. Names are case-sensitive, as kernel device names and
 // Junos instance names are, so "MGMT" and "vrf-mgmt" are not reserved: the VRF

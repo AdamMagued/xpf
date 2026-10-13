@@ -431,6 +431,8 @@ func rtProtoName(p netlink.RouteProtocol) string {
 		return "rip"
 	case rtprotZStatic: // 196 — FRR staticd (RTPROT_ZSTATIC)
 		return "static"
+	case config.ManagementVRFMultipathStaticProtocol: // 88 — xpf ECMP management static (#12539)
+		return "static"
 	default:
 		return strconv.Itoa(int(p))
 	}

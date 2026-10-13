@@ -3147,11 +3147,18 @@ never lock an operator out of a remote box it manages.
   desired state after networkd activation (`ReassertVRFMissTerminator`). #5844,
   #5696, #10421, and #10458 make those failures visible as deferred commit
   errors, while this owner retries the idempotent reconciles. Configured
-  management-scoped statics and the system backup-router are installed with
-  `RTPROT_STATIC` in table 999 by `applyMgmtVRFStaticRoutesTo`, independently of
-  FRR and DHCP. Those routes are excluded from FRR's default-table statics;
-  implicit gateways are matched against live table-999 connected routes as
-  well as configured prefixes, covering DHCP-only management addresses.
+  management-scoped statics and the system backup-router are installed in
+  table 999 by `applyMgmtVRFStaticRoutesTo`, independently of FRR and DHCP:
+  single-path routes as `RTPROT_STATIC` carrying the xpf realm, ECMP routes as
+  `config.ManagementVRFMultipathStaticProtocol` (0x58) because a library-built
+  multipath route cannot carry the realm (#12539). Only routes with one of
+  those markers are reaped, so operator `RTPROT_STATIC` routes in table 999 are
+  never claimed; a replace that overwrites a route's (destination, priority)
+  slot never issues a delete for the overwritten copy, because the kernel
+  would match that delete against the replacement. Those routes are excluded
+  from FRR's default-table statics; implicit gateways are matched against live
+  table-999 connected routes as well as configured prefixes, covering
+  DHCP-only management addresses.
   DHCP-learned management-VRF routes are reconciled alongside them before
   networkd; their error is latched into a separate management-route leg of the
   same routing debt, including errors from management-only DHCP callbacks.
