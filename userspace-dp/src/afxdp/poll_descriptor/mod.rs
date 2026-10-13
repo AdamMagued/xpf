@@ -1791,6 +1791,26 @@ pub(super) fn poll_binding_process_descriptor_with_injection(
                                 on_admitting_interface,
                             } => (Some(arrival_zone), on_admitting_interface),
                         };
+                        // #12265/#11373: route revalidation may use this
+                        // packet's ingress/fabric context. Persist it only
+                        // after #9519 confirms Owner; a foreign packet may
+                        // use its local resolution for this packet's verdict,
+                        // but never stamps or rehomes the owner's session, nor
+                        // invalidates its policy verdict (#12074). Persist
+                        // before the deferred close below, as the inline write
+                        // did, so a #9412 close Update carries the new route.
+                        if foreign_arrival_zone.is_none()
+                            && let Some(revalidation) = resolved.deferred_forwarding_revalidation
+                        {
+                            if revalidation.invalidate_policy_revalidation {
+                                sessions.invalidate_policy_revalidation(&resolved.key);
+                            }
+                            sessions.revalidate_forwarding_resolution(
+                                &resolved.key,
+                                revalidation.resolution,
+                                revalidation.owner_rg_id,
+                            );
+                        }
                         // #10636: the resolve above deferred TCP close-state
                         // until THIS verdict. An owner applies it now — before
                         // the revalidation below, exactly where the inline
