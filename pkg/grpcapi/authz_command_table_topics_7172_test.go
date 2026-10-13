@@ -28,25 +28,34 @@ import (
 // assertCanonicalCommands is the shared validity rule, identical to the one
 // TestEveryMappedCommandIsCanonical7172 applies to the method table.
 //
-// TWO of the three arms are live, and they fail differently.
-// everyWordIsAKeyword rejects an entry whose garbage landed in a VALUE slot
-// (`show interfaces zzbogus` canonicalizes fine — value slots absorb operator
-// data by design, #8094). Canonicalize rejects one that resolves nowhere:
-// reached when the keyword walk stops early at a LEAF and a trailing word then
-// resolves against nothing (`show version zzbogus`).
+// The three arms run in order and only the first failure reports. Since
+// #12527 only the first and the last can fire. everyWordIsAKeyword rejects
+// any entry whose words are not one command path through the tree: garbage
+// in a VALUE slot (`show interfaces zzbogus` canonicalizes fine — value slots
+// absorb operator data by design, #8094), any word after a LEAF
+// (`show version zzbogus`, and `show security flow session summary zone`,
+// which Canonicalize accepts by re-entering the Options map, #9505), and an
+// abbreviation (`show ver`), because its lookups are EXACT.
 //
-// The third arm — canon != cmd — is currently SUBSUMED and no mutation reaches
-// it. That is measured, not assumed: everyWordIsAKeyword does EXACT map
-// lookups, while resolveTreeWord returns the word itself on an exact hit and
-// only expands a unique PREFIX. So any abbreviation (`show ver`) is rejected by
-// the keyword arm before canonicalization sees it, and any word that survives
-// the keyword walk canonicalizes to itself. It is kept rather than deleted
-// because it comes back to life the moment everyWordIsAKeyword is loosened —
-// which is exactly the direction a future change would loosen it — and because
-// cut 3 does match deny regexes against the CANONICAL spelling, so an entry
-// that is not canonical would be compared against a different string than the
-// on-box CLI produces. It is documented as subsumed so nobody reads a green
-// suite as evidence that this arm was exercised.
+// The Canonicalize arm cannot fail on an entry the keyword arm passed. That
+// walk took one exact child-map hit per word with a leaf only at the end, and
+// resolveTreeWord takes its exact-hit branch for each of those words, so
+// Canonicalize walks the same nodes to CanonicalOK and returns the words
+// unchanged. Before #12527 the keyword walk stopped at the first leaf without
+// reading on, so Canonicalize was what refused `show version zzbogus`, and
+// canon != cmd caught an abbreviated option after a leaf (`monitor traffic
+// matching match`). The Canonicalize arm is kept rather than deleted because
+// it comes back to life the moment everyWordIsAKeyword is loosened — which is
+// exactly the direction a future change would loosen it — and it is
+// documented as unable to fire so nobody reads a green suite as evidence that
+// it was exercised.
+//
+// canon != cmd is now reached only by WHITESPACE. strings.Fields collapses
+// and trims it, so `show  version` or ` show version` passes both arms above
+// and canonicalizes to the single-spaced string. That failure is not
+// cosmetic: authorizeRPCCommand matches deny regexes against the entry
+// exactly as written, so `show  version` would escape a `^show version$`
+// deny that the on-box CLI's canonical spelling meets.
 func assertCanonicalCommands(t *testing.T, what string, table map[string]string) {
 	t.Helper()
 	if len(table) == 0 {
@@ -65,10 +74,12 @@ func assertCanonicalCommands(t *testing.T, what string, table map[string]string)
 			continue
 		}
 		if !everyWordIsAKeyword(words) {
-			t.Errorf("%s %q maps to %q, in which some word is not a command KEYWORD — it "+
-				"is being absorbed by a value slot (a dynamic, typed or placeholder "+
-				"child). Entries here are argument-free command paths, so every word "+
-				"must be a real node.", what, key, cmd)
+			t.Errorf("%s %q maps to %q, which is not an argument-free command path: "+
+				"either some word is not a command KEYWORD — a value slot (a dynamic, "+
+				"typed or placeholder child) is absorbing it — or a word follows a "+
+				"LEAF, which fails even when both words are keywords (an option after "+
+				"a complete command, #12527). Every word must be a real node, and only "+
+				"the last may be a leaf.", what, key, cmd)
 			continue
 		}
 		canon, res := cmdtree.Canonicalize(cmdtree.OperationalTree, words)

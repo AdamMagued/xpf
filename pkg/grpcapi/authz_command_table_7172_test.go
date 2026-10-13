@@ -49,11 +49,20 @@ func TestEveryMappedCommandIsCanonical7172(t *testing.T) {
 		//
 		// The mutation that motivated it: `show zzbogus nonexistent` reds
 		// (nothing under `show` matches), but `show interfaces zzbogus` did not.
+		//
+		// #12527 added the other half: a LEAF must be the last word.
+		// `show security flow session summary zone` is two keywords, and
+		// Canonicalize accepts it by re-entering the `session` Options map
+		// (#9505), but a leaf is a complete command, so whatever follows it
+		// is an argument or a second option.
 		if !everyWordIsAKeyword(words) {
-			t.Errorf("%s maps to %q, in which some word is not a command KEYWORD — it is "+
-				"being absorbed by a value slot (a dynamic, typed or placeholder child). "+
-				"Table entries are pure command paths with no arguments, so every word "+
-				"must be a real node.", method, cmd)
+			t.Errorf("%s maps to %q, which is not a pure command path: either some word "+
+				"is not a command KEYWORD — a value slot (a dynamic, typed or "+
+				"placeholder child) is absorbing it — or a word follows a LEAF, which "+
+				"fails even when both words are keywords (an option after a complete "+
+				"command, #12527). Table entries are pure command paths with no "+
+				"arguments, so every word must be a real node and only the last may "+
+				"be a leaf.", method, cmd)
 			continue
 		}
 		canon, res := cmdtree.Canonicalize(cmdtree.OperationalTree, words)
@@ -121,14 +130,19 @@ func TestEveryPricedMethodIsMappedOrNamedAbsent7172(t *testing.T) {
 	}
 }
 
-// everyWordIsAKeyword reports whether each word names a real node in the
-// operational tree, rather than being consumed by a value slot.
+// everyWordIsAKeyword reports whether words spell one argument-free command
+// path: every word names a real node in the operational tree rather than
+// being consumed by a value slot, and only the LAST word may be a leaf. A
+// leaf is a complete command, so a word after it is an argument or, under a
+// node that declares Options, a second option: `summary zone` under
+// `show security flow session` is two keywords and still not one path
+// (#12527).
 //
 // Deliberately NOT a change to cmdtree.Canonicalize: absorbing operator data
-// into value slots is exactly what canonicalization must do for a command an
-// operator typed. The distinction is that THIS table holds argument-free
-// command paths, so the stricter rule belongs to the table's validity check and
-// not to the shared canonicalizer.
+// into value slots, and taking options in any order (#9505), is exactly what
+// canonicalization must do for a command an operator typed. The distinction
+// is that THIS table holds argument-free command paths, so the stricter rule
+// belongs to the table's validity check and not to the shared canonicalizer.
 func everyWordIsAKeyword(words []string) bool {
 	current := cmdtree.OperationalTree
 	for i, w := range words {
@@ -152,12 +166,16 @@ func everyWordIsAKeyword(words []string) bool {
 
 // #12527: option-suffixed mutants must be rejected by the keyword arm.
 func TestEveryWordIsAKeywordRejectsOptionSuffix12527(t *testing.T) {
+	// A multi-option line an operator can run: the CLI shows the session
+	// summary filtered to zone trust.
+	const runnable = "show security flow session summary zone trust"
 	for _, tc := range []struct {
 		cmd  string
 		want bool
 	}{
 		{"show security flow session summary zone", false}, // the #12096-row mutant
 		{"show security flow session summary brief", false},
+		{runnable, false}, // the mechanism pin's line
 		{"show security flow session zone trust", false},   // option value after leaf
 		{"show version configuration", false},              // trailing sibling after leaf (#8289 shape)
 		{"show security flow session summary", true},       // #12096 charge stays valid
@@ -169,9 +187,13 @@ func TestEveryWordIsAKeywordRejectsOptionSuffix12527(t *testing.T) {
 			t.Errorf("everyWordIsAKeyword(%q) = %v, want %v", tc.cmd, got, tc.want)
 		}
 	}
-	// Mechanism pin: Canonicalize legitimately accepts the mutant (Options
-	// re-entry, #9505), so the keyword arm is what must reject it.
-	if _, res := cmdtree.Canonicalize(cmdtree.OperationalTree, strings.Fields("show security flow session summary zone")); res != cmdtree.CanonicalOK {
-		t.Errorf("precondition: Canonicalize must accept the multi-option line (got %v)", res)
+	// Mechanism pin: Canonicalize legitimately accepts the runnable line
+	// (Options re-entry, #9505), so the keyword arm is what must reject it.
+	// Not the `…summary zone` mutant: the CLI refuses that line (missing
+	// value for "zone"), so a correct tightening of Canonicalize could
+	// refuse it too and red this pin for a reason unrelated to the table.
+	if _, res := cmdtree.Canonicalize(cmdtree.OperationalTree, strings.Fields(runnable)); res != cmdtree.CanonicalOK {
+		t.Errorf("precondition: Canonicalize must accept the runnable multi-option "+
+			"line %q (got %v)", runnable, res)
 	}
 }
