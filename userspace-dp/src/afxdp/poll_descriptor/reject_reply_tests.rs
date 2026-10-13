@@ -2323,6 +2323,125 @@ fn unstamped_fabric_udp_policy_reject_still_enqueues_icmp_12319() {
     assert_eq!(event.action, RT_FLOW_ACTION_REJECT);
 }
 
+/// #12319 R2: the shared gate is address-family agnostic. A stamped-fabric
+/// IPv6 UDP policy reject would reflect ICMPv6 port-unreachable to the
+/// synthetic stamp, so no reply is queued or counted and the policy-deny
+/// event reports DENY rather than REJECT. Kills an IPv4-only gate.
+#[test]
+fn stamped_fabric_udp_v6_policy_reject_suppresses_icmpv6_and_logs_deny_12319() {
+    use super::cookie_reply::SYN_COOKIE_REPLY_PENDING_RESERVE;
+    let _g = crate::afxdp::icmp_ratelimit::global_bucket_test_lock();
+    crate::afxdp::icmp_ratelimit::reset_bucket_for_test(
+        crate::afxdp::icmp_ratelimit::GeneratedErrorReason::Reject,
+        0,
+    );
+    let (mut frame, mut meta, flow) = policy_reject_packet_v6(crate::ip_proto::PROTO_UDP);
+    frame[6..12].copy_from_slice(&[0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x02]);
+    meta.ingress_ifindex = 21;
+    let forwarding = stamped_fabric_reject_forwarding();
+    let (handle, rx) = unlimited_event_handle();
+    let mut pipeline = tx_pipeline(
+        SYN_COOKIE_REPLY_PENDING_RESERVE * 2,
+        SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+    );
+    let mut counters = BatchCounters::default();
+
+    deny_reply_and_emit(
+        &mut pipeline,
+        &forwarding,
+        Some(&handle),
+        21,
+        &frame,
+        meta,
+        &flow,
+        &mut counters,
+        &NatDecision::default(),
+        7,
+        9,
+        0,
+        101,
+        PolicyAction::Reject,
+        0,
+        123,
+    );
+
+    assert!(
+        pipeline.pending_tx_local.is_empty(),
+        "a stamped-fabric IPv6 UDP reject must not queue stamp-addressed ICMPv6"
+    );
+    assert_eq!(counters.policy_reject_sent, 0);
+    assert_eq!(counters.policy_reject_reply_budget_drops, 0);
+    assert_eq!(counters.policy_reject_rate_limit_drops, 0);
+    let event = rx
+        .try_recv()
+        .expect("policy-deny event frame")
+        .decode_dataplane_event()
+        .expect("policy-deny payload");
+    assert_eq!(event.action, RT_FLOW_ACTION_DENY);
+    assert!(rx.try_recv().is_err());
+}
+
+/// #12319 R2 control: the same IPv6 fixture with an unstamped source keeps its
+/// ICMPv6 port-unreachable to the client MAC, counts it, and logs REJECT, so
+/// the stamped IPv6 cell above is held by the gate and not by an unbuildable
+/// reply.
+#[test]
+fn unstamped_fabric_udp_v6_policy_reject_still_enqueues_icmpv6_12319() {
+    use super::cookie_reply::SYN_COOKIE_REPLY_PENDING_RESERVE;
+    let _g = crate::afxdp::icmp_ratelimit::global_bucket_test_lock();
+    crate::afxdp::icmp_ratelimit::reset_bucket_for_test(
+        crate::afxdp::icmp_ratelimit::GeneratedErrorReason::Reject,
+        0,
+    );
+    let (frame, mut meta, flow) = policy_reject_packet_v6(crate::ip_proto::PROTO_UDP);
+    let client_mac = frame[6..12].to_vec();
+    meta.ingress_ifindex = 21;
+    let forwarding = stamped_fabric_reject_forwarding();
+    let (handle, rx) = unlimited_event_handle();
+    let mut pipeline = tx_pipeline(
+        SYN_COOKIE_REPLY_PENDING_RESERVE * 2,
+        SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+    );
+    let mut counters = BatchCounters::default();
+
+    deny_reply_and_emit(
+        &mut pipeline,
+        &forwarding,
+        Some(&handle),
+        21,
+        &frame,
+        meta,
+        &flow,
+        &mut counters,
+        &NatDecision::default(),
+        7,
+        9,
+        0,
+        101,
+        PolicyAction::Reject,
+        0,
+        123,
+    );
+
+    assert_eq!(counters.policy_reject_sent, 1);
+    let reply = pipeline
+        .pending_tx_local
+        .pop_front()
+        .expect("unstamped-fabric UDP ICMPv6 reply");
+    assert_eq!(&reply.bytes[..6], client_mac.as_slice());
+    assert_eq!(
+        &reply.bytes[54..56],
+        &[1, 4],
+        "ICMPv6 destination-unreachable/port-unreachable"
+    );
+    let event = rx
+        .try_recv()
+        .expect("policy-deny event frame")
+        .decode_dataplane_event()
+        .expect("policy-deny payload");
+    assert_eq!(event.action, RT_FLOW_ACTION_REJECT);
+}
+
 /// #4499 E2 (reject half): a policy `then reject` deny path emits a single
 /// RT_FLOW record whose KIND is `PolicyDeny` — NOT a `SessionCreate`
 /// (session-init) record — and NO second frame follows. The reject branch in

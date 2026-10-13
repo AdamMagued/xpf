@@ -590,3 +590,94 @@ fn stamped_fabric_syn_cookie_suppression_precedes_exhausted_budget_12319() {
         "the stamp gate must run before an exhausted TX budget is charged"
     );
 }
+
+/// #12319 R2 control: an unstamped SYN on fabric ingress is an ordinary peer
+/// arrival, so its cookie SYN-ACK still reflects the inbound source MAC and is
+/// counted. Kills a gate that keys on fabric ingress alone.
+#[test]
+fn unstamped_fabric_syn_cookie_reply_still_enqueues_syn_ack_12319() {
+    let (frame, mut meta, flow) = tcp_v4_syn_frame();
+    meta.ingress_ifindex = 21;
+    let (forwarding, _) = stamped_fabric_cookie_forwarding();
+    let mut pipeline = tx_pipeline(
+        SYN_COOKIE_REPLY_PENDING_RESERVE * 2,
+        SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+        0,
+    );
+    let mut counters = BatchCounters::default();
+
+    let sent = enqueue_syn_cookie_reply(
+        &mut pipeline,
+        &forwarding,
+        21,
+        &frame,
+        meta,
+        Some(&flow),
+        SynCookieReply::SynAck(SynCookieChallenge {
+            cookie_isn: 0xaabb_ccdd,
+            peer_mss: 1460,
+        }),
+        &mut counters,
+    );
+
+    assert!(
+        sent,
+        "an unstamped fabric SYN must still get its cookie SYN-ACK"
+    );
+    assert_eq!(counters.syn_cookie_syn_ack_sent, 1);
+    let reply = pipeline
+        .pending_tx_local
+        .pop_front()
+        .expect("unstamped fabric cookie SYN-ACK");
+    assert_eq!(&reply.bytes[..6], &frame[6..12]);
+    assert_eq!(
+        reply.bytes[14 + 20 + 13],
+        crate::tcp_flags::TCP_SYN | crate::tcp_flags::TCP_ACK
+    );
+}
+
+/// #12319 R2 control: a stamp-shaped source MAC on native ingress is not a
+/// synthetic fabric arrival, so its cookie SYN-ACK still reflects that source
+/// MAC and is counted. Kills a gate that keys on the source MAC alone.
+#[test]
+fn stamp_shaped_native_syn_cookie_reply_still_enqueues_syn_ack_12319() {
+    let (mut frame, meta, flow) = tcp_v4_syn_frame();
+    assert_eq!(meta.ingress_ifindex, 5, "native ingress fixture");
+    let (forwarding, stamp) = stamped_fabric_cookie_forwarding();
+    frame[6..12].copy_from_slice(&stamp);
+    let mut pipeline = tx_pipeline(
+        SYN_COOKIE_REPLY_PENDING_RESERVE * 2,
+        SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+        0,
+    );
+    let mut counters = BatchCounters::default();
+
+    let sent = enqueue_syn_cookie_reply(
+        &mut pipeline,
+        &forwarding,
+        5,
+        &frame,
+        meta,
+        Some(&flow),
+        SynCookieReply::SynAck(SynCookieChallenge {
+            cookie_isn: 0xaabb_ccdd,
+            peer_mss: 1460,
+        }),
+        &mut counters,
+    );
+
+    assert!(
+        sent,
+        "a stamp-shaped native SYN must still get its cookie SYN-ACK"
+    );
+    assert_eq!(counters.syn_cookie_syn_ack_sent, 1);
+    let reply = pipeline
+        .pending_tx_local
+        .pop_front()
+        .expect("native cookie SYN-ACK");
+    assert_eq!(&reply.bytes[..6], &stamp);
+    assert_eq!(
+        reply.bytes[14 + 20 + 13],
+        crate::tcp_flags::TCP_SYN | crate::tcp_flags::TCP_ACK
+    );
+}

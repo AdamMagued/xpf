@@ -3635,11 +3635,12 @@ fn v2_stamped_fabric_udp_policy_reject_suppresses_icmp_on_real_poll_12319() {
     );
     let mut snapshot = reject_fabric_snapshot(false);
     // #12319 F1: the fabric parent (ifindex 21) ships with no addresses, so
-    // egress[21].primary_v4 is None and build_local_icmp_error_v4 bails at
-    // icmp.rs:419 whether or not the gate exists — the test passed on base
-    // too. Give the parent a fabric-subnet inet so the ICMP leg is buildable
-    // and the gate is the only thing standing between the reject and the TX
-    // queue. Local to this test; the shared fixture is untouched.
+    // egress[21].primary_v4 is None and build_local_icmp_error_v4 returns None
+    // at its `egress.primary_v4?` check whether or not the gate exists — the
+    // test passed on base too. Give the parent a fabric-subnet inet so the
+    // ICMP leg is buildable and the gate is the only thing standing between
+    // the reject and the TX queue. Local to this test; the shared fixture is
+    // untouched.
     for iface in &mut snapshot.interfaces {
         if iface.ifindex == 21 {
             iface.addresses.push(InterfaceAddressSnapshot {
