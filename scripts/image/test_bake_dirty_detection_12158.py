@@ -269,5 +269,22 @@ class BindDirtyMarkerTests(unittest.TestCase):
                               str(caught.exception.code))
 
 
+class DebianRulesStagingTests(unittest.TestCase):
+    def test_every_xpf_file_staged_by_debian_rules_is_git_ignored(self):
+        # An unignored staged copy under debian/ is an untracked package input
+        # to the shared probe, so the next build would be marked dirty.
+        rules = (_ROOT / "debian" / "rules").read_text().replace("\\\n", " ")
+        staged = set(re.findall(
+            r"(?:\bcp\s+\S+\s+|>\s*)(debian/xpf\.[\w.-]+)(?=\s|$)", rules))
+        self.assertTrue(staged, "no generated debian/xpf.* files in debian/rules")
+        for path in sorted(staged):
+            result = subprocess.run(
+                ["git", "check-ignore", "-q", path],
+                cwd=_ROOT, capture_output=True, text=True)
+            self.assertEqual(
+                result.returncode, 0,
+                f"{path} staged by debian/rules is not git-ignored")
+
+
 if __name__ == "__main__":
     unittest.main()
