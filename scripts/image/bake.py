@@ -310,6 +310,12 @@ def bind_deb_identity(deb_version, staged_version_output, *, skip_build,
     unique abbreviated commit. Resolve both to the same object when available;
     in a --skip-build bake, record the package's own commit, never the current
     checkout's unrelated HEAD.
+
+    `make deb` embeds `-dirty` in xpfd's version exactly when the package
+    version carries `.dirty` (#12158), so the two markers must agree. A dirty
+    package is accepted (its `.dirty` version names the image set in the
+    signed manifest); a clean package whose xpfd is marked dirty, or the
+    reverse, is refused.
     """
     package_commit = deb_commit_from_version(deb_version)
     xpfd_version, xpfd_commit = parse_xpfd_version(staged_version_output)
@@ -317,6 +323,17 @@ def bind_deb_identity(deb_version, staged_version_output, *, skip_build,
             or xpfd_commit.startswith(package_commit)):
         die(f"package {deb_version} embeds commit {package_commit}, but its "
             f"staged xpfd reports {xpfd_commit}")
+    package_dirty = deb_version.endswith(".dirty")
+    xpfd_dirty = xpfd_version.endswith("-dirty")
+    if xpfd_dirty and not package_dirty:
+        die(f"package {deb_version} records clean source, but its staged xpfd "
+            f"version {xpfd_version!r} marks dirty build bytes; rebuild it "
+            "with `make deb` (packages built before #12158 mark every xpfd "
+            "-dirty)")
+    if package_dirty and not xpfd_dirty:
+        die(f"package {deb_version} records dirty source, but its staged xpfd "
+            f"version {xpfd_version!r} has no -dirty marker; the package "
+            "version does not describe its binary")
 
     if not skip_build:
         if not head_commit.startswith(package_commit):
@@ -346,6 +363,7 @@ def bind_deb_identity(deb_version, staged_version_output, *, skip_build,
         except (OSError, subprocess.CalledProcessError) as e:
             die(f"cannot verify staged xpfd version against package commit "
                 f"{commit}: {e}")
+        # The dirty markers already agree; compare the describe base.
         observed = xpfd_version.removesuffix("-dirty")
         same_version = observed == expected_xpfd_version
         if not same_version and re.fullmatch(r"[0-9a-f]{7,40}", observed):

@@ -33,8 +33,12 @@ Two deliverables, same root disk:
 > `0.0.<commit-count>+g<at-least-12-hex-commit>[.dirty]`; it refuses unless
 > that version matches the selected `.deb` filename and the result of
 > `dpkg-deb -f <deb> Version`, and the staged `xpfd version` identifies the
-> same source commit. `--skip-build` does not weaken these checks: a stale
-> `.deb` is never selected by mtime.
+> same source commit with the same dirty marker: `make deb` embeds `-dirty`
+> exactly when the package version carries `.dirty` (#12158), and the bake
+> refuses a package whose two markers disagree. Packages built before #12158
+> embed `-dirty` in every xpfd, so a clean-labelled one must be rebuilt.
+> `--skip-build` does not weaken these checks: a stale `.deb` is never
+> selected by mtime.
 > `fetch` accepts any path-safe version that names a published image set.
 >
 > `fetch` also closes the verify/use gap (#5817): the `--out` directory may be
