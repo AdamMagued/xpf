@@ -1328,6 +1328,10 @@ func buildInterfaceNetworkdModels(cfg *config.Config, result *CompileResult, see
 		}
 
 		linuxName := config.LinuxIfName(ifName)
+		mgmtVRFName := ""
+		if config.IsManagementIfName(ifName) {
+			mgmtVRFName = config.ManagementVRFDeviceName
+		}
 		originalName := "" // kernel name before .link rename (for RETH recovery)
 		physIface, err := result.cachedInterfaceByName(linuxName)
 		if err != nil && isVRRPReth && cfg.Chassis.Cluster != nil {
@@ -1460,6 +1464,7 @@ func buildInterfaceNetworkdModels(cfg *config.Config, result *CompileResult, see
 					Duplex:       ifCfg.Duplex,
 					MTU:          ifCfg.MTU,
 					Description:  ifCfg.Description,
+					VRFName:      mgmtVRFName,
 					// #9721: the advert source, plus KeepAddresses so a
 					// networkctl reload keeps the VIPs VRRP adds to this
 					// device, as on every other RETH device. Both only when the
@@ -1491,6 +1496,7 @@ func buildInterfaceNetworkdModels(cfg *config.Config, result *CompileResult, see
 							MTU:              unit.MTU,
 							Description:      unit.Description,
 							KeepAddresses:    isVRRPReth,
+							VRFName:          mgmtVRFName,
 						})
 					}
 				}
@@ -1537,16 +1543,8 @@ func buildInterfaceNetworkdModels(cfg *config.Config, result *CompileResult, see
 					primaryAddr = ""
 					preferredAddr = ""
 				}
-				// Management interfaces (fxp*, fab*) are bound to vrf-mgmt.
-				// Include VRF= in .network so networkctl reconfigure preserves binding.
-				vrfName := ""
-				// #7515: config.IsManagementIfName is the SSOT. If this drifts
-				// from the daemon's management-VRF set, networkctl reconfigure
-				// strips a binding the daemon just made (or preserves one it
-				// never made).
-				if config.IsManagementIfName(ifName) {
-					vrfName = config.ManagementVRFDeviceName
-				}
+				// Management interfaces use the shared class predicate so
+				// networkctl preserves the daemon's management-VRF binding.
 				result.ManagedInterfaces = append(result.ManagedInterfaces, networkd.InterfaceConfig{
 					Name:             linuxName,
 					MACAddress:       mac,
@@ -1561,9 +1559,9 @@ func buildInterfaceNetworkdModels(cfg *config.Config, result *CompileResult, see
 					Speed:            ifCfg.Speed,
 					Duplex:           ifCfg.Duplex,
 					MTU:              mtu,
+					VRFName:          mgmtVRFName,
 					Description:      ifCfg.Description,
 					KeepAddresses:    isVRRPReth,
-					VRFName:          vrfName,
 				})
 			}
 		}

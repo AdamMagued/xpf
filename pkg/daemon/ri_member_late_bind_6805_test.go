@@ -2,7 +2,9 @@ package daemon
 
 import (
 	"context"
-	"os"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"strings"
 	"sync"
 	"testing"
@@ -231,39 +233,76 @@ func TestBothPassesBindTheSameNameSet6805(t *testing.T) {
 // path that never calls it would pass all of them — and "nothing calls it" is
 // the entire defect, one layer up. applyDataplaneAndHACore cannot be driven from
 // a unit test (netlink, a dataplane, sockets, a cluster), so the call is
-// asserted at the source with comments stripped: a source-scanning gate that
-// greps for a line its own doc comment quotes is satisfied by the comment.
+// asserted on that function's parsed AST. Comments never reach the AST, so a
+// doc comment that quotes the call cannot satisfy the gate.
+//
+// Callees are matched by name, not by source spelling. The earlier text-scan
+// form anchored on the management re-bind's exact argument list; #12297 gave
+// that method a cfg parameter, the anchor stopped matching, and the cell was
+// deleted rather than re-anchored, which left the package green with the late
+// pass unwired. The late pass's own argument IS checked:
+// bindRoutingInstanceMembers returns before binding anything for a nil config,
+// so a call that does not hand over the apply's cfg is the same unwired pass.
 //
 // It must also land BEFORE the management re-bind, which is where "the devices
 // exist by this phase" first becomes true.
+//
+// FAIL-ON-REVERT: delete the d.rebindRoutingInstanceMembers(cfg) call from
+// applyDataplaneAndHACore and this is the only cell in the package that reds;
+// passing it nil, or moving it after the management re-bind, reds it too.
 func TestApplyCallsTheLateRebind6805(t *testing.T) {
-	src := stripLineComments6791(readDaemonSourceFile6805(t, "daemon_apply_dataplane.go"))
-
-	const call = "d.rebindRoutingInstanceMembers(cfg)"
-	i := strings.Index(src, call)
-	if i < 0 {
-		t.Fatalf("the apply path does not call rebindRoutingInstanceMembers; a " +
-			"list-only routing-instance member created after step 0a is never bound " +
-			"and its tunnel forwards in the default table (#6805)")
+	const file, fnName = "daemon_apply_dataplane.go", "applyDataplaneAndHACore"
+	f, err := parser.ParseFile(token.NewFileSet(), file, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", file, err)
 	}
-	j := strings.Index(src, "d.rebindManagementVRFIfaces()")
-	if j < 0 {
-		t.Fatal("could not find the management re-bind to order against")
+	var found bool
+	var lateBind, mgmtRebind []token.Pos
+	for _, decl := range f.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != fnName || fn.Body == nil {
+			continue
+		}
+		found = true
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			switch sel.Sel.Name {
+			case "rebindRoutingInstanceMembers":
+				for _, arg := range call.Args {
+					if id, ok := arg.(*ast.Ident); ok && id.Name == "cfg" {
+						lateBind = append(lateBind, call.Pos())
+						break
+					}
+				}
+			case "rebindManagementVRFIfaces":
+				mgmtRebind = append(mgmtRebind, call.Pos())
+			}
+			return true
+		})
 	}
-	if i > j {
+	if !found {
+		t.Fatalf("%s not found in %s", fnName, file)
+	}
+	if len(lateBind) == 0 {
+		t.Fatalf("%s does not call rebindRoutingInstanceMembers(cfg); a "+
+			"list-only routing-instance member created after step 0a is never bound "+
+			"and its tunnel forwards in the default table (#6805)", fnName)
+	}
+	if len(mgmtRebind) == 0 {
+		t.Fatalf("%s has no rebindManagementVRFIfaces call to order against", fnName)
+	}
+	if lateBind[0] > mgmtRebind[0] {
 		t.Error("the routing-instance re-bind runs AFTER the management re-bind; " +
 			"it belongs at the same post-networkd point, where the tunnel/xfrmi " +
 			"devices are known to exist")
 	}
-}
-
-func readDaemonSourceFile6805(t *testing.T, name string) string {
-	t.Helper()
-	b, err := os.ReadFile(name)
-	if err != nil {
-		t.Fatalf("read %s: %v", name, err)
-	}
-	return string(b)
 }
 
 // TestStep0aStillBindsAnExistingMember6805 keeps the EARLY pass load-bearing.
