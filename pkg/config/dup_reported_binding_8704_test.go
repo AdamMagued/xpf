@@ -1,6 +1,7 @@
 package config
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -94,11 +95,12 @@ func TestEveryNotConservedContainerIsReported8704(t *testing.T) {
 		checked, len(silent), len(deepDupUnreportable))
 }
 
-// #12308: this test pins the measured split: both duplicate block orders
-// compile separately, while flat-set merges their modifiers. The resulting
-// backup joins metric 0's primary ECMP tier, so the unresolved behavior is
-// scope-deferred to #12308 rather than silently described as correct.
-func TestQualifiedNextHopCensusExemptionIsMeasured8704(t *testing.T) {
+// #12308: the census site #12184 measured as a split now CONSERVES. Both
+// authoring orders compile to what the merged block and the flat-set spelling
+// give (one next-hop carrying both modifiers) and strict commit accepts them,
+// so the site needs neither a #8704 exemption nor a #8436 inventory line. A
+// conserved container that kept either would read as a live hazard.
+func TestQualifiedNextHopCensusSiteConserves8704(t *testing.T) {
 	const dupAB = `routing-options { static { route 0.0.0.0/0 {
 		qualified-next-hop 192.168.1.1 { interface ge-0/0/1.0; }
 		qualified-next-hop 192.168.1.1 { metric 100; }
@@ -107,44 +109,10 @@ func TestQualifiedNextHopCensusExemptionIsMeasured8704(t *testing.T) {
 		qualified-next-hop 192.168.1.1 { metric 100; }
 		qualified-next-hop 192.168.1.1 { interface ge-0/0/1.0; }
 	} } }`
-	parse := func(text string) *ConfigTree {
-		tree, errs := NewParser(text).Parse()
-		if len(errs) > 0 {
-			t.Fatalf("parse repeated QNH fixture: %v", errs[0])
-		}
-		return tree
-	}
-	assertSplitEntries := func(name, text string) {
-		t.Helper()
-		cfg, err := CompileConfig(parse(text))
-		if err != nil {
-			t.Fatalf("%s strict compile: %v", name, err)
-		}
-		if len(cfg.RoutingOptions.StaticRoutes) != 1 ||
-			len(cfg.RoutingOptions.StaticRoutes[0].NextHops) != 2 {
-			t.Fatalf("%s should retain two next-hop entries: %+v", name, cfg.RoutingOptions.StaticRoutes)
-		}
-		haveInterface, haveMetric := false, false
-		for _, nh := range cfg.RoutingOptions.StaticRoutes[0].NextHops {
-			if nh.Interface != "" {
-				haveInterface = true
-				if nh.HasMetric {
-					t.Fatalf("%s unexpectedly merged modifiers onto one entry: %+v", name, nh)
-				}
-			}
-			if nh.HasMetric {
-				haveMetric = nh.Metric == 100
-				if nh.Interface != "" {
-					t.Fatalf("%s unexpectedly merged modifiers onto one entry: %+v", name, nh)
-				}
-			}
-		}
-		if !haveInterface || !haveMetric {
-			t.Fatalf("%s did not retain interface and metric separately", name)
-		}
-	}
-	assertSplitEntries("interface-then-metric", dupAB)
-	assertSplitEntries("metric-then-interface", dupBA)
+	const merged = `routing-options { static { route 0.0.0.0/0 {
+		qualified-next-hop 192.168.1.1 { interface ge-0/0/1.0; metric 100; }
+	} } }`
+	want := []NextHopEntry{{Address: "192.168.1.1", Interface: "ge-0/0/1.0", Metric: 100, HasMetric: true}}
 
 	flat, err := CompileConfig(flatTreeFromSets(t,
 		"set routing-options static route 0.0.0.0/0 qualified-next-hop 192.168.1.1 interface ge-0/0/1.0",
@@ -153,19 +121,46 @@ func TestQualifiedNextHopCensusExemptionIsMeasured8704(t *testing.T) {
 		t.Fatalf("flat-set control compile: %v", err)
 	}
 	if len(flat.RoutingOptions.StaticRoutes) != 1 ||
-		len(flat.RoutingOptions.StaticRoutes[0].NextHops) != 1 {
-		t.Fatalf("flat-set control should merge modifiers onto one next-hop: %+v",
-			flat.RoutingOptions.StaticRoutes)
+		!reflect.DeepEqual(flat.RoutingOptions.StaticRoutes[0].NextHops, want) {
+		t.Fatalf("flat-set control = %+v, want one route with next-hops %+v",
+			flat.RoutingOptions.StaticRoutes, want)
 	}
-	merged := flat.RoutingOptions.StaticRoutes[0].NextHops[0]
-	if merged.Interface != "ge-0/0/1.0" || !merged.HasMetric || merged.Metric != 100 {
-		t.Fatalf("flat-set control did not preserve both modifiers: %+v", merged)
+	cm := compileText(t, merged)
+	if cm == nil {
+		t.Fatal("the merged block must compile")
+	}
+	for _, tc := range []struct{ name, text string }{
+		{"interface-then-metric", dupAB},
+		{"metric-then-interface", dupBA},
+	} {
+		tree, errs := NewParser(tc.text).Parse()
+		if len(errs) > 0 {
+			t.Fatalf("%s parse: %v", tc.name, errs[0])
+		}
+		cfg, err := CompileConfig(tree)
+		if err != nil {
+			t.Fatalf("%s strict compile: %v", tc.name, err)
+		}
+		// Against a literal, so a leaked compile-only provenance bit fails here
+		// too: DeepEqual compares unexported fields.
+		if len(cfg.RoutingOptions.StaticRoutes) != 1 ||
+			!reflect.DeepEqual(cfg.RoutingOptions.StaticRoutes[0].NextHops, want) {
+			t.Errorf("%s compiled %+v, want the flat-set next-hops %+v",
+				tc.name, cfg.RoutingOptions.StaticRoutes, want)
+		}
+		// The census's own conservation predicate, verbatim.
+		if cd := compileText(t, tc.text); !cfgEqual(cd, cm) {
+			t.Errorf("%s does not conserve: the duplicate compiles differently from the merged block", tc.name)
+		}
 	}
 	key := "routing-options static route xpfname qualified-next-hop"
-	if reason := deepDupUnreportable[key]; reason == "" {
-		t.Fatalf("the measured QNH divergence must have a recorded #8704 disposition")
-	} else if !strings.Contains(reason, "#12308") {
-		t.Fatalf("the measured QNH exemption must cite #12308: %q", reason)
+	if reason, listed := deepDupUnreportable[key]; listed {
+		t.Errorf("the conserved QNH site still carries a #8704 exemption: %q", reason)
+	}
+	for _, site := range dupConservationInventory8436 {
+		if site == key {
+			t.Errorf("the conserved QNH site is still listed in dupConservationInventory8436")
+		}
 	}
 }
 

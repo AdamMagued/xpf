@@ -1539,6 +1539,24 @@ including those paths in group bodies; security-zone and per-interface
 `host-inbound-traffic protocols` are intentionally outside this routing fold,
 so their `except` child boundaries remain intact.
 
+**Qualified next-hops merge by gateway (#12308):** every `qualified-next-hop
+<gw>` statement for one route compiles to ONE next-hop, whatever carries it:
+a bare `set ... qualified-next-hop <gw>` beside `set ... qualified-next-hop
+<gw> preference <n>` (SetPath keeps the leaf and the container as two nodes),
+two hierarchical blocks for the gateway, repeated `route <p>` blocks, repeated
+`routing-options` roots, `rib inet.0 static` beside `static`, and the same
+shapes in a routing instance. A later statement overrides only the settings it
+authors (interface, preference, metric), which is what flat-set replay gives.
+Before this, each statement compiled to its own next-hop: the half without a
+preference inherited the route's and joined the primary ECMP tier, so one
+floating backup load-balanced with the primary instead of failing over. The
+merge is keyed on the qualified statement's gateway, never on address alone: a
+plain `next-hop <gw>` for the same address stays a separate primary member. A
+compile-only provenance bit on `NextHopEntry` carries that distinction until
+`canonicalizeStaticRouteCollections` clears it. Distinct-spelling aliases and
+the bare-static/`rib inet6.0` fold stay independent sources (#12084). The
+#8436 census now finds the site conserved.
+
 **Static routes through XFRM must fit the remote selector union (#11422):**
 the typed gate checks global and routing-instance static routes whose
 next-hop interface names an IPsec bind device. The destination prefix must be

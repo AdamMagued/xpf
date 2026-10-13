@@ -63,13 +63,52 @@ var dupConservationInventory8436 = []string{
 	"system services dhcpv6-local-server group",
 	// ---- SILENT: no commit gate at all. ----
 	//
-	// #12184 made the qualified-next-hop metric synthesizable in this census.
-	// Measured: flat-set sibling commands merge interface+metric onto one
-	// next-hop, while repeated hierarchical blocks compile as two entries with
-	// the modifiers split between them. The interface-only entry therefore
-	// lands in metric 0, the primary ECMP tier, instead of failing over.
-	// This unresolved consequence is scope-deferred to #12308.
-	"routing-options static route xpfname qualified-next-hop",
+	// EMPTY — and this time the sentence is load-bearing rather than an
+	// artefact of what the census could reach.
+	//
+	// It said EMPTY for a long time because the census could not REACH the
+	// containers that were losing configuration. #9024 taught the fixture
+	// builder to descend through container-only children, the population went
+	// 30 -> 44, and four SILENT sites appeared at once:
+	//
+	//	firewall policer                        bandwidth-limit LOST
+	//	protocols ospf area                     area DUPLICATED, not merged
+	//	security ipsec policy                   rejected with a MISDIRECTING
+	//	                                        message about missing proposals
+	//	system services dhcp-local-server group
+	//
+	// Issue 9209 fixed all four by extending mergeDuplicateBlocks9023's site
+	// list, so the set is empty again for the reason the sentence claims. What
+	// the episode is worth remembering for:
+	//
+	//	AN INSTRUMENT THAT FILTERS ITS POPULATION BEFORE MEASURING REPORTS THE
+	//	HEALTH OF WHAT SURVIVED THE FILTER, AND REPORTS IT AS THE HEALTH OF THE
+	//	WHOLE.
+	//
+	// The reader who needs this is the one about to conclude that this class
+	// is handled. Ask what the census cannot reach before believing a zero.
+	//
+	// The hedge was true when written and did all the work of the sentence,
+	// which is how a reader arrives at "this class is handled". An empty
+	// section plus an unmeasured majority is not evidence of absence; it is
+	// evidence of reach. What remains below is conservation achieved by
+	// REFUSAL, where an operator is told rather than quietly given a different
+	// config.
+	//
+	// An empty section is not the end of the census's job — it is the state in
+	// which the census earns its keep, because the next NEW non-conserving
+	// container now fails TestDuplicateBlockConservationIsPinned8436 as a
+	// regression instead of joining a list. Do not delete the section header:
+	// a future site belongs here with a reason, not silently.
+	//
+	// It happened once more. #12184 made the qualified-next-hop metric
+	// synthesizable, and the census found `routing-options static route
+	// xpfname qualified-next-hop` here: two blocks for one gateway compiled to
+	// two next-hops, the interface on one and the metric on the other. #12308
+	// fixed it the #9192 way (compileStaticRoutes folds every statement for one
+	// gateway into a single entry), so the site CONSERVES and its line is
+	// deleted rather than re-homed.
+
 	// ---- Already REJECTED at strict commit (conservation by refusal) (8). ----
 	//
 	// #9192 removed `protocols bgp group xpfname neighbor` from this section:

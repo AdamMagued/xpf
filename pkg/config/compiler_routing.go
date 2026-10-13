@@ -370,6 +370,12 @@ func appendStaticRouteNextHopsDeduped(existing *StaticRoute, hops []NextHopEntry
 		return
 	}
 	for _, hop := range hops {
+		if hop.qualified {
+			// #12308: a later block's statement for a gateway this route
+			// already carries folds into that entry, not a second one.
+			existing.NextHops = mergeQualifiedNextHop12308(existing.NextHops, hop)
+			continue
+		}
 		duplicate := false
 		for _, prior := range existing.NextHops {
 			if prior == hop {
@@ -624,9 +630,14 @@ func foldDistinctStaticRouteAliases(routes []*StaticRoute) []*StaticRoute {
 // Competing next-table targets and no-install disagreement are retained as
 // compiler-only conflict metadata. Strict validation rejects these conflicts;
 // tolerant loads warn and keep one deterministic route available to snapshots.
+//
+// Every source for both lists has compiled by now, so this is also where the
+// #12308 qualified-next-hop merge window closes.
 func canonicalizeStaticRouteCollections(
 	staticRoutes, inet6Routes []*StaticRoute,
 ) ([]*StaticRoute, []*StaticRoute) {
+	finalizeQualifiedNextHops12308(staticRoutes)
+	finalizeQualifiedNextHops12308(inet6Routes)
 	staticRoutes = foldDistinctStaticRouteAliases(staticRoutes)
 	inet6Routes = foldDistinctStaticRouteAliases(inet6Routes)
 	if len(staticRoutes) == 0 || len(inet6Routes) == 0 {
@@ -794,7 +805,7 @@ func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRou
 							}
 							i += 2
 						}
-						route.NextHops = append(route.NextHops, nh)
+						route.NextHops = mergeQualifiedNextHop12308(route.NextHops, nh)
 					}
 				case "no-install":
 					route.NoInstall = true
@@ -944,7 +955,10 @@ func compileStaticRoutes(staticNode *Node, existing []*StaticRoute) []*StaticRou
 						nh.HasMetric = true
 					}
 				}
-				route.NextHops = append(route.NextHops, nh)
+				// #12308: fold into the entry this gateway already has. A
+				// bare leaf and a modifier block are separate nodes for one
+				// gateway, even when authored with flat `set`.
+				route.NextHops = mergeQualifiedNextHop12308(route.NextHops, nh)
 			case "next-table":
 				if v := nodeVal(prop); v != "" {
 					setStaticRouteNextTable(route, v)

@@ -111,13 +111,6 @@ var deepDupUnreportable = map[string]string{
 	"system services dhcpv6-local-server group xpfname pool xpfname static-binding": "same as the " +
 		"dhcp-local-server row above — the specific duplicate-MAC diagnosis must not be displaced " +
 		"by a generic one.",
-	"routing-options static route xpfname qualified-next-hop": "scope-deferred to " +
-		"#12308, which tracks whether the measured modifier-association difference needs " +
-		"a targeted report. Measured: flat-set sibling commands merge interface+metric " +
-		"onto one next-hop, while two hierarchical blocks compile as two independent " +
-		"entries; the interface-only entry carries no metric, so StaticRouteNextHopTiers " +
-		"treats it as metric 0 and the intended backup joins the primary ECMP tier " +
-		"instead of failing over. That consequence is real and unresolved here.",
 }
 
 // findDeepDupBlocks walks the registry and returns the duplicates it finds.
