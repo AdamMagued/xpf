@@ -268,6 +268,14 @@ func (v *vrfManager) bindLinkToVRF(ifaceName string, iface netlink.Link, vrf *ne
 	return nil
 }
 
+// netnsIDLocal is the LinkAttrs.NetNsID netlink reports for a link whose
+// lower device is in the caller's namespace. The kernel sends
+// IFLA_LINK_NETNSID only when that device is in another namespace, and
+// LinkDeserialize keeps -1 otherwise. Any other value, 0 included, means
+// ParentIndex is an ifindex in that other namespace and can equal an
+// unrelated local ifindex (the rule pkg/dataplane's netnsIDLocal applies).
+const netnsIDLocal = -1
+
 func (v *vrfManager) bindManagementVLANDescendants(root netlink.Link, vrf *netlink.Vrf) error {
 	links, err := v.ops.LinkList()
 	if err != nil {
@@ -285,6 +293,7 @@ func (v *vrfManager) bindManagementVLANDescendants(root netlink.Link, vrf *netli
 		for _, link := range links {
 			vlan, ok := link.(*netlink.Vlan)
 			if !ok || vlan == nil || vlan.Attrs() == nil ||
+				vlan.Attrs().NetNsID != netnsIDLocal ||
 				vlan.Attrs().ParentIndex != parentAttrs.Index {
 				continue
 			}
