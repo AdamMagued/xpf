@@ -74,6 +74,14 @@ func TestCompactAndTermLineRouteFilterUnknownMatchTypeRejected_12538(t *testing.
 			name: "term-line second filter unknown",
 			text: `policy-options { policy-statement P { term T from route-filter 10.0.0.0/8 exact route-filter 192.168.0.0/16 orlongerr; term T then accept; } }`,
 		},
+		{
+			name: "compact empty quoted match-type",
+			text: `policy-options { policy-statement P { term T { from route-filter 10.0.0.0/8 ""; then accept; } } }`,
+		},
+		{
+			name: "term-line empty quoted match-type",
+			text: `policy-options { policy-statement P { term T from route-filter 10.0.0.0/8 ""; term T then accept; } }`,
+		},
 	}
 
 	const want = "not a valid route-filter match-type"
@@ -85,29 +93,53 @@ func TestCompactAndTermLineRouteFilterUnknownMatchTypeRejected_12538(t *testing.
 }
 
 func TestTolerantSyncUnknownMatchTypeWarning_12538(t *testing.T) {
-	const text = `policy-options {
+	cases := []struct {
+		name string
+		text string
+	}{
+		{
+			name: "term-line",
+			text: `policy-options {
 policy-statement P {
     term T from route-filter 10.0.0.0/8 orlongerr;
     term T then accept;
 }
-}`
-	store := newTestStore(t)
-	cfg, err := store.SyncApply(text, nil)
-	if err != nil {
-		t.Fatalf("SyncApply failed on tolerant path: %v", err)
-	}
-	if cfg == nil {
-		t.Fatal("SyncApply returned nil config")
+}`,
+		},
+		{
+			name: "compact",
+			text: `policy-options {
+policy-statement P {
+    term T {
+        from route-filter 10.0.0.0/8 orlongerr;
+        then accept;
+    }
+}
+}`,
+		},
 	}
 
-	foundWarning := false
-	for _, w := range cfg.Warnings {
-		if strings.Contains(w, "route-filter match-type") && strings.Contains(w, "not a valid route-filter match-type") {
-			foundWarning = true
-			break
-		}
-	}
-	if !foundWarning {
-		t.Fatalf("expected warning for route-filter match-type on tolerant path, got warnings: %v", cfg.Warnings)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newTestStore(t)
+			cfg, err := store.SyncApply(tc.text, nil)
+			if err != nil {
+				t.Fatalf("SyncApply failed on tolerant path: %v", err)
+			}
+			if cfg == nil {
+				t.Fatal("SyncApply returned nil config")
+			}
+
+			foundWarning := false
+			for _, w := range cfg.Warnings {
+				if strings.Contains(w, "route-filter match-type") && strings.Contains(w, "not a valid route-filter match-type") {
+					foundWarning = true
+					break
+				}
+			}
+			if !foundWarning {
+				t.Fatalf("expected warning for route-filter match-type on tolerant path, got warnings: %v", cfg.Warnings)
+			}
+		})
 	}
 }

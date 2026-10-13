@@ -32,6 +32,10 @@ func TestRouteFilterUnknownMatchTypeRejected_12538(t *testing.T) {
 			name: "compact second filter unknown",
 			text: `policy-options { policy-statement P { term T { from route-filter 10.0.0.0/8 exact route-filter 192.168.0.0/16 orlongerr; then accept; } } }`,
 		},
+		{
+			name: "compact empty quoted match-type",
+			text: `policy-options { policy-statement P { term T { from route-filter 10.0.0.0/8 ""; then accept; } } }`,
+		},
 	}
 
 	for _, tc := range cases {
@@ -89,6 +93,10 @@ func TestRouteFilterTermLineUnknownMatchTypeRejected_12538(t *testing.T) {
 		{
 			name: "term-line second filter unknown",
 			text: `policy-options { policy-statement P { term T from route-filter 10.0.0.0/8 exact route-filter 192.168.0.0/16 orlongerr; term T then accept; } }`,
+		},
+		{
+			name: "term-line empty quoted match-type",
+			text: `policy-options { policy-statement P { term T from route-filter 10.0.0.0/8 ""; term T then accept; } }`,
 		},
 	}
 
