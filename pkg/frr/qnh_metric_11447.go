@@ -279,7 +279,7 @@ func policyHasStaticSource11447(ps *config.PolicyStatement) bool {
 	}
 	for _, term := range ps.Terms {
 		for _, source := range term.FromProtocols {
-			if source == "static" {
+			if config.CanonicalSourceProtocol(source) == "static" {
 				return true
 			}
 		}
