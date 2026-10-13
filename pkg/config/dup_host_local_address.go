@@ -157,42 +157,6 @@ func buildZoneInterfaceMapLocal(cfg *Config) map[string]string {
 	return out
 }
 
-// mergeHostInboundOverrideLocal mirrors
-// pkg/dataplane/userspace.mergeHostInboundTraffic: it returns a NEW
-// *HostInboundTraffic whose token lists are the order-preserving UNION of a and
-// b (a first, then b's not-already-present tokens). It backs the #3720 additive
-// physical→unit override resolution so the commit-time gate classifies the same
-// effective set the runtime does. Returns nil only when both inputs are nil.
-func mergeHostInboundOverrideLocal(a, b *HostInboundTraffic) *HostInboundTraffic {
-	if a == nil && b == nil {
-		return nil
-	}
-	appendUnique := func(dst *[]string, src []string) {
-		for _, t := range src {
-			dup := false
-			for _, e := range *dst {
-				if e == t {
-					dup = true
-					break
-				}
-			}
-			if !dup {
-				*dst = append(*dst, t)
-			}
-		}
-	}
-	out := &HostInboundTraffic{}
-	if a != nil {
-		appendUnique(&out.SystemServices, a.SystemServices)
-		appendUnique(&out.Protocols, a.Protocols)
-	}
-	if b != nil {
-		appendUnique(&out.SystemServices, b.SystemServices)
-		appendUnique(&out.Protocols, b.Protocols)
-	}
-	return out
-}
-
 // buildHostInboundOverrideMapLocal mirrors
 // pkg/dataplane/userspace.buildInterfaceHostInboundMap: per-interface
 // host-inbound overrides (#3362) keyed by the interface ref. A physical
@@ -204,6 +168,9 @@ func mergeHostInboundOverrideLocal(a, b *HostInboundTraffic) *HostInboundTraffic
 // pkg/dataplane; the effective set it produces per unit therefore matches the
 // runtime builder exactly, so the commit gate and the runtime reporter classify
 // the same unit identically.
+// The physical/unit merge itself is the shared MergeHostInboundTraffic, so the
+// gate reapplies exclusion provenance exactly as the runtime resolver does
+// (#12317).
 func buildHostInboundOverrideMapLocal(cfg *Config) map[string]*HostInboundTraffic {
 	if cfg == nil || len(cfg.Security.Zones) == 0 {
 		return nil
@@ -241,9 +208,9 @@ func buildHostInboundOverrideMapLocal(cfg *Config) map[string]*HostInboundTraffi
 				// Logical unit ref: most specific — merge onto any physical-
 				// inherited set (both are INTERFACE-level statements and union
 				// with each other, #3720).
-				out[ref] = mergeHostInboundOverrideLocal(out[ref], hib)
+				out[ref] = MergeHostInboundTraffic(out[ref], hib)
 				if s.Literal != ref && strings.Count(ref, ".") > 1 {
-					out[s.Literal] = mergeHostInboundOverrideLocal(out[s.Literal], hib)
+					out[s.Literal] = MergeHostInboundTraffic(out[s.Literal], hib)
 				}
 				continue
 			}
@@ -256,7 +223,7 @@ func buildHostInboundOverrideMapLocal(cfg *Config) map[string]*HostInboundTraffi
 					if z := zoneByIface[un]; z != "" && z != zn {
 						continue // #3720 M01: do not leak cross-zone
 					}
-					out[un] = mergeHostInboundOverrideLocal(out[un], hib)
+					out[un] = MergeHostInboundTraffic(out[un], hib)
 				}
 			}
 		}

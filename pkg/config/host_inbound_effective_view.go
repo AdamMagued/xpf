@@ -169,12 +169,24 @@ func InterfaceZoneMap(cfg *Config) map[string]string {
 // lists are the order-preserving UNION of a and b (a's tokens first, then any of
 // b's not already present, exact-string dedup). It underpins the #3720
 // physical→unit override resolution: a physical-interface override and a
-// more-specific unit-level override on the same unit are UNIONed (both are
-// INTERFACE-level statements) rather than the sorted-first physical ref silently
-// shadowing the unit ref (the #3720 first-writer-wins bug). #6515 changed how the
-// RESULT combines with the zone level — it replaces it — not this merge. Returns
-// nil only when BOTH inputs are nil; a fresh struct is always allocated so the
-// shared config-owned override objects are never mutated in place.
+// more-specific unit-level override on the same unit are BOTH INTERFACE-level
+// statements and union. #6515 changed how the RESULT combines with the zone
+// level — it replaces it — not this merge.
+//
+// #12317: the exclusion provenance unions too, and each input's positives are
+// filtered by the OTHER input's exclusions before the union. An `except` in
+// either scope therefore removes every token of the other scope whose tuples
+// it excludes — an alias (`netconf-ssh` against `ssh except`) and an
+// explicitly named service or protocol alike. An input never needs its own
+// exclusions reapplied: the compiler filtered every stanza by them
+// (parseHostInboundNode, mergeHostInbound) and an earlier merge filtered its
+// result here, so a single input is copied without filtering, and a physical
+// override fanning down to many units is not re-filtered once per unit.
+// Filtering expands a literal `all`, which can repeat a token the other input
+// already lists; the union still drops the repeat.
+//
+// Returns nil only when BOTH inputs are nil; a fresh struct is always allocated
+// so the shared config-owned override objects are never mutated in place.
 func MergeHostInboundTraffic(a, b *HostInboundTraffic) *HostInboundTraffic {
 	if a == nil && b == nil {
 		return nil
@@ -193,15 +205,28 @@ func MergeHostInboundTraffic(a, b *HostInboundTraffic) *HostInboundTraffic {
 			}
 		}
 	}
+	crossFiltered := func(tokens, otherExcept []string, protocols bool) []string {
+		if len(tokens) == 0 {
+			return nil
+		}
+		return hostInboundFilterExcept(tokens, otherExcept, protocols)
+	}
+	var none HostInboundTraffic
+	if a == nil {
+		a = &none
+	}
+	if b == nil {
+		b = &none
+	}
 	out := &HostInboundTraffic{}
-	if a != nil {
-		appendUnique(&out.SystemServices, a.SystemServices)
-		appendUnique(&out.Protocols, a.Protocols)
-	}
-	if b != nil {
-		appendUnique(&out.SystemServices, b.SystemServices)
-		appendUnique(&out.Protocols, b.Protocols)
-	}
+	appendUnique(&out.SystemServices, crossFiltered(a.SystemServices, b.systemServicesExcept, false))
+	appendUnique(&out.SystemServices, crossFiltered(b.SystemServices, a.systemServicesExcept, false))
+	appendUnique(&out.Protocols, crossFiltered(a.Protocols, b.protocolsExcept, true))
+	appendUnique(&out.Protocols, crossFiltered(b.Protocols, a.protocolsExcept, true))
+	appendUnique(&out.systemServicesExcept, a.systemServicesExcept)
+	appendUnique(&out.systemServicesExcept, b.systemServicesExcept)
+	appendUnique(&out.protocolsExcept, a.protocolsExcept)
+	appendUnique(&out.protocolsExcept, b.protocolsExcept)
 	return out
 }
 
@@ -238,6 +263,20 @@ func MergeHostInboundTraffic(a, b *HostInboundTraffic) *HostInboundTraffic {
 // itself stays first-writer-wins across ordinary single-owner refs, while
 // contested logical keys are omitted from the effective view.
 func ResolveInterfaceHostInbound(cfg *Config) map[string]*HostInboundTraffic {
+	return resolveInterfaceHostInbound(cfg, func(_, _, _ string, prev, hib *HostInboundTraffic) *HostInboundTraffic {
+		return MergeHostInboundTraffic(prev, hib)
+	})
+}
+
+// hostInboundOverrideMerge folds the override authored at (zone, ref) onto the
+// override already resolved for key; prev is nil for the first contributor.
+type hostInboundOverrideMerge func(key, zone, ref string, prev, hib *HostInboundTraffic) *HostInboundTraffic
+
+// resolveInterfaceHostInbound is ResolveInterfaceHostInbound with the per-key
+// merge injected, so the #12317 advisory can replay the identical walk —
+// ownership, quarantine and canonicalization included — with a
+// provenance-free union and record which stanzas contributed to each key.
+func resolveInterfaceHostInbound(cfg *Config, merge hostInboundOverrideMerge) map[string]*HostInboundTraffic {
 	if cfg == nil || len(cfg.Security.Zones) == 0 {
 		return nil
 	}
@@ -300,7 +339,7 @@ func ResolveInterfaceHostInbound(cfg *Config) map[string]*HostInboundTraffic {
 				// refs are walked sorted and a bare physical ref sorts before its
 				// units, a same-zone physical expansion below has already run, so
 				// this yields physical ∪ unit.
-				out[s.Literal] = MergeHostInboundTraffic(out[s.Literal], hib)
+				out[s.Literal] = merge(s.Literal, zn, ref, out[s.Literal], hib)
 				continue
 			}
 			// Bare physical ref: keep the ordinary first-writer-wins behavior,
@@ -321,7 +360,7 @@ func ResolveInterfaceHostInbound(cfg *Config) map[string]*HostInboundTraffic {
 					if z := zoneByIface[un]; z != "" && z != zn {
 						continue
 					}
-					out[un] = MergeHostInboundTraffic(out[un], hib)
+					out[un] = merge(un, zn, ref, out[un], hib)
 				}
 			}
 		}
