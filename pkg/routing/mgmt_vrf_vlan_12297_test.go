@@ -68,3 +68,35 @@ func TestBindManagementVLANDescendantsReportsLinkListFailure12297(t *testing.T) 
 		t.Fatalf("BindInterfaceToVRF error = %v, want wrapped link-list failure", err)
 	}
 }
+
+// Only a bind into vrf-mgmt walks VLAN descendants. A member bound to any other
+// VRF moves alone and its VLAN children keep their own masters, even when the
+// member has a management-class name.
+func TestBindNonManagementVRFLeavesVLANChildren12297(t *testing.T) {
+	for _, parentName := range []string{"fxp0", "ge-0-0-0"} {
+		t.Run(parentName, func(t *testing.T) {
+			parent := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: parentName, Index: 10}}
+			child := &netlink.Vlan{LinkAttrs: netlink.LinkAttrs{Name: parentName + ".100", Index: 11, ParentIndex: 10}, VlanId: 100}
+			ops := &childBindOps12297{fakeVRFOps: newFakeVRFOps()}
+			for _, link := range []netlink.Link{parent, child} {
+				ops.overlay[link.Attrs().Name] = link
+				ops.extraLinks = append(ops.extraLinks, link)
+			}
+			ops.seed("vrf-blue", 1001)
+			ops.links["vrf-blue"].LinkAttrs.Index = 77
+
+			if err := (&vrfManager{ops: ops}).BindInterfaceToVRF(parentName, "blue"); err != nil {
+				t.Fatalf("BindInterfaceToVRF: %v", err)
+			}
+			if got := parent.Attrs().MasterIndex; got != 77 {
+				t.Errorf("%s master index = %d, want vrf-blue index 77", parentName, got)
+			}
+			if got := child.Attrs().MasterIndex; got != 0 {
+				t.Errorf("%s master index = %d, want unchanged 0", child.Attrs().Name, got)
+			}
+			if ops.masterCalls != 1 {
+				t.Errorf("LinkSetMaster calls = %d, want only the member", ops.masterCalls)
+			}
+		})
+	}
+}
