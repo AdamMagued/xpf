@@ -13609,10 +13609,17 @@ View 1, so such a config still fails strict commit, and its lenient warning
 names a quarantine the runtime does not perform (pre-existing; the zone
 counterpart of the #9657 routing-instance fix is a follow-up). The defined-`any`
 poison (#12249) stays per node: it fires only when the compiled config itself
-defines `any`, matching policy lowering and the rejection mirror. Regression
+defines `any`, matching policy lowering and the rejection mirror. Because
+`Config.ZoneQuarantineNames` is `json:"-"`, the #5680/#6480 partial-republish
+skew guard (`configsContentEqual`) compares the runtime set explicitly. Moving
+a collider between a group nothing applies and a node group leaves the config
+JSON unchanged yet changes the quarantine, so a scheduler or route-only
+republish refuses any config whose runtime set differs from the applied one
+until that config's full apply lands. Regression
 coverage: `pkg/dataplane/userspace/zone_quarantine_union_12247_test.go`
 (node-scoped quarantine through `buildSnapshot`, the loser's interface map,
-the scheduler-only republish, and the three group-only shapes),
+the scheduler-only republish, the quarantine-only skew refusal, and the three
+group-only shapes),
 `pkg/dataplane/userspace/zone_any_defined_12249_test.go`
 (`TestAnyZoneOutsideThisNodeLeavesWildcardIntact12247`),
 `pkg/daemon/per_rg_test.go` (`TestBuildZoneRGMapUsesNodeScopedQuarantine12247`)
