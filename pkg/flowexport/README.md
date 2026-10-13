@@ -601,9 +601,11 @@ for consistent per-group identity.
 
 Each exporter derives a **stable, nonzero 32-bit id** via
 `stableExporterID(protocol, instance, template, isV6)` (`exporterid.go`):
-FNV-1a 64 over `"protocol|instance|template"` for inet and
-`"protocol|instance|template|v6"` for inet6, xor-folded to 32 bits and mapped
-into `[1, 0xFFFFFFFF]`. It mirrors `config.StableTunnelEndpointID` (#1873).
+FNV-1a 64 over backslash-escaped `"protocol|instance|template"` for inet and
+`"...|v6"` for inet6 (#12542: each field escapes `\` → `\\`, `|` → `\|`
+so a literal `|` in a name cannot forge a field boundary or the family
+suffix), xor-folded to 32 bits and mapped into `[1, 0xFFFFFFFF]`. It mirrors
+`config.StableTunnelEndpointID` (#1873).
 `NewExporter` stamps it as the v9 SourceID; `NewIPFIXExporter` as the IPFIX
 Observation Domain ID.
 
@@ -635,12 +637,25 @@ re-announced automatically. This is a NetFlow/IPFIX wire-value change to the
 external collector only, not an internal Go↔Rust snapshot wire change (no
 `protocol_wire_v1.json` regen).
 
-Fail-on-revert pins (`exporter_id_3740_test.go` and
-`exporter_id_family_12148_test.go`, loopback UDP): the #3740 tests preserve
+**ID migration (#12542).** Names containing `|` (previously ambiguous) or
+`\` (the escape character) hash differently once escaped, so those groups
+also get a new SourceID/ODID after upgrade — for example a template named
+`C:\flows`. Names without either byte keep their IDs, including the #12148
+inet pins.
+
+Fail-on-revert pins: in `exporter_id_3740_test.go` and
+`exporter_id_family_12148_test.go` (loopback UDP), the #3740 tests preserve
 per-group uniqueness, the 12148 cells require distinct inet/inet6 IDs through
 the real resolver path for a same-destination dual-family instance, and
 `TestStableExporterIDFamilyMigration` pins existing inet values while
-requiring distinct, deterministic inet6 values.
+requiring distinct, deterministic inet6 values. In
+`exporter_id_pipe_12542_test.go`, each escaping rule has a pair, checked
+under both protocols, that collides when the rule breaks: inet template
+`t|v6` vs inet6 template `t` (template written raw), inet6 template `t\` vs
+inet template `t|v6` (`\` left unescaped), and inet instance `i|t` with
+template `v6` vs inet6 instance `i` with template `t` (instance written
+raw). `TestStableExporterIDZeroAlloc12542` pins that the ID build makes no
+heap allocation when the escaped key fits its 128-byte stack buffer.
 
 
 ## Unusable collectors are excluded at build time (#8163)
