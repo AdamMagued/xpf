@@ -24,11 +24,8 @@ func (s *Server) zonesHandler(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	cr := s.applyResult()
-	zoneNames := make([]string, 0, len(cfg.Security.Zones))
-	for zoneName := range cfg.Security.Zones {
-		zoneNames = append(zoneNames, zoneName)
-	}
-	quarantinedZones := config.ZoneQuarantineExclusions(zoneNames)
+	quarantineNames := config.ZoneQuarantineNamesForConfig(cfg)
+	quarantinedZones := config.ZoneQuarantineExclusions(quarantineNames)
 	// #3408: a per-zone counter read failure must not be reported as a clean
 	// 0 — surface it as HTTP 500 after building, mirroring the global
 	// /stats/global contract (#3345).
@@ -48,7 +45,7 @@ func (s *Server) zonesHandler(w http.ResponseWriter, _ *http.Request) {
 		if quarantined {
 			zi.Quarantine = &ZoneQuarantineInfo{
 				State:        ZoneQuarantineStateQuarantined,
-				SurvivorZone: config.ZoneQuarantineSurvivorName(zoneName, zoneNames),
+				SurvivorZone: config.ZoneQuarantineSurvivorName(zoneName, quarantineNames),
 			}
 			// Do not publish the survivor's counters under the quarantined
 			// name. The numeric counter fields remain their zero values.
@@ -185,11 +182,7 @@ func (s *Server) policiesHandler(w http.ResponseWriter, _ *http.Request) {
 	// snapshot. Reuse the config verdict once per request so the existing
 	// fields can distinguish "0 hits" from "no live attribution" without
 	// changing the REST schema.
-	zoneNames := make([]string, 0, len(cfg.Security.Zones))
-	for name := range cfg.Security.Zones {
-		zoneNames = append(zoneNames, name)
-	}
-	quarantinedZones := config.ZoneQuarantineExclusions(zoneNames)
+	quarantinedZones := config.ZoneQuarantineExclusionsForConfig(cfg)
 	isQuarantinedZone := func(name string) bool {
 		_, ok := quarantinedZones[name]
 		return ok

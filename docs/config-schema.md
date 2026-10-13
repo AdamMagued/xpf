@@ -13538,8 +13538,9 @@ and tcp-rst bit, and both zones' interfaces/policies resolve to one id — a
 zone-isolation failure the lenient warning falsely claimed was quarantined.
 `config.QuarantinedZoneNames` (`zoneid.go`) is the SSOT that, for each id claimed
 by more than one name, keeps the **sorted-first** name (the survivor) and
-quarantines the rest. It is a pure function of the name set, so both HA nodes and
-a cold-booting node agree. The userspace builder's `quarantineCollidingZones`
+quarantines the rest. It is a pure function of the name set it is given, and the
+runtime gives it one set on every node (#12247, below), so both HA nodes and a
+cold-booting node agree. The userspace builder's `quarantineCollidingZones`
 (`pkg/dataplane/userspace/zones_quarantine.go`) applies it to the built snapshot
 BEFORE publish: it **drops** the quarantined `ZoneSnapshot`, **unzones** any
 interface bound to it (`Zone=""` → default-deny, fail closed), and scrubs the
@@ -13587,6 +13588,43 @@ called before `populate_zones` in `build_forwarding_state`) rejects a snapshot
 that STILL carries two different zones under one nonzero non-reserved id — the
 helper-boundary guard for a corrupt / version-drifted snapshot that bypassed the
 Go quarantine (regression `build_forwarding_state_rejects_duplicate_zone_ids`).
+
+**#12247 — one runtime name set on every node.** Runtime quarantine (the
+snapshot build, the #6480 partial republishes, the #12237 HA zone→RG ownership
+map, the interface and host-inbound maps, and every show/API/metrics surface)
+decides over `config.ZoneQuarantineNamesForConfig(cfg)`: the main, node0 and
+node1 views — every top-level `security` root plus the node0 and node1 group
+expansions (`zoneRuntimeNameUnionAST`, recorded at compile time as
+`Config.ZoneQuarantineNames`) — merged with the compiled config's own zones.
+Both cluster nodes compute it from the same candidate, so a node-scoped pair
+(`z174` only in `groups node0`, `z214` only in `groups node1`,
+`apply-groups "${node}"`) quarantines `z214` on **both** nodes. The survivor
+may exist only on the peer: node1 then installs no zone for that id, maps it to
+no RG, and reports `z214` quarantined in favour of a `z174` it does not carry.
+View 1's raw `groups` scan is not part of the runtime set. A name only a groups
+block declares — a `<*>` wildcard template, a group nothing applies, a group
+applied under another stanza — is installed by no node and never
+quarantines a live zone. The strict gate and the lenient warning still count
+View 1, so such a config still fails strict commit, and its lenient warning
+names a quarantine the runtime does not perform (pre-existing; the zone
+counterpart of the #9657 routing-instance fix is a follow-up). The defined-`any`
+poison (#12249) stays per node: it fires only when the compiled config itself
+defines `any`, matching policy lowering and the rejection mirror. Because
+`Config.ZoneQuarantineNames` is `json:"-"`, the #5680/#6480 partial-republish
+skew guard (`configsContentEqual`) compares the runtime set explicitly. Moving
+a collider between a group nothing applies and a node group leaves the config
+JSON unchanged yet changes the quarantine, so a scheduler or route-only
+republish refuses any config whose runtime set differs from the applied one
+until that config's full apply lands. Regression
+coverage: `pkg/dataplane/userspace/zone_quarantine_union_12247_test.go`
+(node-scoped quarantine through `buildSnapshot`, the loser's interface map,
+the scheduler-only republish, the quarantine-only skew refusal, and the three
+group-only shapes),
+`pkg/dataplane/userspace/zone_any_defined_12249_test.go`
+(`TestAnyZoneOutsideThisNodeLeavesWildcardIntact12247`),
+`pkg/daemon/per_rg_test.go` (`TestBuildZoneRGMapUsesNodeScopedQuarantine12247`)
+and `pkg/api/security_zone_quarantine_10531_test.go`
+(`TestZonesHandlerReportsNodeScopedQuarantine12247`).
 
 **`MaxUsableZoneID`** is now `ZoneIDReservedMin-1` (65533) — the pigeonhole bound
 of the u16 stable-hash space, not the old 255-id u8 wire limit (**#2391

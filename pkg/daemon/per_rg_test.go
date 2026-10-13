@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"slices"
 	"testing"
 
 	"github.com/psaab/xpf/pkg/cluster"
@@ -376,6 +377,56 @@ func TestBuildZoneRGMapSkipsQuarantinedCollisionLoser12237(t *testing.T) {
 	ss.IsPrimaryForRGFn = func(rg int) bool { return rg == 1 }
 	if !ss.ShouldSyncSessionV4(row) {
 		t.Fatal("survivor-zone session was not sync-owned by survivor z174 RG 1")
+	}
+}
+
+// TestBuildZoneRGMapUsesNodeScopedQuarantine12247 pins the HA ownership map to
+// the runtime zone-name set the dataplane quarantine decides over (#12247).
+// z174 exists only in groups node0 and z214 only in groups node1; both fold to
+// one stable ID, and both nodes' dataplanes quarantine z214. On node1, where
+// z214 is the ID's only claimant, z214's RG 2 must not own the ID; node0 keeps
+// z174's RG 1.
+func TestBuildZoneRGMapUsesNodeScopedQuarantine12247(t *testing.T) {
+	zoneID := config.StableZoneID("z174")
+	if zoneID != config.StableZoneID("z214") {
+		t.Fatalf("fixture zones do not collide: z174=%d z214=%d", zoneID, config.StableZoneID("z214"))
+	}
+	tree, errs := config.NewParser(`groups {
+  node0 { security { zones { security-zone z174 { interfaces { reth0.0; } } } } }
+  node1 { security { zones { security-zone z214 { interfaces { reth1.0; } } } } }
+}
+apply-groups "${node}";`).Parse()
+	if len(errs) != 0 {
+		t.Fatalf("parse node-scoped zones: %v", errs)
+	}
+	for _, tc := range []struct {
+		nodeID int
+		zone   string
+		want   []int
+	}{
+		{nodeID: 0, zone: "z174", want: []int{1}},
+		{nodeID: 1, zone: "z214", want: nil},
+	} {
+		cfg, err := config.CompileConfigForNodeLenient(tree, tc.nodeID)
+		if err != nil {
+			t.Fatalf("tolerant node%d compile: %v", tc.nodeID, err)
+		}
+		// RG ownership comes from the reth parents. Set them directly so the
+		// cell isolates the quarantine verdict from chassis-cluster plumbing.
+		cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+			"reth0": {Name: "reth0", RedundancyGroup: 1},
+			"reth1": {Name: "reth1", RedundancyGroup: 2},
+		}
+		// The local zone must be configured on its reth and carry the shared
+		// ID, or node1's empty result would not be the quarantine's doing.
+		zoneIDs := buildZoneIDs(cfg)
+		if zone := cfg.Security.Zones[tc.zone]; zone == nil || len(zone.Interfaces) != 1 || zoneIDs[tc.zone] != zoneID {
+			t.Fatalf("node%d precondition: zone %q = %+v with id %d, want one reth unit and id %d",
+				tc.nodeID, tc.zone, zone, zoneIDs[tc.zone], zoneID)
+		}
+		if got := buildZoneRGMap(cfg, zoneIDs)[zoneID]; !slices.Equal(got, tc.want) {
+			t.Fatalf("node%d zone RG set for id %d = %v, want %v", tc.nodeID, zoneID, got, tc.want)
+		}
 	}
 }
 

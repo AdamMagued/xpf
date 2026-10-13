@@ -136,11 +136,7 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 	// the dataplane read) rather than surfacing live counts the operator
 	// did not enable.
 	statsEnabled := cfg.Security.PolicyStatsEnabled
-	zoneNames := make([]string, 0, len(cfg.Security.Zones))
-	for name := range cfg.Security.Zones {
-		zoneNames = append(zoneNames, name)
-	}
-	quarantinedZones := config.ZoneQuarantineExclusions(zoneNames)
+	quarantinedZones := config.ZoneQuarantineExclusionsForConfig(cfg)
 	isQuarantined := func(name string) bool {
 		_, ok := quarantinedZones[name]
 		return ok
@@ -418,11 +414,7 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 	// the "Session statistics" block is per-policy hit-count display, so
 	// it must honor the knob for cross-surface consistency.
 	statsEnabled := cfg.Security.PolicyStatsEnabled
-	zoneNames := make([]string, 0, len(cfg.Security.Zones))
-	for name := range cfg.Security.Zones {
-		zoneNames = append(zoneNames, name)
-	}
-	quarantinedZones := config.ZoneQuarantineExclusions(zoneNames)
+	quarantinedZones := config.ZoneQuarantineExclusionsForConfig(cfg)
 	isQuarantined := func(name string) bool {
 		_, ok := quarantinedZones[name]
 		return ok

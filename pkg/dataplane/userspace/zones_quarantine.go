@@ -56,25 +56,42 @@ func (c ZoneIDCollision) String() string {
 // (a brick on a fresh boot), so the scrub is coordinated across zones,
 // interfaces, and policies.
 //
-// The quarantine set is config.ZoneQuarantineExclusions over the snapshot's own zone
-// names — a pure function of the name set, so both HA nodes and a cold-booting
-// node resolve the identical set. Returns the collisions it resolved, sorted for
-// deterministic operator output (nil in the common no-collision case).
+// The quarantine set is config.ZoneQuarantineExclusions over the compiler's
+// runtime zone-name set carried in snap.Config (config.ZoneQuarantineNamesForConfig:
+// the main, node0 and node1 views merged with the config's own zones). This
+// keeps node-scoped peer-only colliders from surviving on one node; hand-built
+// snapshots without compiled metadata fall back to their own zone names.
+// Collision records remain sorted for deterministic operator output (nil in
+// the common no-collision case).
 func quarantineCollidingZones(snap *ConfigSnapshot) []ZoneIDCollision {
 	if snap == nil || len(snap.Zones) == 0 {
 		return nil
 	}
-	names := make([]string, 0, len(snap.Zones))
-	for _, z := range snap.Zones {
-		names = append(names, z.Name)
+	names := config.ZoneQuarantineNamesForConfig(snap.Config)
+	if len(names) == 0 {
+		names = make([]string, 0, len(snap.Zones))
+		for _, z := range snap.Zones {
+			names = append(names, z.Name)
+		}
 	}
 	quarantined := config.ZoneQuarantineExclusions(names)
 	if len(quarantined) == 0 {
 		return nil
 	}
 	collisions := make([]ZoneIDCollision, 0, len(quarantined))
+	// #12249: the defined-`any` poison follows THIS snapshot's own zones — the
+	// effective cfg.Security.Zones keys buildZoneSnapshots emits, which policy
+	// lowering and PolicyContentRejectionReasons also read — never the runtime
+	// name set. An `any` defined only in a peer node's view installs nothing
+	// here; poisoning this node's legitimate wildcard rules on it would make
+	// the helper refuse the whole snapshot with no rejection reason to explain
+	// it, and partial republishes (effective lowering) would publish them clean.
+	definedAny := false
 	kept := snap.Zones[:0]
 	for _, z := range snap.Zones {
+		if z.Name == config.ReservedWildcardZoneName {
+			definedAny = true
+		}
 		if _, drop := quarantined[z.Name]; drop {
 			collisions = append(collisions, ZoneIDCollision{
 				ID:          z.ID,
@@ -132,7 +149,7 @@ func quarantineCollidingZones(snap *ConfigSnapshot) []ZoneIDCollision {
 	// republish paths (#6480).
 	policyQuarantined := config.QuarantinedZoneNames(names)
 	snap.Policies = scrubPoliciesForQuarantinedZones(snap.Policies, policyQuarantined)
-	poisonDefinedAnyZonePairPolicies(snap.Policies, config.HasDefinedAnyZoneName(names))
+	poisonDefinedAnyZonePairPolicies(snap.Policies, definedAny)
 	sort.Slice(collisions, func(i, j int) bool {
 		if collisions[i].ID != collisions[j].ID {
 			return collisions[i].ID < collisions[j].ID
@@ -233,22 +250,11 @@ func scrubPoliciesForQuarantinedZones(policies []PolicyRuleSnapshot, quarantined
 	return keptPol
 }
 
-// quarantinedZoneNamesForConfig computes the StableZoneID quarantine set — the
-// zone names quarantineCollidingZones drops — directly from a config's zone-name
-// set, WITHOUT building a full snapshot. The partial-republish paths use it to
-// re-scrub a freshly rebuilt policy slice against the SAME quarantine the full
-// build applied (#6480). The name set is exactly buildZoneSnapshots' source
-// (cfg.Security.Zones keys), so the computed set matches the full build's
-// quarantine by construction; the inherited next.Zones (reduced by the full
-// build) is therefore full(cfg) minus this set, and scrubbing the rebuilt
-// policies against it leaves no reference to a zone absent from next.Zones.
+// quarantinedZoneNamesForConfig computes the StableZoneID quarantine set from
+// the same runtime zone-name set the full snapshot build uses
+// (config.ZoneQuarantineNamesForConfig). Partial-republish paths use it to
+// re-scrub policies against collisions contributed by peer-only node views as
+// well as the effective config's local zones.
 func quarantinedZoneNamesForConfig(cfg *config.Config) map[string]struct{} {
-	if cfg == nil || len(cfg.Security.Zones) < 2 {
-		return nil
-	}
-	names := make([]string, 0, len(cfg.Security.Zones))
-	for name := range cfg.Security.Zones {
-		names = append(names, name)
-	}
-	return config.QuarantinedZoneNames(names)
+	return config.QuarantinedZoneNames(config.ZoneQuarantineNamesForConfig(cfg))
 }
