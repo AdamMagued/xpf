@@ -1,6 +1,8 @@
 package userspace
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -239,6 +241,138 @@ security {
 	if !schedPolicyInactive5328(t, req.Snapshot.Policies, "local-allow") {
 		t.Fatal("scheduler republish did not apply the closed window to local-allow")
 	}
+}
+
+// TestPartialRepublishRefusesQuarantineOnlySkew12247 pins the #6480/#5680
+// skew guard (configsContentEqual) to the runtime zone-name set, which is
+// `json:"-"` and so invisible to the guard's marshal comparison. On node1,
+// config A keeps z174 in a group nothing applies and config B renames that
+// group to node0. Both compile to the same JSON (zones, policies and the
+// View-1 warning), yet B quarantines node1's z214 in favour of the peer's z174
+// while A keeps it live. With A applied and B's full apply failed, a partial
+// republish of B would scrub z214's deny while inheriting A's live z214, so
+// z214 traffic would reach the global permit. Both partial-republish paths
+// must refuse B, while a recompile of A stays content-equal.
+func TestPartialRepublishRefusesQuarantineOnlySkew12247(t *testing.T) {
+	hermeticSnapshot12247(t)
+	compileWithGroup := func(group string) *config.Config {
+		return lenientCompile12247(t, parseTree12247(t, `groups {
+  `+group+` { security { zones { security-zone z174; } } }
+  node1 { security { zones { security-zone z214 { interfaces { ge-0/0/1.0; } } } } }
+}
+apply-groups "${node}";
+interfaces { ge-0/0/1 { unit 0 { family inet { address 10.0.1.1/24; } } } }
+schedulers { scheduler workhours { daily { start-time 09:00:00; stop-time 17:00:00; } } }
+security {
+  zones { security-zone trust; security-zone untrust; }
+  policies {
+    from-zone trust to-zone untrust {
+      policy office-hours {
+        match { source-address any; destination-address any; application any; }
+        then { permit; }
+        scheduler-name workhours;
+      }
+    }
+    from-zone trust to-zone z214 {
+      policy z214-deny {
+        match { source-address any; destination-address any; application any; }
+        then { deny; }
+      }
+    }
+    global {
+      policy allow-rest {
+        match { source-address any; destination-address any; application any; }
+        then { permit; }
+      }
+    }
+  }
+}`), 1)
+	}
+	cfgA := compileWithGroup("unused")
+	cfgB := compileWithGroup("node0")
+
+	// The skew must be invisible to the marshal, or this cell would pass on
+	// the JSON comparison alone.
+	jsonA, err := json.Marshal(cfgA)
+	if err != nil {
+		t.Fatalf("marshal A: %v", err)
+	}
+	jsonB, err := json.Marshal(cfgB)
+	if err != nil {
+		t.Fatalf("marshal B: %v", err)
+	}
+	if string(jsonA) != string(jsonB) {
+		t.Fatal("fixture: renaming the unapplied group to node0 must leave node1's config JSON unchanged")
+	}
+	if reason := config.ZoneQuarantineExcludedReason("z214", cfgA); reason != "" {
+		t.Fatalf("fixture: A must keep z214 live on node1, got %s", reason)
+	}
+	if config.ZoneQuarantineExcludedReason("z214", cfgB) == "" {
+		t.Fatal("fixture: B must quarantine node1's z214 in favour of the peer's z174")
+	}
+	if routeOnlyPublishHybrid(compileWithGroup("unused"), cfgA) {
+		t.Fatal("a distinct recompile of A was treated as a hybrid (false refusal)")
+	}
+
+	dir, err := os.MkdirTemp("", "x12247q")
+	if err != nil {
+		t.Fatalf("mkdtemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	controlSock := filepath.Join(dir, "control.sock")
+
+	m := New()
+	m.proc = &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}}
+	m.cfg.ControlSocket = controlSock
+	m.generation = 5
+	m.lastStatus.ConfigSnapshotProtocolVersion = ProtocolVersion
+	m.lastSnapshot, err = buildSnapshotWithSchedulerState(
+		cfgA, config.UserspaceConfig{ControlSocket: controlSock}, 5, 0,
+		map[string]bool{"workhours": true}, nil, nil)
+	if err != nil {
+		t.Fatalf("build lastSnapshot: %v", err)
+	}
+	applied := m.lastSnapshot
+	if !zonePublished12247(applied, "z214") || !schedPolicyPresent5328(applied.Policies, "z214-deny") {
+		t.Fatal("precondition: applied A must install z214 together with its deny")
+	}
+
+	// One slot, so a regression ships its hybrid instead of failing to dial.
+	reqs := startArmControlServer(t, controlSock, 1)
+	if err := m.UpdatePolicyScheduleState(cfgB, map[string]bool{"workhours": false}); err == nil {
+		shipped := "no snapshot captured"
+		select {
+		case req := <-reqs:
+			if req.Snapshot != nil {
+				shipped = fmt.Sprintf("z214 live=%v, z214-deny kept=%v",
+					zonePublished12247(req.Snapshot, "z214"),
+					schedPolicyPresent5328(req.Snapshot.Policies, "z214-deny"))
+			}
+		case <-time.After(10 * time.Second):
+		}
+		t.Fatalf("scheduler republish of B over applied A was accepted (%s): B's "+
+			"quarantine scrubbed z214's deny while A's z214 stayed live (#6480)", shipped)
+	} else if !strings.Contains(err.Error(), "refusing scheduled-policy republish") {
+		t.Fatalf("scheduler republish error = %q, want the #6480 skew refusal", err)
+	}
+	published, err := m.PublishRouteOverlaySnapshot(cfgB, nil, nil)
+	if published || err == nil || !strings.Contains(err.Error(), "refusing route-only publish") {
+		t.Fatalf("route-only publish of B over applied A: published=%v err=%v, want the #5680 refusal",
+			published, err)
+	}
+	if m.generation != 5 || m.lastSnapshot != applied {
+		t.Fatalf("refused republishes advanced the manager: generation=%d, snapshot replaced=%v",
+			m.generation, m.lastSnapshot != applied)
+	}
+	select {
+	case req := <-reqs:
+		t.Fatalf("a refused republish shipped a snapshot: %q", req.Type)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func zonePublished12247(snap *ConfigSnapshot, name string) bool {
+	return slices.ContainsFunc(snap.Zones, func(z ZoneSnapshot) bool { return z.Name == name })
 }
 
 func schedPolicyPresentInConfig12247(cfg *config.Config, toZone, name string) bool {

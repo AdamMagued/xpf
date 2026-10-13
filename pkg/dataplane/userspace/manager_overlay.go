@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"time"
 
@@ -435,7 +436,7 @@ func routeOnlyPublishHybrid(cfg, applied *config.Config) bool {
 // NOTE — the JSON comparison is strictly COARSER than reflect.DeepEqual, in one
 // direction only (#6037 review): DeepEqual-equal ALWAYS implies JSON-equal (Go
 // sorts map keys, so the encoding is deterministic), but the converse fails for
-// two classes of field:
+// three classes of field:
 //   - Secrets: config.Secret.MarshalJSON redacts every non-empty secret to the
 //     sentinel "<redacted>", so two configs differing ONLY in a non-empty secret
 //     (an IPsec PSK / auth-key / password rotation) compare EQUAL here though
@@ -443,6 +444,9 @@ func routeOnlyPublishHybrid(cfg, applied *config.Config) bool {
 //   - Unexported fields (e.g. SNMPCommunity.clientNets): json.Marshal omits them;
 //     DeepEqual compares them. These are derived from exported fields, so the
 //     coarsening is benign (arguably more correct).
+//   - `json:"-"` fields: json.Marshal skips them as well.
+//     Config.ZoneQuarantineNames is one of them and changes the snapshot, so
+//     it is compared explicitly (#12247, below).
 //
 // This coarsening is SAFE for every secret the helper CANNOT see, and #9161
 // found the exception.
@@ -475,6 +479,17 @@ func routeOnlyPublishHybrid(cfg, applied *config.Config) bool {
 // receive — either change re-creates the over-strictness this coarsening exists
 // to avoid.
 //
+// #12247: Config.ZoneQuarantineNames is `json:"-"` compile-time metadata, so
+// the marshal cannot see it, yet zone quarantine decides over it
+// (config.ZoneQuarantineNamesForConfig). Moving a colliding zone from a group
+// nothing applies into the peer's node group changes only that set: the two
+// configs marshal equal, but the new one quarantines a zone the retained
+// snapshot still installs. A partial republish would then scrub that zone's
+// rules while keeping the zone live, so its traffic falls through to a later
+// permit (the #6480 hybrid). The runtime name set is therefore compared too:
+// the merged set every quarantine consumer reads, whose zone keys the JSON
+// comparison has already pinned.
+//
 // A marshal error is never observed in practice — the very same object is
 // marshaled to the helper on each apply — but if one occurred we cannot prove
 // content-equality, so we report NOT equal and let the hybrid-ACK guard fail
@@ -489,6 +504,10 @@ func configsContentEqual(a, b *config.Config) bool {
 		return false
 	}
 	if !bytes.Equal(ab, bb) {
+		return false
+	}
+	// #12247: the runtime zone-name set is invisible to the marshal (above).
+	if !slices.Equal(config.ZoneQuarantineNamesForConfig(a), config.ZoneQuarantineNamesForConfig(b)) {
 		return false
 	}
 	// #9161: the redacted marshal cannot see a secret the helper CAN see.
