@@ -22,7 +22,8 @@ import (
 //
 //   - CANONICALITY. Every value resolves against the operational tree to
 //     itself, with every word a real command KEYWORD rather than a word a
-//     value slot absorbed. So no entry names a command that cannot be run.
+//     value slot absorbed, and no word after a leaf (#12527). So no entry
+//     names a command that cannot be run.
 //   - COMPLETENESS. Every topic the ShowText dispatcher serves, and every verb
 //     the SystemAction handler serves, has an entry — enumerated out of
 //     production source in both directions, so a new topic or verb reds the

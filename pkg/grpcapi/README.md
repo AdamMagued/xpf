@@ -357,7 +357,11 @@ is distinguishable from a forgotten one.
 Plus a validity rule on every value: it must resolve against
 `cmdtree.OperationalTree` **to itself**, with every word a real command
 KEYWORD rather than a word a value slot absorbed (`show interfaces zzbogus`
-canonicalizes fine — value slots take operator data by design, #8094).
+canonicalizes fine — value slots take operator data by design, #8094), and
+with nothing after a leaf (`show security flow session summary zone`
+canonicalizes fine too — `session` takes its options in any order, #9505 —
+but a leaf is a complete command, so a word after it is an argument or a
+second option, #12527).
 
 **Completeness and canonicality are checked; ATTRIBUTION is not.**
 `chassis-cluster-status` mapped to some other real canonical command passes

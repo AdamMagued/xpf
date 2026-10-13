@@ -311,11 +311,16 @@ system {
 // detail charge `show security flow session`; a GetZonePairSummary
 // mis-charge to detail is admitted and fails the denial arm. A deny
 // widened to cover detail or inventory reads is caught by the
-// same-fixture GetSessions/GetZones controls below. The `$` anchor is
-// load-bearing: `session` takes options in any order, so a mis-charge
-// to a longer canonical command such as `show security flow session
-// summary zone` passes TestEveryMappedCommandIsCanonical7172, and only
-// this anchored deny keeps it from satisfying the denial arm.
+// same-fixture GetSessions/GetZones controls below.
+//
+// The `$` anchor is one of TWO guards against a mis-charge to a longer
+// command. `session` takes options in any order, so Canonicalize accepts
+// a command that continues past the `summary` leaf, such as `show
+// security flow session summary zone trust`. Since #12527
+// TestEveryMappedCommandIsCanonical7172 rejects that entry, because no
+// word may follow a leaf, and the anchor independently keeps it from
+// satisfying the denial arm here, so either guard alone reds it. Before
+// #12527 the anchor was the only guard: the table test accepted it.
 const authzSummaryDenyConfig7172 = `
 system {
     host-name authz-summary-deny-test;
