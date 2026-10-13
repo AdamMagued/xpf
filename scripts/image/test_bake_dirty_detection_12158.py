@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
-"""#12158: the packaged xpfd's dirty marker follows its package version.
+"""#12158: the packaged xpfd's dirty marker agrees with its package version.
 
 `make deb` rewrites debian/changelog and only then lets dpkg-buildpackage rerun
 the Makefile through debian/rules, so the inner `git describe --dirty` default
-marked EVERY packaged xpfd `-dirty`. The deb recipe now hands the inner build a
-VERSION whose marker follows DEB_VERSION (the #12141 shared probe).
+marked EVERY packaged xpfd `-dirty`. bake.py therefore stripped `-dirty` before
+comparing versions, which also discarded a real marker on a clean-labelled
+package. The deb recipe now hands the inner build a VERSION whose marker
+follows DEB_VERSION (the #12141 shared probe), and bind_deb_identity requires
+`-dirty` on xpfd exactly when the package version carries `.dirty`.
 
 The recipe cells run the REAL Makefile `deb` target in a throwaway checkout.
 A stand-in dpkg-buildpackage on PATH drives the REAL debian/rules build step
 under `make -n` (so the `$(MAKE) build` hop is real), then records xpfd's link
 flags and `git describe --dirty` as seen at that moment. Pre-fix, the clean
-cell embeds `-dirty`.
+cell embeds `-dirty` and the bind cells accept mismatched markers.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import re
 import shutil
@@ -22,9 +26,14 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _HERE = Path(__file__).resolve().parent
 _ROOT = _HERE.parent.parent
+_SPEC = importlib.util.spec_from_file_location("xpf_bake_12158", _HERE / "bake.py")
+bake = importlib.util.module_from_spec(_SPEC)
+assert _SPEC.loader is not None
+_SPEC.loader.exec_module(bake)
 
 # Stand-in for dpkg-buildpackage: it runs where the real one does (the source
 # root, after the recipe's changelog rewrite), dry-runs debian/rules' build
@@ -188,6 +197,76 @@ class DebRecipeMarkerTests(unittest.TestCase):
         with self.subTest(channel="environment"):
             _, embedded, _ = self.run_deb(env={**self.env, "VERSION": "env-pin"})
             self.assertEqual(embedded, "env-pin")
+
+
+class BindDirtyMarkerTests(unittest.TestCase):
+    """bind_deb_identity requires xpfd -dirty exactly when the package is."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(prefix="xpf-bind-marker-12158-")
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        (self.root / "src.txt").write_text("v1\n")
+        _commit_fixture(self.root)
+        # bind_deb_identity reads the module-global ROOT at call time.
+        patcher = mock.patch.object(bake, "ROOT", str(self.root))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.head = _git(self.root, "rev-parse", "HEAD")
+        self.describe = _git(self.root, "describe", "--tags", "--always", "HEAD")
+        self.clean_package = "0.0.1+g" + self.head[:12]
+        self.dirty_package = self.clean_package + ".dirty"
+
+    def bind(self, package, xpfd_version, *, skip_build):
+        output = f"xpfd {xpfd_version} (commit {self.head[:9]}, built test)\n"
+        return bake.bind_deb_identity(
+            package, output, skip_build=skip_build, head_commit=self.head)
+
+    def test_matching_clean_markers_bind(self):
+        for skip_build in (False, True):
+            with self.subTest(skip_build=skip_build):
+                self.assertEqual(
+                    self.bind(self.clean_package, self.describe,
+                              skip_build=skip_build),
+                    (self.describe, self.head))
+
+    def test_matching_dirty_markers_bind(self):
+        # Dirty packages stay bakeable; their .dirty version names the set.
+        dirty_describe = self.describe + "-dirty"
+        for skip_build in (False, True):
+            with self.subTest(skip_build=skip_build):
+                self.assertEqual(
+                    self.bind(self.dirty_package, dirty_describe,
+                              skip_build=skip_build),
+                    (dirty_describe, self.head))
+
+    def test_dirty_xpfd_in_clean_package_is_refused(self):
+        for skip_build in (False, True):
+            with self.subTest(skip_build=skip_build):
+                with self.assertRaises(SystemExit) as caught:
+                    self.bind(self.clean_package, self.describe + "-dirty",
+                              skip_build=skip_build)
+                self.assertIn("marks dirty build bytes",
+                              str(caught.exception.code))
+
+    def test_dirty_xpfd_refused_when_package_commit_is_not_local(self):
+        # --skip-build of a package whose commit is absent locally skips the
+        # describe comparison; the marker check must not depend on it.
+        with self.assertRaises(SystemExit) as caught:
+            bake.bind_deb_identity(
+                "0.0.1+gdeadbeefcafe",
+                "xpfd release-dirty (commit deadbeefcafe, built test)\n",
+                skip_build=True, head_commit="")
+        self.assertIn("marks dirty build bytes", str(caught.exception.code))
+
+    def test_clean_xpfd_in_dirty_package_is_refused(self):
+        for skip_build in (False, True):
+            with self.subTest(skip_build=skip_build):
+                with self.assertRaises(SystemExit) as caught:
+                    self.bind(self.dirty_package, self.describe,
+                              skip_build=skip_build)
+                self.assertIn("has no -dirty marker",
+                              str(caught.exception.code))
 
 
 if __name__ == "__main__":
