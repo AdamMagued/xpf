@@ -443,3 +443,241 @@ fn syn_cookie_reply_enqueues_host_generated_frame_without_transit_policy_metadat
     assert_eq!(counters.syn_cookie_syn_ack_sent, 1);
     assert_eq!(counters.syn_cookie_reply_budget_drops, 0);
 }
+
+/// #12319 residual: a SYN-cookie SYN-ACK on a stamped fabric arrival would
+/// also reflect the synthetic source MAC and must not be counted as sent.
+#[test]
+fn stamped_fabric_syn_cookie_reply_suppresses_unreachable_syn_ack_12319() {
+    let (mut frame, mut meta, flow) = tcp_v4_syn_frame();
+    frame[6..12].copy_from_slice(&[0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x02]);
+    meta.ingress_ifindex = 21;
+    let mut forwarding = ForwardingState::default();
+    forwarding.fabrics.push(FabricLink {
+        parent_ifindex: 21,
+        overlay_ifindex: 22,
+        peer_addr: "192.0.2.1".parse().unwrap(),
+        peer_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x02],
+        local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
+        up: true,
+    });
+    let mut pipeline = tx_pipeline(
+        SYN_COOKIE_REPLY_PENDING_RESERVE * 2,
+        SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+        0,
+    );
+    let mut counters = BatchCounters::default();
+
+    let sent = enqueue_syn_cookie_reply(
+        &mut pipeline,
+        &forwarding,
+        21,
+        &frame,
+        meta,
+        Some(&flow),
+        SynCookieReply::SynAck(SynCookieChallenge {
+            cookie_isn: 0xaabb_ccdd,
+            peer_mss: 1460,
+        }),
+        &mut counters,
+    );
+
+    assert!(!sent, "an unreachable cookie reply must not report sent");
+    assert!(pipeline.pending_tx_local.is_empty());
+    assert_eq!(counters.syn_cookie_syn_ack_sent, 0);
+    assert_eq!(counters.syn_cookie_reply_budget_drops, 0);
+}
+
+fn stamped_fabric_cookie_forwarding() -> (ForwardingState, [u8; 6]) {
+    let mut forwarding = ForwardingState::default();
+    forwarding.fabrics.push(FabricLink {
+        parent_ifindex: 21,
+        overlay_ifindex: 22,
+        peer_addr: "192.0.2.1".parse().unwrap(),
+        peer_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x02],
+        local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
+        up: true,
+    });
+    let scope_id = crate::afxdp::forwarding::fabric_nat_scope_stamp_id(
+        7,
+        "reth0.7",
+        "default",
+    );
+    forwarding
+        .ifindex_to_fabric_nat_scope_id
+        .insert(21, scope_id);
+    forwarding.fabric_nat_scope_id_to_identity.insert(
+        scope_id,
+        crate::afxdp::types::FabricNatScopeIdentity {
+            zone_id: 7,
+            ifindex: 21,
+            redundancy_group: 1,
+        },
+    );
+    let stamp = crate::afxdp::forwarding::resolve_fabric_redirect_for_ingress_identity(
+        &forwarding,
+        Some(7),
+        Some(21),
+    )
+    .expect("producer-minted V2 cookie stamp")
+    .src_mac
+    .expect("V2 fabric source stamp");
+    (forwarding, stamp)
+}
+
+/// #12319 F3: the validated-cookie ACK-RST arm must honor the same stamped
+/// fabric gate as the SYN-ACK arm.
+#[test]
+fn stamped_fabric_syn_cookie_reply_suppresses_unreachable_ack_rst_12319() {
+    let (mut frame, mut meta, flow) = tcp_v4_syn_frame();
+    frame[47] = crate::tcp_flags::TCP_ACK;
+    meta.ingress_ifindex = 21;
+    meta.tcp_flags = crate::tcp_flags::TCP_ACK;
+    let (forwarding, source_mac) = stamped_fabric_cookie_forwarding();
+    frame[6..12].copy_from_slice(&source_mac);
+    let mut pipeline = tx_pipeline(
+        SYN_COOKIE_REPLY_PENDING_RESERVE * 2,
+        SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+        0,
+    );
+    let mut counters = BatchCounters::default();
+
+    let sent = enqueue_syn_cookie_reply(
+        &mut pipeline,
+        &forwarding,
+        21,
+        &frame,
+        meta,
+        Some(&flow),
+        SynCookieReply::AckRst,
+        &mut counters,
+    );
+
+    assert!(!sent, "an unreachable cookie ACK-RST must not report sent");
+    assert!(pipeline.pending_tx_local.is_empty());
+    assert_eq!(counters.syn_cookie_ack_rst_sent, 0);
+    assert_eq!(counters.syn_cookie_reply_budget_drops, 0);
+}
+
+/// #12319 F3 / M12: a stamped SYN-cookie challenge is suppressed before an
+/// exhausted TX budget can account a budget drop.
+#[test]
+fn stamped_fabric_syn_cookie_suppression_precedes_exhausted_budget_12319() {
+    let (mut frame, meta, flow) = tcp_v4_syn_frame();
+    let (forwarding, source_mac) = stamped_fabric_cookie_forwarding();
+    frame[6..12].copy_from_slice(&source_mac);
+    let mut pipeline = tx_pipeline(0, 0, 0);
+    let mut counters = BatchCounters::default();
+
+    let sent = enqueue_syn_cookie_reply(
+        &mut pipeline,
+        &forwarding,
+        21,
+        &frame,
+        meta,
+        Some(&flow),
+        SynCookieReply::SynAck(SynCookieChallenge {
+            cookie_isn: 0xaabb_ccdd,
+            peer_mss: 1460,
+        }),
+        &mut counters,
+    );
+
+    assert!(!sent, "an unreachable cookie SYN-ACK must not report sent");
+    assert!(pipeline.pending_tx_local.is_empty());
+    assert_eq!(counters.syn_cookie_syn_ack_sent, 0);
+    assert_eq!(
+        counters.syn_cookie_reply_budget_drops, 0,
+        "the stamp gate must run before an exhausted TX budget is charged"
+    );
+}
+
+/// #12319 R2 control: an unstamped SYN on fabric ingress is an ordinary peer
+/// arrival, so its cookie SYN-ACK still reflects the inbound source MAC and is
+/// counted. Kills a gate that keys on fabric ingress alone.
+#[test]
+fn unstamped_fabric_syn_cookie_reply_still_enqueues_syn_ack_12319() {
+    let (frame, mut meta, flow) = tcp_v4_syn_frame();
+    meta.ingress_ifindex = 21;
+    let (forwarding, _) = stamped_fabric_cookie_forwarding();
+    let mut pipeline = tx_pipeline(
+        SYN_COOKIE_REPLY_PENDING_RESERVE * 2,
+        SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+        0,
+    );
+    let mut counters = BatchCounters::default();
+
+    let sent = enqueue_syn_cookie_reply(
+        &mut pipeline,
+        &forwarding,
+        21,
+        &frame,
+        meta,
+        Some(&flow),
+        SynCookieReply::SynAck(SynCookieChallenge {
+            cookie_isn: 0xaabb_ccdd,
+            peer_mss: 1460,
+        }),
+        &mut counters,
+    );
+
+    assert!(
+        sent,
+        "an unstamped fabric SYN must still get its cookie SYN-ACK"
+    );
+    assert_eq!(counters.syn_cookie_syn_ack_sent, 1);
+    let reply = pipeline
+        .pending_tx_local
+        .pop_front()
+        .expect("unstamped fabric cookie SYN-ACK");
+    assert_eq!(&reply.bytes[..6], &frame[6..12]);
+    assert_eq!(
+        reply.bytes[14 + 20 + 13],
+        crate::tcp_flags::TCP_SYN | crate::tcp_flags::TCP_ACK
+    );
+}
+
+/// #12319 R2 control: a stamp-shaped source MAC on native ingress is not a
+/// synthetic fabric arrival, so its cookie SYN-ACK still reflects that source
+/// MAC and is counted. Kills a gate that keys on the source MAC alone.
+#[test]
+fn stamp_shaped_native_syn_cookie_reply_still_enqueues_syn_ack_12319() {
+    let (mut frame, meta, flow) = tcp_v4_syn_frame();
+    assert_eq!(meta.ingress_ifindex, 5, "native ingress fixture");
+    let (forwarding, stamp) = stamped_fabric_cookie_forwarding();
+    frame[6..12].copy_from_slice(&stamp);
+    let mut pipeline = tx_pipeline(
+        SYN_COOKIE_REPLY_PENDING_RESERVE * 2,
+        SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+        0,
+    );
+    let mut counters = BatchCounters::default();
+
+    let sent = enqueue_syn_cookie_reply(
+        &mut pipeline,
+        &forwarding,
+        5,
+        &frame,
+        meta,
+        Some(&flow),
+        SynCookieReply::SynAck(SynCookieChallenge {
+            cookie_isn: 0xaabb_ccdd,
+            peer_mss: 1460,
+        }),
+        &mut counters,
+    );
+
+    assert!(
+        sent,
+        "a stamp-shaped native SYN must still get its cookie SYN-ACK"
+    );
+    assert_eq!(counters.syn_cookie_syn_ack_sent, 1);
+    let reply = pipeline
+        .pending_tx_local
+        .pop_front()
+        .expect("native cookie SYN-ACK");
+    assert_eq!(&reply.bytes[..6], &stamp);
+    assert_eq!(
+        reply.bytes[14 + 20 + 13],
+        crate::tcp_flags::TCP_SYN | crate::tcp_flags::TCP_ACK
+    );
+}
