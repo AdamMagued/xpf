@@ -732,12 +732,13 @@ func validateHostInboundTokensStrict(cfg *Config) error {
 	return nil
 }
 
-// validateHostInboundFullAdmitExceptStrict reports every host-inbound stanza
-// where a known `except` token is inert under a retained `any-service` token.
-// It is separate from validateHostInboundTokensStrict so tolerant compilation
-// can preserve the token validator's diagnostic and still warn once for each
-// affected stanza. Strict compilation returns the first diagnostic; tolerant
-// compilation downgrades every one to a warning.
+// validateHostInboundFullAdmitExceptStrict reports known `except` tokens made
+// inert by a retained `any-service`, both within one stanza and across the
+// interface-level override scopes that runtime unions onto one unit. It is
+// separate from validateHostInboundTokensStrict so tolerant compilation can
+// preserve that gate's diagnostic and report every affected stanza or union
+// pair. Strict compilation returns the first diagnostic; tolerant compilation
+// downgrades every one to a warning.
 func validateHostInboundFullAdmitExceptStrict(cfg *Config) []error {
 	names := make([]string, 0, len(cfg.Security.Zones))
 	for name := range cfg.Security.Zones {
@@ -766,30 +767,143 @@ func validateHostInboundFullAdmitExceptStrict(cfg *Config) []error {
 			}
 		}
 	}
+	diagnostics = append(diagnostics, validateHostInboundFullAdmitExceptRuntimeUnions(cfg)...)
 	return diagnostics
 }
 
-func validateHostInboundFullAdmitExceptStanza(zone, ifName string, hib *HostInboundTraffic) error {
-	if hib == nil {
+// validateHostInboundFullAdmitExceptRuntimeUnions reports interface-level
+// overrides that the resolver unions onto one unit (#3720) where one
+// contributor retains a full-admit token and another carries a known `except`
+// that the full admit makes inert. It replays the resolver walk
+// (resolveInterfaceHostInbound) rather than pairing raw stanzas, so ownership,
+// quarantine and canonicalization are the resolver's own: a physical override
+// pairs with each unit override it fans down to, and two spellings of one unit
+// (ge-0/0/0.0 and ge-0/0/0.00) pair on their canonical key. The zone-level
+// stanza never contributes: #6515 makes an interface override replace, not
+// union with, it. A contributor carrying its own full-admit token is left to
+// the per-stanza #12054 check.
+func validateHostInboundFullAdmitExceptRuntimeUnions(cfg *Config) []error {
+	if cfg == nil {
 		return nil
 	}
-	fullAdmit := ""
-	for _, svc := range hib.SystemServices {
-		if HostInboundFullAdmitService(svc) {
-			fullAdmit = svc
-			break
+	// A diagnostic needs an interface-level full-admit and an interface-level
+	// exclusion; without both, skip the resolver walk.
+	hasFullAdmit, hasExcept := false, false
+	for _, zone := range cfg.Security.Zones {
+		if zone == nil {
+			continue
+		}
+		for _, hib := range zone.InterfaceHostInbound {
+			if hib == nil {
+				continue
+			}
+			hasFullAdmit = hasFullAdmit || hostInboundFullAdmitToken(hib) != ""
+			hasExcept = hasExcept || len(hib.systemServicesExcept) > 0 || len(hib.protocolsExcept) > 0
 		}
 	}
-	if fullAdmit == "" {
+	if !hasFullAdmit || !hasExcept {
 		return nil
 	}
 
+	type contributor struct {
+		zone, ref string
+		hib       *HostInboundTraffic
+	}
+	contributors := make(map[string][]contributor)
+	effective := resolveInterfaceHostInbound(cfg, func(key, zone, ref string, prev, hib *HostInboundTraffic) *HostInboundTraffic {
+		contributors[key] = append(contributors[key], contributor{zone: zone, ref: ref, hib: hib})
+		return MergeHostInboundTraffic(prev, hib)
+	})
+	keys := make([]string, 0, len(contributors))
+	for key, unioned := range contributors {
+		if len(unioned) > 1 && hostInboundFullAdmitToken(effective[key]) != "" {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+
+	// The resolver's owner guard admits a unit's overrides only from the zone
+	// that owns it, so the full-admit contributor's zone names the pair. A
+	// physical pair can share several units; report it once.
+	type pair struct{ zone, fullAdmitRef, exceptRef string }
+	seen := make(map[pair]struct{})
+	var diagnostics []error
+	for _, key := range keys {
+		for _, full := range contributors[key] {
+			fullAdmit := hostInboundFullAdmitToken(full.hib)
+			if fullAdmit == "" {
+				continue
+			}
+			for _, except := range contributors[key] {
+				if hostInboundFullAdmitToken(except.hib) != "" {
+					continue
+				}
+				p := pair{zone: full.zone, fullAdmitRef: full.ref, exceptRef: except.ref}
+				if _, duplicate := seen[p]; duplicate {
+					continue
+				}
+				seen[p] = struct{}{}
+				if err := validateHostInboundFullAdmitExceptCrossScope(
+					full.zone, full.ref, except.ref, fullAdmit, except.hib); err != nil {
+					diagnostics = append(diagnostics, err)
+				}
+			}
+		}
+	}
+	return diagnostics
+}
+
+func validateHostInboundFullAdmitExceptCrossScope(
+	zone, fullAdmitRef, exceptRef, fullAdmit string, except *HostInboundTraffic,
+) error {
+	exclusions := hostInboundFullAdmitExceptDescriptions(except)
+	if len(exclusions) == 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"security zone %q runtime-unioned host-inbound-traffic scopes %s and %s "+
+			"have inert except exclusion(s) %s under system-services %q: "+
+			"any-service is a packet-wide full-admit, not a subtractable admission set",
+		zone, hostInboundFullAdmitExceptScope(fullAdmitRef),
+		hostInboundFullAdmitExceptScope(exceptRef), strings.Join(exclusions, "; "), fullAdmit)
+}
+
+func validateHostInboundFullAdmitExceptStanza(zone, ifName string, hib *HostInboundTraffic) error {
+	fullAdmit := hostInboundFullAdmitToken(hib)
+	if fullAdmit == "" {
+		return nil
+	}
+	exclusions := hostInboundFullAdmitExceptDescriptions(hib)
+	if len(exclusions) == 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"security zone %q %s has inert except exclusion(s) %s under system-services %q: "+
+			"any-service is a packet-wide full-admit, not a subtractable admission set",
+		zone, hostInboundFullAdmitExceptScope(ifName), strings.Join(exclusions, "; "), fullAdmit)
+}
+
+func hostInboundFullAdmitToken(hib *HostInboundTraffic) string {
+	if hib == nil {
+		return ""
+	}
+	for _, svc := range hib.SystemServices {
+		if HostInboundFullAdmitService(svc) {
+			return svc
+		}
+	}
+	return ""
+}
+
+func hostInboundFullAdmitExceptDescriptions(hib *HostInboundTraffic) []string {
+	if hib == nil {
+		return nil
+	}
 	servicesExcept := knownHostInboundExceptTokens(hib.systemServicesExcept, KnownHostInboundSystemServices)
 	protocolsExcept := knownHostInboundExceptTokens(hib.protocolsExcept, KnownHostInboundProtocols)
 	if len(servicesExcept) == 0 && len(protocolsExcept) == 0 {
 		return nil
 	}
-
 	exclusions := make([]string, 0, 2)
 	if len(servicesExcept) > 0 {
 		exclusions = append(exclusions, fmt.Sprintf("system-services %q", strings.Join(servicesExcept, ", ")))
@@ -797,15 +911,15 @@ func validateHostInboundFullAdmitExceptStanza(zone, ifName string, hib *HostInbo
 	if len(protocolsExcept) > 0 {
 		exclusions = append(exclusions, fmt.Sprintf("protocols %q", strings.Join(protocolsExcept, ", ")))
 	}
+	return exclusions
+}
 
+func hostInboundFullAdmitExceptScope(ifName string) string {
 	scope := "host-inbound-traffic"
 	if ifName != "" {
 		scope = fmt.Sprintf("interfaces %q host-inbound-traffic", ifName)
 	}
-	return fmt.Errorf(
-		"security zone %q %s has inert except exclusion(s) %s under system-services %q: "+
-			"any-service is a packet-wide full-admit, not a subtractable admission set",
-		zone, scope, strings.Join(exclusions, "; "), fullAdmit)
+	return scope
 }
 
 // toleratedUnknownHostInboundChildWarnings returns deterministic diagnostics
