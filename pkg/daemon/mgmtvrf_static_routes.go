@@ -13,9 +13,21 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// This realm tags only routes reconciled by xpf. RTPROT_STATIC is shared with
-// operator-installed routes in table 999, so the tag lets startup cleanup reap
-// its own stale routes without claiming or deleting those operator routes.
+// Table 999 is shared with operator routes (networkd [Route] sections and `ip
+// route`, both RTPROT_STATIC), so the reconcile claims and reaps only routes
+// that carry an xpf ownership marker (mgmtStaticRouteOwned):
+//
+//   - A single-path route is RTPROT_STATIC with this realm in RTA_FLOW.
+//   - A multipath (ECMP) route is config.ManagementVRFMultipathStaticProtocol
+//     with no realm. The kernel accepts a top-level RTA_FLOW on a multipath
+//     route only when it equals the first leg's per-nexthop RTA_FLOW ("Nexthop
+//     class id does not match RTA_FLOW"), and vishvananda/netlink can neither
+//     emit nor parse a per-leg RTA_FLOW. A realm-stamped ECMP route therefore
+//     fails with EINVAL, and a realm-0 one would be indistinguishable from an
+//     operator route (#12539).
+//
+// IPv6 routes do not store RTA_FLOW, so an IPv6 single-path route reads back
+// unmarked and is never reaped; the protocol marker survives in both families.
 const mgmtStaticRouteRealm = 0x585046 // "XPF"
 
 type mgmtStaticRouteTarget struct {
@@ -25,9 +37,10 @@ type mgmtStaticRouteTarget struct {
 
 // applyMgmtVRFStaticRoutesTo installs management-scoped configuration routes
 // and the system backup-router in table 999, then removes stale xpf-owned
-// RTPROT_STATIC entries. Table 999 is dedicated to management interfaces; a
-// global static is copied here only when every next-hop resolves to a
-// management interface (explicitly, or through a connected table-999 route).
+// entries (see mgmtStaticRouteRealm). Table 999 is dedicated to management
+// interfaces; a global static is copied here only when every next-hop resolves
+// to a management interface (explicitly, or through a connected table-999
+// route).
 func (d *Daemon) applyMgmtVRFStaticRoutesTo(
 	nlh mgmtRouteProgrammer,
 	cfg *config.Config,
@@ -47,15 +60,17 @@ func (d *Daemon) applyMgmtVRFStaticRoutesTo(
 	desired := mgmtStaticRoutesDesired(nlh, cfg, mgmtSet, current)
 	present := make(map[string]struct{}, len(desired))
 	applied := make(map[string]struct{}, len(desired))
+	overwritten := make(map[string]struct{}, len(desired))
 	for i, family := range [...]int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
 		for _, route := range current[i] {
-			if route.Protocol != unix.RTPROT_STATIC {
+			if route.Protocol != unix.RTPROT_STATIC &&
+				route.Protocol != config.ManagementVRFMultipathStaticProtocol {
 				continue
 			}
 			key := mgmtStaticRouteKey(route, family)
 			if _, wanted := desired[key]; wanted {
 				present[key] = struct{}{}
-				if route.Realm == mgmtStaticRouteRealm {
+				if mgmtStaticRouteOwned(route) {
 					applied[key] = struct{}{}
 				}
 			}
@@ -82,15 +97,26 @@ func (d *Daemon) applyMgmtVRFStaticRoutesTo(
 			continue
 		}
 		applied[key] = struct{}{}
+		overwritten[mgmtStaticRouteSlot(target.route, target.family)] = struct{}{}
 	}
 
 	for i, family := range [...]int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
 		for _, route := range current[i] {
-			if route.Protocol != unix.RTPROT_STATIC || route.Realm != mgmtStaticRouteRealm {
+			if !mgmtStaticRouteOwned(route) {
 				continue
 			}
 			key := mgmtStaticRouteKey(route, family)
 			if _, keep := applied[key]; keep {
+				continue
+			}
+			// A successful replace above already overwrote this snapshot
+			// route in place (NLM_F_REPLACE, same destination and priority).
+			// Deleting it would hit the replacement instead: the kernel
+			// matches a single-path delete against the first leg only and a
+			// multipath delete leg by leg over the installed legs only, and
+			// IPv6 removes every matching leg even when it then reports
+			// ESRCH (#12539).
+			if _, gone := overwritten[mgmtStaticRouteSlot(route, family)]; gone {
 				continue
 			}
 			if err := nlh.RouteDel(&route); err != nil && !errors.Is(err, unix.ESRCH) {
@@ -237,13 +263,16 @@ func mgmtStaticRoutesDesired(
 					Table:    mgmtVRFTableID,
 					Type:     unix.RTN_UNICAST,
 					Protocol: unix.RTPROT_STATIC,
-					Realm:    mgmtStaticRouteRealm,
 					Priority: priority,
 				}
+				// Ownership marker per path shape; see mgmtStaticRouteRealm
+				// for why a multipath route cannot carry the realm (#12539).
 				if len(hops) == 1 {
+					route.Realm = mgmtStaticRouteRealm
 					route.LinkIndex = hops[0].LinkIndex
 					route.Gw = hops[0].Gw
 				} else {
+					route.Protocol = config.ManagementVRFMultipathStaticProtocol
 					route.MultiPath = hops
 				}
 				mgmtAddStaticRoute(desired, route, family)
@@ -508,6 +537,25 @@ func mgmtStaticConnectedLinkIndex(gateway net.IP, routes []netlink.Route) (int, 
 
 func mgmtAddStaticRoute(routes map[string]mgmtStaticRouteTarget, route netlink.Route, family int) {
 	routes[mgmtStaticRouteKey(route, family)] = mgmtStaticRouteTarget{family: family, route: route}
+}
+
+// mgmtStaticRouteOwned reports whether a table-999 route carries one of the
+// xpf ownership markers described at mgmtStaticRouteRealm.
+func mgmtStaticRouteOwned(route netlink.Route) bool {
+	switch route.Protocol {
+	case config.ManagementVRFMultipathStaticProtocol:
+		return true
+	case unix.RTPROT_STATIC:
+		return route.Realm == mgmtStaticRouteRealm
+	default:
+		return false
+	}
+}
+
+// mgmtStaticRouteSlot identifies what NLM_F_REPLACE overwrites in table 999:
+// one route per family, destination and priority (TOS is always zero here).
+func mgmtStaticRouteSlot(route netlink.Route, family int) string {
+	return fmt.Sprintf("%d|%s|%d", family, mgmtRouteDstKey(route.Dst, family), route.Priority)
 }
 
 func mgmtStaticRouteKey(route netlink.Route, family int) string {

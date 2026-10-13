@@ -303,7 +303,8 @@ External only: `github.com/insomniacslk/dhcp`, `github.com/vishvananda/netlink`.
   classless routes follow the same contract: FRR and the management-VRF twin
   suppress a learned prefix contained by a rendered/operator static route in
   the same table, with a visible warning. In table 999, only operator routes
-  stamped `RTPROT_STATIC` are authority; xpf-owned `RTPROT_DHCP` and
+  stamped `RTPROT_STATIC`, and xpf's ECMP management statics stamped with
+  protocol 0x58 (#12539), are authority; xpf-owned `RTPROT_DHCP` and
   connected/kernel routes are silently ignored, while unexpected
   other-protocol routes are warned and ignored. An option-121 `/0` follows the
   normal DHCP-default suppression contract. Unusually broad classless `/1`

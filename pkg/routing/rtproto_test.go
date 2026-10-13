@@ -3,6 +3,7 @@ package routing
 import (
 	"testing"
 
+	"github.com/psaab/xpf/pkg/config"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
@@ -33,6 +34,11 @@ func TestRtProtoName(t *testing.T) {
 		// "static". This arm pre-dates #2127 and must be preserved (the
 		// kernel UAPI RTPROT_STATIC=4 above is a different value).
 		{"frr-zstatic-196", rtprotZStatic, "static"},
+
+		// xpf stamps its ECMP management statics in table 999 with a
+		// dedicated ownership protocol; they are still configured statics
+		// (#12539).
+		{"xpf-mgmt-ecmp-static", config.ManagementVRFMultipathStaticProtocol, "static"},
 
 		// The #2127 fixes.
 		{"isis-187", unix.RTPROT_ISIS, "isis"}, // was the literal "187"

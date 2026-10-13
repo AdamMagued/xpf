@@ -86,10 +86,14 @@ func mgmtVRFControlFabricLinkIndexes(
 
 // mgmtVRFRouteInventory keeps operator statics as the authority for DHCP
 // precedence (#9943), and returns dynamic RIB routes as classless-route
-// coverage evidence (#11426). Management connected kernel prefixes remain a
-// separate fence, with configured cluster control/fabric connected routes
-// returned separately for the non-overridable fence (#11362). xpf-owned
-// RTPROT_DHCP routes are never used as suppression evidence.
+// coverage evidence (#11426). Static authority is RTPROT_STATIC plus the
+// multipath management statics xpf stamps with
+// config.ManagementVRFMultipathStaticProtocol, so an ECMP static carries the
+// same precedence as its single-path form (#12539). Management connected
+// kernel prefixes remain a separate fence, with configured cluster
+// control/fabric connected routes returned separately for the
+// non-overridable fence (#11362). xpf-owned RTPROT_DHCP routes are never used
+// as suppression evidence.
 func mgmtVRFRouteInventory(
 	nlh mgmtRouteReconciler,
 	family int,
@@ -121,7 +125,8 @@ func mgmtVRFRouteInventory(
 			}
 			continue
 		}
-		if route.Protocol == unix.RTPROT_STATIC {
+		if route.Protocol == unix.RTPROT_STATIC ||
+			route.Protocol == config.ManagementVRFMultipathStaticProtocol {
 			operators = append(operators, route)
 			continue
 		}
