@@ -62,10 +62,6 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 	// knob is off the "Policy count" column reads 0 (we skip the
 	// dataplane read).
 	statsEnabled := cfg.Security.PolicyStatsEnabled
-	zoneNames := make([]string, 0, len(cfg.Security.Zones))
-	for name := range cfg.Security.Zones {
-		zoneNames = append(zoneNames, name)
-	}
 	quarantinedZones := config.ZoneQuarantineExclusionsForConfig(cfg)
 	isQuarantined := func(name string) bool {
 		_, ok := quarantinedZones[name]
@@ -360,10 +356,6 @@ func printPolicyMatchAddresses(cfg *config.Config, pol *config.Policy) {
 
 func (c *CLI) showPoliciesDetail(cfg *config.Config, fromZone, toZone string) error {
 	schedActive, haveSched := c.policySchedulerActiveState()
-	zoneNames := make([]string, 0, len(cfg.Security.Zones))
-	for name := range cfg.Security.Zones {
-		zoneNames = append(zoneNames, name)
-	}
 	quarantinedZones := config.ZoneQuarantineExclusionsForConfig(cfg)
 	isQuarantined := func(name string) bool {
 		_, ok := quarantinedZones[name]

@@ -340,20 +340,6 @@ func ZoneQuarantineExclusions(names []string) map[string]struct{} {
 	return excluded
 }
 
-// HasDefinedAnyZoneName reports whether the config's zone-name set contains a
-// definition of the reserved `any` token. Wildcard policies using `any` are
-// legitimate when no zone has that name; a tolerated pre-#3055 definition is
-// omitted from snapshots and requires fail-closed handling of zone-pair
-// references to avoid wildcard widening.
-func HasDefinedAnyZoneName(names []string) bool {
-	for _, name := range names {
-		if name == ReservedWildcardZoneName {
-			return true
-		}
-	}
-	return false
-}
-
 // ZoneQuarantineExcludedReason returns the operator-facing reason for a
 // quarantined zone in cfg. It returns an empty string for an ordinary or
 // survivor zone, and uses the same runtime name set as the snapshot builders

@@ -22,10 +22,6 @@ func (s *Server) GetZones(_ context.Context, _ *pb.GetZonesRequest) (*pb.GetZone
 	}
 
 	cr := s.applyResult()
-	zoneNames := make([]string, 0, len(cfg.Security.Zones))
-	for zoneName := range cfg.Security.Zones {
-		zoneNames = append(zoneNames, zoneName)
-	}
 	quarantineNames := config.ZoneQuarantineNamesForConfig(cfg)
 	quarantinedZones := config.ZoneQuarantineExclusions(quarantineNames)
 
@@ -210,10 +206,6 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 	// #11072: mirror the text twin's quarantine marking (server_show_policies_text.go):
 	// a rule whose scope touches a StableZoneID-collision quarantine carries
 	// Quarantined=true so remote show does not present scrubbed permits as live.
-	zoneNames := make([]string, 0, len(cfg.Security.Zones))
-	for name := range cfg.Security.Zones {
-		zoneNames = append(zoneNames, name)
-	}
 	quarantinedZones := config.ZoneQuarantineExclusionsForConfig(cfg)
 	isQuarantined := func(name string) bool {
 		_, ok := quarantinedZones[name]
