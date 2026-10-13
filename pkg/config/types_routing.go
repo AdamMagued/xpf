@@ -366,6 +366,14 @@ type NextHopEntry struct {
 	// the metric into IGP redistribution route-maps. Valid only when HasMetric.
 	Metric    int
 	HasMetric bool
+	// qualified marks an entry compiled from a qualified-next-hop statement
+	// while later statements for the same gateway can still fold into it
+	// (#12308, compiler_static_qnh_merge_12308.go). Compile-only and transient:
+	// finalizeQualifiedNextHops12308 clears it before any validator or consumer
+	// reads the route, so a compiled Config never carries it and NextHopEntry
+	// equality outside the compiler is unchanged. Unexported, so it is not on
+	// the helper wire (#8892).
+	qualified bool
 }
 
 // StaticRoute defines a single static route.
