@@ -4,7 +4,8 @@ CARGO ?= $(HOME)/.cargo/bin/cargo
 BINARY := xpfd
 PREFIX ?= /usr/local
 
-# Version info embedded at build time
+# Version info embedded at build time. `make deb` passes its own VERSION to
+# the package build (marker bound to DEB_VERSION, #12158; see the deb recipe).
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_TIME ?= $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
@@ -1625,6 +1626,14 @@ deb:
 	@# not 0. A bare `trap cleanup INT TERM` with a cleanup that returns 0
 	@# would mask Ctrl-C / CI-kill as success under dash (AGY r2). The EXIT
 	@# trap covers normal completion + dpkg-buildpackage failure (set -e).
+	@# #12158: debian/rules reruns this Makefile (`make build ...`) AFTER the
+	@# changelog rewrite below, so the inner VERSION default (`git describe
+	@# --dirty`) would mark every packaged xpfd dirty. Hand the inner build
+	@# VERSION instead, derived from the same DEB_VERSION value the changelog
+	@# gets: HEAD's describe plus -dirty exactly when DEB_VERSION carries .dirty
+	@# (the shared probe), so the two markers cannot disagree. An explicit
+	@# VERSION (command line or environment) keeps make's usual precedence;
+	@# bake.py refuses a package whose markers then disagree.
 	set -e; \
 	  cleanup() { \
 	    sed -i "1s/^xpf ([^)]*)/xpf (0.0.0)/" debian/changelog; \
@@ -1634,8 +1643,13 @@ deb:
 	  trap cleanup EXIT; \
 	  trap 'cleanup; trap - INT; kill -INT $$$$' INT; \
 	  trap 'cleanup; trap - TERM; kill -TERM $$$$' TERM; \
-	  sed -i "1s/^xpf ([^)]*)/xpf ($(DEB_VERSION))/" debian/changelog; \
-	  dpkg-buildpackage -us -uc -b --no-sign; \
+	  deb_version="$(DEB_VERSION)"; \
+	  xpfd_dirty=; \
+	  case "$$deb_version" in *.dirty) xpfd_dirty=-dirty;; esac; \
+	  xpfd_version=$${VERSION-$$(git describe --tags --always 2>/dev/null || echo dev)$$xpfd_dirty}; \
+	  echo "==> xpfd embedded version: $$xpfd_version"; \
+	  sed -i "1s/^xpf ([^)]*)/xpf ($$deb_version)/" debian/changelog; \
+	  VERSION="$$xpfd_version" dpkg-buildpackage -us -uc -b --no-sign; \
 	  mkdir -p $(DEB_OUT); \
 	  cp ../xpf_$(DEB_VERSION)_*.deb ../xpf-appliance_$(DEB_VERSION)_*.deb $(DEB_OUT)/
 	@echo "==> packages in $(DEB_OUT):"
