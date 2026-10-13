@@ -1592,17 +1592,24 @@ Host-inbound-traffic can be authored at three granularities:
 3. **unit-level** — `security zones <z> interfaces <ifN.M>
    host-inbound-traffic { ... }`, applies only to that logical unit.
 
-Levels 2 and 3 are both the **interface level** and they UNION with each other.
-The interface level as a whole **REPLACES** the zone level:
+Levels 2 and 3 are both the **interface level** and they UNION with each other,
+with every `except` exclusion either one authors reapplied to that union
+(#12317). The interface level as a whole **REPLACES** the zone level:
 
 ```
-effective(ifN.M) = physical(ifN) ∪ unit(ifN.M)     if either is declared
-                 = zone                             otherwise
+effective(ifN.M) = (pos(ifN) ∪ pos(ifN.M)) − (exc(ifN) ∪ exc(ifN.M))   if either is declared
+                 = zone                                                otherwise
 ```
+
+`pos` is a stanza's positive tokens and `exc` its `except` exclusions. The
+subtraction removes every token whose family-scoped L4 tuples overlap an
+excluded service or protocol (#12053, #12318), expanding a literal `all` first.
+With no exclusion in either stanza it is the plain union.
 
 `config.EffectiveHostInboundTokens` is the SSOT for that outer choice and
-`config.UnionHostInboundTokens` for the inner merge; every surface that resolves
-an interface's admission routes through the former — the kernel nft view builder
+`config.MergeHostInboundTraffic` (through `config.ResolveInterfaceHostInbound`)
+for the inner merge; every surface that resolves an interface's admission
+routes through the former — the kernel nft view builder
 (`BuildZoneHostInboundViews`), the per-interface classifier
 (`ClassifyHostInboundForInterface`), the commit-time advisories, the
 duplicate-host-address gate, and all six display surfaces.
@@ -1714,17 +1721,9 @@ service or protocol (#12053, #12318). In particular,
 admit IPv4 protocol 2. If a token admits multiple tuples and any intersects an
 excluded tuple, that token is removed as a whole. The compiler preserves
 unknown modifiers for strict validation and emits the resulting positive-token
-representation consumed by both enforcement paths.
-
-**Cross-scope interface union keeps exclusions (#12317).** Physical-interface
-and unit-level overrides are both interface-level statements and union under
-#3720. Their exclusion provenance is retained through that union and reapplied
-to the combined service tuples: a physical `netconf-ssh` plus a unit
-`all; ssh except` admits TCP/830 via the independent `netconf` token, but not
-TCP/22 via the alias. Reversing the physical and unit scopes has the same
-result. This does not combine a zone stanza with an interface stanza: under
-#6515 the interface stanza replaces the zone stanza, so a zone-level exclusion
-does not filter a replacing interface override.
+representation consumed by both enforcement paths. A physical and a unit
+stanza also reapply each other's exclusions (#12317; see "Physical∪unit merge
+(#3720)" below).
 
 `any-service` is not that service union: xpf cannot subtract a named service or
 protocol exclusion from its packet-wide full-admit. A strict commit therefore
@@ -1778,6 +1777,34 @@ later exact unit override was **dropped** — the less-specific physical ref
 silently shadowed the more-specific unit ref (fail-open, admitting a service the
 unit did not open, or fail-closed, denying one it did). The fix MERGES (unions)
 the two levels instead.
+
+**Exclusions survive the union (#12317).** Each stanza's `except` exclusions
+are kept as provenance and reapplied to the merged positives
+(`config.MergeHostInboundTraffic`), so neither scope can re-open a tuple the
+other excludes. A physical `netconf-ssh` plus a unit
+`system-services { all; ssh except; }` admits TCP/830 through the independent
+`netconf` token but not TCP/22 through the alias, and a literal `protocols all`
+in one scope does not re-admit the OSPF the other excludes; both scope orders
+behave the same. The rule removes explicitly named tokens too: physical
+`system-services { all; ssh except; }` plus unit `system-services ssh` admits
+no TCP/22 on that unit, and physical `protocols { all; ospf except; }` plus unit
+`protocols ospf` admits no OSPF there. To admit on one unit what the physical
+stanza excludes, move the exclusion out of the physical stanza into the
+unit-level stanzas it should narrow. Zone and interface stanzas never combine
+this way: under #6515 the interface stanza replaces the zone stanza, so a
+zone-level exclusion does not filter a replacing interface override.
+
+**Upgrading narrows those units.** Before #12317 the union discarded the
+exclusions, so every configuration above admitted the excluded tuple — TCP/22
+or OSPF — on the unit. Upgrading removes that admission, and the #5566
+conntrack reconcile, which rebuilds its admit set from the same views, flushes
+established sessions to it, management SSH over that unit included.
+`validateHostInboundCrossScopeExceptWarnings`
+(`pkg/config/compiler_validate_warn_host_inbound.go`) names the unit, every
+contributing stanza and each token the union no longer fully admits at
+`commit check`. It replays the resolver walk with the provenance-free union, so
+it fires only where an exclusion changes the result; like the #6515 advisory it
+is WARN-only and skips lifeline interfaces and `any-service` unions.
 
 **Cross-zone quarantine (#3720 M01, #5489).** A host-inbound override must
 contribute to a unit's effective set ONLY from the unit's authoritative zone
@@ -1857,9 +1884,10 @@ address is never dropped from the deny scope.
 **Gate alignment.** The commit-time duplicate-address gate
 (`buildHostInboundOverrideMapLocal` +
 `validateDuplicateHostLocalAddressStrict`, `pkg/config/dup_host_local_address.go`)
-mirrors the same resolution and quarantine — `effectiveHostInboundSigLocal`
-delegates to `EffectiveHostInboundTokens` — so the
-`CanonicalHostInboundTokenSig` it compares equals the runtime's effective set.
+mirrors the same resolution and quarantine — it merges physical and unit
+stanzas through the shared `MergeHostInboundTraffic` (#12317), and
+`effectiveHostInboundSigLocal` delegates to `EffectiveHostInboundTokens` — so
+the `CanonicalHostInboundTokenSig` it compares equals the runtime's effective set.
 That matters here specifically: the gate rejects two zones claiming one
 firewall-local address with DIFFERING admission, so a signature built from a
 different combination rule than enforcement uses would compare the wrong sets.
@@ -2206,8 +2234,8 @@ dedup applies only when a second block is actually merged. RED-on-revert guards:
 
 This is orthogonal to the "Per-interface override precedence (#3362, #3720,
 #6515)" section above, which resolves host-inbound authored at DIFFERENT
-granularities (`physical ∪ unit`, then REPLACING the zone level). #4544 merges
-repeated blocks at the SAME granularity.
+granularities (`physical ∪ unit` with both stanzas' exclusions reapplied, then
+REPLACING the zone level). #4544 merges repeated blocks at the SAME granularity.
 
 **#4818 extends this merge one level UP.** #4544 merges repeated
 `host-inbound-traffic {}` blocks *within one* `security-zone <name> {}`

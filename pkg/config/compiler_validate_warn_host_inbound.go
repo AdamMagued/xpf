@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -923,6 +924,114 @@ func validateHostInboundOverrideReplaceWarnings(cfg *Config) []string {
 					"connections (#6515, #5566).",
 				name, ref, strings.Join(lost, " and "), name))
 		}
+	}
+	return warnings
+}
+
+// validateHostInboundCrossScopeExceptWarnings emits the #12317 advisory: one
+// warning per unit whose interface-level overrides — a physical-interface
+// stanza and the unit's own stanza, which union under #3720 — lose admission
+// to each other's exclusions. The union reapplies every contributing stanza's
+// `except` list to the combined positives, so an exclusion in one scope also
+// removes a service or protocol another scope names explicitly: physical
+// `all; ssh except` plus unit `ssh` no longer admits TCP/22 on that unit,
+// where the provenance-free union before #12317 did. That can take away a
+// management session on upgrade, so the advisory names the unit, every
+// contributing stanza, and each positive token the union no longer admits in
+// full.
+//
+// It replays the resolver walk with a provenance-free union (the pre-#12317
+// merge) rather than correlating raw stanzas, so ownership, quarantine and
+// canonicalization are the resolver's own. WARN-only: the narrowing is the
+// intended semantics. Lifeline interfaces and full-admit (`any-service`)
+// results are skipped as in the #6515 advisory; an exclusion `any-service`
+// makes inert narrows nothing.
+func validateHostInboundCrossScopeExceptWarnings(cfg *Config) []string {
+	// Without an interface-level exclusion the union and the provenance-free
+	// union are identical; ValidateConfig also backs the alarm views, so skip
+	// both resolver walks in that (common) case.
+	if cfg == nil {
+		return nil
+	}
+	hasExcept := false
+	for _, zone := range cfg.Security.Zones {
+		if zone == nil {
+			continue
+		}
+		for _, hib := range zone.InterfaceHostInbound {
+			if hib != nil && (len(hib.systemServicesExcept) > 0 || len(hib.protocolsExcept) > 0) {
+				hasExcept = true
+				break
+			}
+		}
+	}
+	if !hasExcept {
+		return nil
+	}
+	effective := ResolveInterfaceHostInbound(cfg)
+	if len(effective) == 0 {
+		return nil
+	}
+	scopes := make(map[string][]string)
+	unioned := resolveInterfaceHostInbound(cfg, func(key, zone, ref string, prev, hib *HostInboundTraffic) *HostInboundTraffic {
+		scopes[key] = append(scopes[key], fmt.Sprintf("zone %q interfaces %q", zone, ref))
+		return MergeHostInboundTraffic(prev, &HostInboundTraffic{
+			SystemServices: hib.SystemServices,
+			Protocols:      hib.Protocols,
+		})
+	})
+	keys := make([]string, 0, len(scopes))
+	for key, contributors := range scopes {
+		if len(contributors) > 1 {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	lifelines := HostInboundLifelineSet(cfg)
+	var warnings []string
+	for _, key := range keys {
+		eff, union := effective[key], unioned[key]
+		if eff == nil || union == nil || HostInboundLifelineInterface(key, lifelines) {
+			continue
+		}
+		fullAdmit := false
+		for _, s := range eff.SystemServices {
+			if HostInboundFullAdmitService(s) {
+				fullAdmit = true
+				break
+			}
+		}
+		if fullAdmit {
+			continue
+		}
+		// Equal lists lose nothing, so only differing ones are compared
+		// token by token.
+		var lostSvc, lostProto []string
+		if !slices.Equal(union.SystemServices, eff.SystemServices) {
+			lostSvc = hostInboundLostTokens(union.SystemServices, eff.SystemServices, false)
+		}
+		if !slices.Equal(union.Protocols, eff.Protocols) {
+			lostProto = hostInboundLostTokens(union.Protocols, eff.Protocols, true)
+		}
+		if len(lostSvc) == 0 && len(lostProto) == 0 {
+			continue
+		}
+		var lost []string
+		if len(lostSvc) > 0 {
+			lost = append(lost, "system-services ["+strings.Join(lostSvc, " ")+"]")
+		}
+		if len(lostProto) > 0 {
+			lost = append(lost, "protocols ["+strings.Join(lostProto, " ")+"]")
+		}
+		warnings = append(warnings, fmt.Sprintf(
+			"interface %q: the host-inbound-traffic overrides of %s apply "+
+				"to this unit together and union (#3720); an except in any "+
+				"of them is reapplied to the union, so the union no longer "+
+				"fully admits host-bound %s here (#12317). If this unit should "+
+				"still admit them, scope the except to stanzas that do not "+
+				"cover this unit. Established sessions to a removed "+
+				"service are flushed at commit (#5566).",
+			key, strings.Join(scopes[key], " and "), strings.Join(lost, " and ")))
 	}
 	return warnings
 }

@@ -1916,6 +1916,7 @@ func ValidateConfig(cfg *Config) []string {
 
 	warnings = append(warnings, validateHostInboundZoneLevelDHCPWarnings(cfg)...)
 	warnings = append(warnings, validateHostInboundOverrideReplaceWarnings(cfg)...)
+	warnings = append(warnings, validateHostInboundCrossScopeExceptWarnings(cfg)...)
 	warnings = append(warnings, validateDeviceMapHostInboundLifelineWarnings11365(cfg)...)
 
 	// #6460: a configured DHCP server answers on every interface its

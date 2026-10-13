@@ -138,8 +138,10 @@ func hostInboundExceptParts(n *Node) (values, excluded []string) {
 // `all` is materialized only when an exclusion is present. Positives are
 // filtered by their family-scoped L4 matches as well as names, so an alias
 // cannot re-admit an excluded tuple — including when exclusions were retained
-// across merged same-key stanzas. The services plane gained tuple subtraction
-// in #12053; the protocols plane follows in #12318 (igmp/dvmrp share proto 2).
+// across merged same-key stanzas or across the #3720 physical/unit override
+// union (MergeHostInboundTraffic, #12317). The services plane gained tuple
+// subtraction in #12053; the protocols plane follows in #12318 (igmp/dvmrp
+// share proto 2).
 func hostInboundFilterExcept(tokens, excluded []string, protocols bool) []string {
 	if len(excluded) == 0 {
 		return tokens
@@ -263,9 +265,9 @@ func hostInboundTokenMatchesAny(token string, excluded map[string][]L4Match, pro
 // SINGLE block stays byte-identical to the pre-#4544 behaviour (no dedup, no
 // copy — a single block preserves its exact token multiset). Only when a second
 // block is actually merged are the unioned slices deduplicated (first-seen
-// order preserved). src nil (no stanza) is a no-op. Compiler-local exclusion
-// provenance is merged with the positive lists so a restrictive sibling block
-// cannot be erased by the positive-list union.
+// order preserved). src nil (no stanza) is a no-op. Exclusion provenance is
+// merged with the positive lists so a restrictive sibling block cannot be
+// erased by the positive-list union.
 func mergeHostInbound(dst, src *HostInboundTraffic) *HostInboundTraffic {
 	if src == nil {
 		return dst
@@ -284,7 +286,7 @@ func mergeHostInbound(dst, src *HostInboundTraffic) *HostInboundTraffic {
 }
 
 // cloneHostInbound returns a deep copy of src (fresh backing arrays for both
-// admission dimensions and compiler-only exclusion provenance), preserving the
+// admission dimensions and exclusion provenance), preserving the
 // exact token multiset and order — a copy is value-identical, it only breaks
 // POINTER identity.
 //

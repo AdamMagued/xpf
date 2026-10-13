@@ -536,10 +536,13 @@ type HostInboundTraffic struct {
 	// strict compilation can reject them and tolerant loads can retain warnings.
 	UnknownChildren []string `json:"-"`
 
-	// Compiler-only provenance for Junos `except` modifiers. The parser
-	// materializes filtered positives immediately; retaining the exclusions
-	// privately lets repeated same-key blocks merge without re-introducing a
-	// token that a later block explicitly excluded.
+	// Exclusion provenance for Junos `except` modifiers. The parser
+	// materializes filtered positives immediately; the exclusions are kept so
+	// repeated same-key blocks (mergeHostInbound) and the #3720 physical/unit
+	// union (MergeHostInboundTraffic, #12317) can reapply them without
+	// re-admitting an excluded token. They therefore shape enforcement: a copy
+	// that keeps only the exported fields silently drops them, so copy through
+	// cloneHostInbound or MergeHostInboundTraffic.
 	systemServicesExcept []string
 	protocolsExcept      []string
 }

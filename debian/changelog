@@ -1,5 +1,15 @@
 xpf (0.0.0) unstable; urgency=medium
 
+  * Reapply host-inbound `except` exclusions across the union of a
+    physical-interface override and a unit-level override. An exclusion in
+    either scope now also removes the other scope's overlapping aliases and
+    explicitly named services or protocols: `all; ssh except` in one scope
+    plus `ssh` or `netconf-ssh` in the other no longer admits TCP/22 on that
+    unit, and established sessions to it are flushed. Commit check names
+    each narrowed unit and both stanzas. If a unit must keep a service its
+    physical interface excludes, move the exclusion into the other units'
+    stanzas before upgrading (#12317).
+
   * Repeated interface filter bindings now resolve last-wins across all
     `filter` siblings (was: first sibling, first leaf only). Persisted
     configs with repeats or split siblings may activate, change, or
