@@ -17670,6 +17670,25 @@ fn established_session_re_resolves_after_fib_generation_changes_11373() {
         ForwardingDisposition::NoRoute,
         "withdrawn route must not retain the session's cached gateway resolution"
     );
+    // The direct resolver has no #9519 authority verdict to wait for, so it
+    // still persists the re-resolve and its stamp itself (#12265).
+    let (stored, _) = sessions
+        .probe_with_origin(&flow.forward_key)
+        .expect("re-resolved session stays installed");
+    assert_eq!(
+        stored.decision.resolution.disposition,
+        ForwardingDisposition::NoRoute,
+        "the direct resolver must persist the re-resolved route"
+    );
+    assert_eq!(
+        stored.forwarding_generation,
+        ForwardingGenerationStamp {
+            config_generation: 1,
+            fib_generation: 2,
+            valid: true,
+        },
+        "and stamp it with the live generation"
+    );
     let local_resolved = resolve_flow_session_decision(
         &mut sessions,
         SteeringMap::unshared_for_test(-1),

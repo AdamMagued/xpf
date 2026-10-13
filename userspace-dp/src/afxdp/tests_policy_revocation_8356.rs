@@ -9792,6 +9792,142 @@ fn fib_only_cross_zone_route_move_rejudges_existing_session_12074() {
     assert_eq!(session_count(&sessions), 0);
 }
 
+/// #12265 with #12074: a FOREIGN packet's stale-generation hit re-resolves
+/// the route into the moved egress zone, but the #12074 policy-stamp
+/// invalidation it implies belongs to the owner. A foreign hit "may not
+/// revoke, re-stamp, tear down or cache the entry" (#9519), so it must leave
+/// the owner's verdict Fresh; the owner's own next hit must still re-judge
+/// the cross-zone move and revoke.
+#[test]
+fn fib_only_foreign_stale_hit_keeps_owner_policy_stamp_12265() {
+    let mut initial = nat_snapshot();
+    initial.generation = 7;
+    initial.fib_generation = 9;
+    initial.source_nat_rules.clear();
+    add_fib_move_egress_12074(
+        &mut initial,
+        "dmz",
+        TEST_DMZ_ZONE_ID,
+        "203.0.113.1/24",
+        "203.0.113.2",
+    );
+    let forwarding_initial = build_forwarding_state(&initial);
+    let mut moved = initial.clone();
+    moved.fib_generation = 10;
+    add_fib_move_route_12074(&mut moved, FIB_MOVE_DST_12074, "203.0.113.2", "reth2.0");
+    let forwarding_moved = build_forwarding_state(&moved);
+
+    let mut sessions = SessionTable::new();
+    sessions.set_timeouts(forwarding_initial.session_timeouts);
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, LAN_IFINDEX, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let ha_state = txn_ha_state();
+    let validation_initial = ValidationState {
+        snapshot_installed: true,
+        config_generation: 7,
+        fib_generation: 9,
+    };
+    for flags in [TCP_SYN, TCP_ACK] {
+        let frame = build_txn_tcp_syn_frame_v4(
+            SRC,
+            FIB_MOVE_DST_12074,
+            SPORT,
+            DPORT,
+            flags,
+            crate::afxdp::tests_support::TEST_LAN_MAC,
+        );
+        let (_batch, dbg) = txn_run_descriptor_with_validation(
+            &mut binding,
+            &mut sessions,
+            &forwarding_initial,
+            &ha_state,
+            &frame,
+            txn_meta_v4(LAN_IFINDEX as u32, flags, frame.len() as u16),
+            validation_initial,
+        );
+        assert_eq!(dbg.tx, 1, "the owner's initial flow forwards via WAN");
+    }
+    let key = flow_key_to(FIB_MOVE_DST_12074);
+    assert_eq!(
+        sessions.policy_revalidation_target(&key),
+        crate::session::PolicyRevalidationTarget::Fresh,
+        "the owner's verdict is fresh before the move"
+    );
+    let validation_moved = ValidationState {
+        snapshot_installed: true,
+        config_generation: 7,
+        fib_generation: 10,
+    };
+
+    // FOREIGN: the same forward tuple arrives in dmz after the FIB move.
+    let mut foreign_binding = BindingWorker::new_for_mirror_test(0, 0, DMZ_IFINDEX, 0);
+    foreign_binding.interface = Arc::<str>::from("reth2.0");
+    let foreign = build_txn_tcp_syn_frame_v4(
+        SRC,
+        FIB_MOVE_DST_12074,
+        SPORT,
+        DPORT,
+        TCP_ACK,
+        REVOCATION_DMZ_MAC,
+    );
+    let mut foreign_meta = txn_meta_v4(DMZ_IFINDEX as u32, TCP_ACK, foreign.len() as u16);
+    foreign_meta.fib_generation = 10;
+    let (foreign_batch, foreign_dbg) = txn_run_descriptor_with_validation(
+        &mut foreign_binding,
+        &mut sessions,
+        &forwarding_moved,
+        &ha_state,
+        &foreign,
+        foreign_meta,
+        validation_moved,
+    );
+    assert_eq!(foreign_batch.validated_packets, 1);
+    assert_eq!(
+        foreign_dbg.session_hit, 1,
+        "the foreign packet must hit the session"
+    );
+    assert_eq!(
+        foreign_dbg.foreign_authority_drops, 1,
+        "and be judged foreign"
+    );
+    assert_eq!(foreign_dbg.tx, 0);
+    assert_eq!(session_count(&sessions), 2, "the pair survives the drop");
+    assert_eq!(
+        sessions.policy_revalidation_target(&key),
+        crate::session::PolicyRevalidationTarget::Fresh,
+        "a foreign stale hit must not invalidate the owner's policy verdict"
+    );
+
+    // OWNER: its own next hit re-judges the cross-zone move and revokes.
+    let ack = build_txn_tcp_syn_frame_v4(
+        SRC,
+        FIB_MOVE_DST_12074,
+        SPORT,
+        DPORT,
+        TCP_ACK,
+        crate::afxdp::tests_support::TEST_LAN_MAC,
+    );
+    let mut owner_meta = txn_meta_v4(LAN_IFINDEX as u32, TCP_ACK, ack.len() as u16);
+    owner_meta.fib_generation = 10;
+    let (owner_batch, owner_dbg) = txn_run_descriptor_with_validation(
+        &mut binding,
+        &mut sessions,
+        &forwarding_moved,
+        &ha_state,
+        &ack,
+        owner_meta,
+        validation_moved,
+    );
+    assert_eq!(owner_batch.validated_packets, 1);
+    assert_eq!(owner_dbg.session_hit, 1);
+    assert_eq!(
+        owner_dbg.policy_revoked_sessions, 1,
+        "the owner must still re-judge the move into the default-deny DMZ"
+    );
+    assert_eq!(owner_dbg.tx, 0);
+    assert_eq!(session_count(&sessions), 0);
+}
+
 #[test]
 fn fib_only_same_zone_route_move_keeps_forwarding_and_nat_12074() {
     let mut initial = nat_snapshot();
